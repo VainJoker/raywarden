@@ -28,37 +28,38 @@ html_handling = "auto-trailing-slash"
 # Only invoke Worker for API and Identity routes, serve static files directly for other routes
 run_worker_first = ["/api/*", "/identity/*"]
 
-# [vars]
-# # Optional: Set the batch size for imports. Defaults to 30 if not set.
-# # Set to 0 means no batching (all records imported in a single batch).
-# # IMPORT_BATCH_SIZE = "30"
+[vars]
+DOMAIN = "warden.vainjoker.online"
+# Optional: Set the batch size for imports. Defaults to 30 if not set.
+# Set to 0 means no batching (all records imported in a single batch).
+# IMPORT_BATCH_SIZE = "30"
 
-# # Number of days to keep soft-deleted items before auto-purging.
-# # Defaults to 30 days if not set. Set to 0 to disable auto-purge.
-# # TRASH_AUTO_DELETE_DAYS = "30"
+# Number of days to keep soft-deleted items before auto-purging.
+# Defaults to 30 days if not set. Set to 0 to disable auto-purge.
+# TRASH_AUTO_DELETE_DAYS = "30"
 
-# # Attachment configuration (optional)
-# # Maximum size for individual attachment files in bytes.
-# # Defaults to no limit if not set.
-# # ATTACHMENT_MAX_BYTES = "104857600"  # 100MB
+# Attachment configuration (optional)
+# Maximum size for individual attachment files in bytes.
+# Defaults to no limit if not set.
+# ATTACHMENT_MAX_BYTES = "104857600"  # 100MB
 
-# # Maximum total attachment storage per user in KB.
-# # Defaults to no limit if not set.
-# # ATTACHMENT_TOTAL_LIMIT_KB = "1048576"  # 1GB
+# Maximum total attachment storage per user in KB.
+# Defaults to no limit if not set.
+# ATTACHMENT_TOTAL_LIMIT_KB = "1048576"  # 1GB
 
-# # Number of seconds to keep attachment upload and download URLs valid.
-# # Defaults to 300 seconds (5 minutes) if not set.
-# # ATTACHMENT_TTL_SECS = "300"
+# Number of seconds to keep attachment upload and download URLs valid.
+# Defaults to 300 seconds (5 minutes) if not set.
+# ATTACHMENT_TTL_SECS = "300"
 
-# # Cron triggers for scheduled tasks
-# # Runs daily at 03:00 UTC to purge soft-deleted ciphers
+# Cron triggers for scheduled tasks
+# Runs daily at 03:00 UTC to purge soft-deleted ciphers
 # [triggers]
 # crons = ["0 3 * * *"]
 
 [[d1_databases]]
 binding = "warden-db"
 database_name = "warden-db"
-database_id = "${D1_DATABASE_ID}"
+database_id = "6bb5ee22-69d1-4f71-a9c2-8ff1187b988e"
 migrations_dir = "migrations"
 
 # # R2 bucket for file attachments (optional)
@@ -81,11 +82,11 @@ workers_dev = true
 # namespace_id = "1002"
 # simple = { limit = 5, period = 60 }
 
-[[env.dev.d1_databases]]
-binding = "warden-db"
-database_name = "warden-db"
-database_id = "${D1_DATABASE_ID_DEV}"
-migrations_dir = "migrations"
+# [[env.dev.d1_databases]]
+# binding = "warden-db"
+# database_name = "warden-db"
+# database_id = "6bb5ee22-69d1-4f71-a9c2-8ff1187b988e"
+# migrations_dir = "migrations"
 
 # # R2 bucket for file attachments in dev environment (optional)
 # # Uncomment and configure this section to enable file attachments

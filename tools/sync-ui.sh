@@ -1,3 +1,5 @@
+#!/bin/bash
+
 # Get latest version tag
 LATEST_TAG=$(curl -s https://api.github.com/repos/dani-garcia/bw_web_builds/releases/latest | jq -r .tag_name)
 
