@@ -1,0 +1,14 @@
+target
+node_modules
+.wrangler
+.env
+# Frontend files (downloaded during deployment/development)
+public/
+build/
+Cargo.lock
+
+# reference repos
+vaultwarden/
+bw_web_builds/
+
+.jj/

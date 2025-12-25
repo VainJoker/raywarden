@@ -1,0 +1,84 @@
+[package]
+name = "raywarden"
+version = "0.1.0"
+edition = "2024"
+authors = ["Jasper Zhang <hanjie.zhang1228@gmail.com>"]
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+
+# Worker & Web APIs
+worker = { version = "0.7", features = ["axum", "http", "d1"] }
+worker-macros = { version = "0.7", features = ['http'] }
+wasm-bindgen = "0.2"
+js-sys = "0.3"
+wasm-bindgen-futures = "0.4"
+web-sys = { version = "0.3", features = ["Crypto", "CryptoKey", "SubtleCrypto", "WorkerGlobalScope", "Pbkdf2Params"] }
+console_error_panic_hook = "0.1.7"
+wasm-streams = "0.4"
+
+# Axum and Routing
+axum = { version = "0.8", default-features = false, features=["json", "macros", "form", "multipart", "query"] }
+tower-service = "0.3"
+tower-http = { version = "0.6", features = ["cors"] }
+bytes = "1"
+futures-util = { version = "0.3", default-features = false, features = ["alloc"] }
+
+# Data & Serialization
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+# Crypto & Encoding
+base64 = "0.22"
+base32 = "0.5"
+hex = "0.4"
+rand = { version = "0.9" }
+getrandom = { version = "0.3", features = ["wasm_js"] }
+constant_time_eq = "0.4"
+sha2 = "0.10"
+hmac = "0.12"
+
+# Utilities
+chrono = { version = "0.4", features = ["serde"] }
+uuid = { version = "1.6", features = ["v4", "serde", "rng-rand"] }
+log = "0.4"
+thiserror = "2.0"
+console_log = "1.0.0"
+glob-match = "0.2"
+
+[lints.rust]
+unsafe_code = "forbid"
+[lints.clippy]
+pedantic = { level = "warn", priority = -1 }
+cast_possible_truncation = "allow"
+cast_possible_wrap = "allow"
+cast_precision_loss = "allow"
+cast_sign_loss = "allow"
+missing_errors_doc = "allow"
+missing_panics_doc = "allow"
+module_name_repetitions = "allow"
+must_use_candidate = "allow"
+wildcard_imports = "allow"
+module_inception = "allow"
+unwrap_used = "warn"
+as_underscore = "warn"
+deref_by_slicing = "warn"
+else_if_without_else = "warn"
+empty_line_after_doc_comments = "warn"
+equatable_if_let = "warn"
+fn_to_numeric_cast_any = "warn"
+format_push_string = "warn"
+map_err_ignore = "warn"
+missing_const_for_fn = "warn"
+mixed_read_write_in_expression = "warn"
+needless_raw_strings = "warn"
+redundant_type_annotations = "warn"
+rest_pat_in_fully_bound_structs = "warn"
+string_lit_chars_any = "warn"
+implicit_clone = "warn"
+use_self = "warn"
+
+[profile.release]
+strip = true

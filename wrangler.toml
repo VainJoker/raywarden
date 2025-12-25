@@ -1,0 +1,107 @@
+name = "raywarden"
+main = "src/entry.js"
+compatibility_date = "2025-12-23"
+keep_vars = true
+workers_dev = false
+preview_urls = false
+
+[build]
+command = "cargo install -q worker-build@^0.7 && worker-build --release"
+
+# Rate limiting configuration for protecting sensitive endpoints
+# See: https://developers.cloudflare.com/workers/runtime-apis/bindings/rate-limit/
+[[ratelimits]]
+name = "LOGIN_RATE_LIMITER"
+# A unique identifier for this rate limiter within your Cloudflare account
+# You can use any positive integer
+namespace_id = "1001"
+# Allow 5 requests per 60 seconds per key (email or IP)
+# This prevents brute force attacks while allowing legitimate login attempts
+simple = { limit = 5, period = 60 }
+
+# Static assets configuration for serving frontend
+# Frontend files should be placed in ./public directory before deployment
+[assets]
+directory = "./public"
+not_found_handling = "404-page"
+html_handling = "auto-trailing-slash"
+# Only invoke Worker for API and Identity routes, serve static files directly for other routes
+run_worker_first = ["/api/*", "/identity/*"]
+
+# [vars]
+# # Optional: Set the batch size for imports. Defaults to 30 if not set.
+# # Set to 0 means no batching (all records imported in a single batch).
+# # IMPORT_BATCH_SIZE = "30"
+
+# # Number of days to keep soft-deleted items before auto-purging.
+# # Defaults to 30 days if not set. Set to 0 to disable auto-purge.
+# # TRASH_AUTO_DELETE_DAYS = "30"
+
+# # Attachment configuration (optional)
+# # Maximum size for individual attachment files in bytes.
+# # Defaults to no limit if not set.
+# # ATTACHMENT_MAX_BYTES = "104857600"  # 100MB
+
+# # Maximum total attachment storage per user in KB.
+# # Defaults to no limit if not set.
+# # ATTACHMENT_TOTAL_LIMIT_KB = "1048576"  # 1GB
+
+# # Number of seconds to keep attachment upload and download URLs valid.
+# # Defaults to 300 seconds (5 minutes) if not set.
+# # ATTACHMENT_TTL_SECS = "300"
+
+# # Cron triggers for scheduled tasks
+# # Runs daily at 03:00 UTC to purge soft-deleted ciphers
+# [triggers]
+# crons = ["0 3 * * *"]
+
+[[d1_databases]]
+binding = "warden-db"
+database_name = "warden-db"
+database_id = "${D1_DATABASE_ID}"
+migrations_dir = "migrations"
+
+# # R2 bucket for file attachments (optional)
+# # Uncomment and configure this section to enable file attachments
+# # [[r2_buckets]]
+# # binding = "ATTACHMENTS_BUCKET"
+# # bucket_name = "warden-attachments"
+
+[env.dev]
+name = "raywarden-worker-dev"
+workers_dev = true
+
+# # Dev environment also needs cron triggers
+# [env.dev.triggers]
+# crons = ["0 3 * * *"]
+
+# # Rate limiting for dev environment (same settings as production)
+# [[env.dev.ratelimits]]
+# name = "LOGIN_RATE_LIMITER"
+# namespace_id = "1002"
+# simple = { limit = 5, period = 60 }
+
+[[env.dev.d1_databases]]
+binding = "warden-db"
+database_name = "warden-db"
+database_id = "${D1_DATABASE_ID_DEV}"
+migrations_dir = "migrations"
+
+# # R2 bucket for file attachments in dev environment (optional)
+# # Uncomment and configure this section to enable file attachments
+# # [[env.dev.r2_buckets]]
+# # binding = "ATTACHMENTS_BUCKET"
+# # bucket_name = "warden-attachments-dev"
+
+# logs
+[env.dev.observability]
+[env.dev.observability.logs]
+enabled = true
+head_sampling_rate = 1
+invocation_logs = true
+persist = true
+
+[env.dev.observability.traces]
+enabled = false
+persist = true
+head_sampling_rate = 1
