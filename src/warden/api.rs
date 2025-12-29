@@ -1,4 +1,9 @@
 pub mod accounts;
 pub mod config;
+pub mod devices;
+pub mod emergency;
+pub mod folders;
 pub mod identity;
 pub mod sync;
+pub mod twofactor;
+pub mod webauth;

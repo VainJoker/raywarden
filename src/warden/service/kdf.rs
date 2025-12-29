@@ -72,3 +72,41 @@ pub fn ensure_supported_kdf(
 
     Ok(())
 }
+
+pub fn validate_rotation_metadata(
+    user: &crate::models::user::User,
+    unlock_data: &crate::models::user::MasterPasswordUnlockData,
+    account_public_key: &str,
+) -> Result<(), AppError> {
+    let kdf_matches = user.kdf_type == unlock_data.kdf_type &&
+        user.kdf_iterations == unlock_data.kdf_iterations &&
+        user.kdf_memory == unlock_data.kdf_memory &&
+        user.kdf_parallelism == unlock_data.kdf_parallelism;
+
+    if user.email != unlock_data.email || !kdf_matches {
+        log::error!(
+            "KDF/email mismatch in rotation request: email_equal={}, \
+             kdf_equal={}",
+            user.email == unlock_data.email,
+            kdf_matches
+        );
+        return Err(AppError::BadRequest(
+            "Changing the kdf variant or email is not supported during key \
+             rotation"
+                .to_string(),
+        ));
+    }
+
+    if user.public_key != account_public_key {
+        log::error!(
+            "Public key mismatch in rotation request: stored != provided"
+        );
+        return Err(AppError::BadRequest(
+            "Changing the asymmetric keypair is not supported during key \
+             rotation"
+                .to_string(),
+        ));
+    }
+
+    Ok(())
+}
