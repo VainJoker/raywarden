@@ -7,7 +7,7 @@ use serde_json::{
     json,
 };
 
-use crate::warden::AppState;
+use crate::api::AppState;
 
 #[worker::send]
 pub async fn config(State(state): State<AppState>) -> Json<Value> {

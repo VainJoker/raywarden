@@ -8,9 +8,9 @@ use axum::{
     },
 };
 
-use crate::warden::{
+use crate::api::{
     AppState,
-    api::accounts,
+    controller::accounts,
 };
 
 pub fn accounts_router() -> Router<AppState> {

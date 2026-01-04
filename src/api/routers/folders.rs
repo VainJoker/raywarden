@@ -8,9 +8,9 @@ use axum::{
     },
 };
 
-use crate::warden::{
+use crate::api::{
     AppState,
-    api::folders,
+    controller::folders,
 };
 
 pub fn folders_router() -> Router<AppState> {

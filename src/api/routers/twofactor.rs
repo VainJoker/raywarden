@@ -8,9 +8,9 @@ use axum::{
     },
 };
 
-use crate::warden::{
+use crate::api::{
     AppState,
-    api::twofactor,
+    controller::twofactor,
 };
 
 pub fn twofactor_router() -> Router<AppState> {

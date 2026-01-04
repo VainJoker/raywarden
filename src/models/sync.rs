@@ -6,7 +6,6 @@ use super::{
     folder::FolderResponse,
     user::User,
 };
-use crate::errors::AppError;
 
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -34,17 +33,13 @@ pub struct Profile {
 }
 
 impl Profile {
-    pub fn from_user(user: User) -> Result<Self, AppError> {
+    pub fn from_user(user: User) -> Self {
         let creation_date =
             chrono::DateTime::parse_from_rfc3339(&user.created_at)
-                .map_err(|e| {
-                    AppError::BadRequest(format!(
-                        "invalid created_at timestamp: {e}"
-                    ))
-                })?
+                .unwrap_or_default()
                 .to_rfc3339_opts(SecondsFormat::Micros, true);
 
-        Ok(Self {
+        Self {
             id: user.id,
             name: user.name,
             avatar_color: user.avatar_color,
@@ -61,7 +56,7 @@ impl Profile {
             creation_date,
             private_key: user.private_key,
             key: user.key,
-        })
+        }
     }
 }
 

@@ -3,9 +3,9 @@ use axum::{
     routing::get,
 };
 
-use crate::warden::{
+use crate::api::{
     AppState,
-    api::sync,
+    controller::sync,
 };
 
 pub fn sync_router() -> Router<AppState> {

@@ -45,7 +45,10 @@ chrono = { version = "0.4", features = ["serde"] }
 uuid = { version = "1.6", features = ["v4", "serde", "rng-rand"] }
 log = "0.4"
 thiserror = "2.0"
+bizerror = "0.1.3"
 console_log = "1.0.0"
+tracing = { version = "0.1", features = ["log"] }
+tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }
 glob-match = "0.2"
 
 [lints.rust]

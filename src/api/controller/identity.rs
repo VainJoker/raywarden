@@ -16,7 +16,19 @@ use serde_json::Value;
 use worker::query;
 
 use crate::{
-    errors::AppError,
+    api::{
+        AppState,
+        service::{
+            auth,
+            claims::Claims,
+            rate,
+        },
+    },
+    errors::{
+        AppError,
+        AuthError,
+        DatabaseError,
+    },
     infra::{
         cryptor::{
             ct_eq,
@@ -33,14 +45,6 @@ use crate::{
             TwoFactorType,
         },
         user::User,
-    },
-    warden::{
-        AppState,
-        service::{
-            auth,
-            claims::Claims,
-            rate,
-        },
     },
 };
 
@@ -149,10 +153,10 @@ pub async fn token(
     match payload.grant_type.as_str() {
         "password" => {
             let username = payload.username.ok_or_else(|| {
-                AppError::BadRequest("Missing username".to_string())
+                AppError::Params("Missing username".to_string())
             })?;
             let password_hash = payload.password.ok_or_else(|| {
-                AppError::BadRequest("Missing password".to_string())
+                AppError::Params("Missing password".to_string())
             })?;
 
             // Check rate limit using email as key to prevent brute force
@@ -166,10 +170,15 @@ pub async fn token(
                 .first(None)
                 .await
                 .map_err(|e| {
-                    AppError::Unauthorized(format!("Invalid credentials ({e})"))
+                    log::warn!("user lookup failed: {e}");
+                    AppError::Auth(AuthError::InvalidCredentials(
+                        "Invalid credentials".to_string(),
+                    ))
                 })?
                 .ok_or_else(|| {
-                    AppError::Unauthorized("Invalid credentials".to_string())
+                    AppError::Auth(AuthError::InvalidCredentials(
+                        "Invalid credentials".to_string(),
+                    ))
                 })?;
             let user: User =
                 serde_json::from_value(user_value).map_err(|e| {
@@ -181,9 +190,9 @@ pub async fn token(
                 user.verify_master_password(&password_hash).await?;
 
             if !verification.is_valid() {
-                return Err(AppError::Unauthorized(
+                return Err(AppError::Auth(AuthError::InvalidCredentials(
                     "Invalid credentials".to_string(),
-                ));
+                )));
             }
 
             // Check for 2FA
@@ -197,7 +206,9 @@ pub async fn token(
                 .await
                 .map_err(|e| {
                     log::warn!("twofactor query failed: {e}");
-                    AppError::Database
+                    AppError::Database(DatabaseError::QueryFailed(
+                        e.to_string(),
+                    ))
                 })?
                 .results()
                 .unwrap_or_default();
@@ -235,7 +246,7 @@ pub async fn token(
                 match TwoFactorType::from_i32(selected_id) {
                     Some(TwoFactorType::Authenticator) => {
                         let Some(tf) = selected_twofactor else {
-                            return Err(AppError::BadRequest(
+                            return Err(AppError::Params(
                                 "TOTP not configured".to_string(),
                             ));
                         };
@@ -261,7 +272,9 @@ pub async fn token(
                         )
                         .map_err(|e| {
                             log::warn!("twofactor last_used bind failed: {e}");
-                            AppError::Database
+                            AppError::Database(DatabaseError::QueryFailed(
+                                e.to_string(),
+                            ))
                         })?
                         .run()
                         .await
@@ -269,7 +282,9 @@ pub async fn token(
                             log::warn!(
                                 "twofactor last_used update failed: {e}"
                             );
-                            AppError::Database
+                            AppError::Database(DatabaseError::QueryFailed(
+                                e.to_string(),
+                            ))
                         })?;
                     }
                     Some(TwoFactorType::Remember) => {
@@ -317,7 +332,11 @@ pub async fn token(
                                     log::warn!(
                                         "remember token bind failed: {e}"
                                     );
-                                    AppError::Database
+                                    AppError::Database(
+                                        DatabaseError::QueryFailed(
+                                            e.to_string(),
+                                        ),
+                                    )
                                 })?
                                 .run()
                                 .await
@@ -326,7 +345,11 @@ pub async fn token(
                                         log::warn!(
                                             "remember token update failed: {e}"
                                         );
-                                        AppError::Database
+                                        AppError::Database(
+                                            DatabaseError::QueryFailed(
+                                                e.to_string(),
+                                            ),
+                                        )
                                     },
                                 )?;
 
@@ -349,8 +372,8 @@ pub async fn token(
                                 &stored_code.to_uppercase(),
                                 &twofactor_code.to_uppercase(),
                             ) {
-                                return Err(AppError::BadRequest(
-                                    "Recovery code is incorrect".to_string(),
+                                return Err(AppError::Auth(
+                                    AuthError::InvalidTotp,
                                 ));
                             }
 
@@ -362,13 +385,17 @@ pub async fn token(
                             )
                             .map_err(|e| {
                                 log::warn!("twofactor delete bind failed: {e}");
-                                AppError::Database
+                                AppError::Database(DatabaseError::QueryFailed(
+                                    e.to_string(),
+                                ))
                             })?
                             .run()
                             .await
                             .map_err(|e| {
                                 log::warn!("twofactor delete failed: {e}");
-                                AppError::Database
+                                AppError::Database(DatabaseError::QueryFailed(
+                                    e.to_string(),
+                                ))
                             })?;
 
                             query!(
@@ -379,22 +406,24 @@ pub async fn token(
                             )
                             .map_err(|e| {
                                 log::warn!("recovery clear bind failed: {e}");
-                                AppError::Database
+                                AppError::Database(DatabaseError::QueryFailed(
+                                    e.to_string(),
+                                ))
                             })?
                             .run()
                             .await
                             .map_err(|e| {
                                 log::warn!("recovery clear failed: {e}");
-                                AppError::Database
+                                AppError::Database(DatabaseError::QueryFailed(
+                                    e.to_string(),
+                                ))
                             })?;
                         } else {
-                            return Err(AppError::BadRequest(
-                                "Recovery code is incorrect".to_string(),
-                            ));
+                            return Err(AppError::Auth(AuthError::InvalidTotp));
                         }
                     }
                     _ => {
-                        return Err(AppError::BadRequest(
+                        return Err(AppError::Params(
                             "Invalid two factor provider".to_string(),
                         ));
                     }
@@ -439,13 +468,17 @@ pub async fn token(
                     )
                     .map_err(|e| {
                         log::warn!("remember token upsert bind failed: {e}");
-                        AppError::Database
+                        AppError::Database(DatabaseError::QueryFailed(
+                            e.to_string(),
+                        ))
                     })?
                     .run()
                     .await
                     .map_err(|e| {
                         log::warn!("remember token upsert failed: {e}");
-                        AppError::Database
+                        AppError::Database(DatabaseError::QueryFailed(
+                            e.to_string(),
+                        ))
                     })?;
 
                     two_factor_remember_token = Some(remember_token);
@@ -474,13 +507,17 @@ pub async fn token(
                 )
                 .map_err(|e| {
                     log::warn!("legacy migration bind failed: {e}");
-                    AppError::Database
+                    AppError::Database(DatabaseError::QueryFailed(
+                        e.to_string(),
+                    ))
                 })?
                 .run()
                 .await
                 .map_err(|e| {
                     log::warn!("legacy migration update failed: {e}");
-                    AppError::Database
+                    AppError::Database(DatabaseError::QueryFailed(
+                        e.to_string(),
+                    ))
                 })?;
 
                 // Return updated user
@@ -502,7 +539,7 @@ pub async fn token(
         }
         "refresh_token" => {
             let refresh_token = payload.refresh_token.ok_or_else(|| {
-                AppError::BadRequest("Missing refresh_token".to_string())
+                AppError::Params("Missing refresh_token".to_string())
             })?;
 
             let jwt_refresh_secret = state.config.jwt_refresh_secret.clone();
@@ -514,7 +551,7 @@ pub async fn token(
             )
             .map_err(|e| {
                 log::warn!("refresh token decode failed: {e}");
-                AppError::Unauthorized("Invalid refresh token".to_string())
+                AppError::from(e)
             })?;
 
             // let token_data = decode::<Claims>(
@@ -533,11 +570,9 @@ pub async fn token(
                 .await
                 .map_err(|e| {
                     log::warn!("refresh_token user query failed: {e}");
-                    AppError::Unauthorized("Invalid user".to_string())
+                    AppError::Auth(AuthError::UserNotFound)
                 })?
-                .ok_or_else(|| {
-                    AppError::Unauthorized("Invalid user".to_string())
-                })?;
+                .ok_or_else(|| AppError::Auth(AuthError::UserNotFound))?;
             let user: User = serde_json::from_value(user).map_err(|e| {
                 log::warn!("Failed to deserialize refresh user: {e}");
                 AppError::Internal
@@ -545,7 +580,7 @@ pub async fn token(
 
             generate_tokens_and_response(user, &state, None)
         }
-        _ => Err(AppError::BadRequest("Unsupported grant_type".to_string())),
+        _ => Err(AppError::Params("Unsupported grant_type".to_string())),
     }
 }
 

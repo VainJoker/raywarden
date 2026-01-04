@@ -1,9 +1,9 @@
 #![feature(once_cell_try)]
 
+pub mod api;
 pub mod errors;
 pub mod infra;
 pub mod models;
-pub mod warden;
 
 use std::sync::OnceLock;
 
@@ -14,10 +14,7 @@ use axum::{
 use log::Level;
 use worker::*;
 
-use crate::{
-    errors::AppError,
-    warden::ApiService,
-};
+use crate::api::ApiService;
 
 /// Initialize panic hook and logger (once per Worker instance).
 pub static INIT: OnceLock<()> = OnceLock::new();
@@ -38,6 +35,6 @@ pub async fn main(
     init();
     ApiService::run(req, env).await.map_err(|e| {
         log::error!("API service error: {e:?}");
-        AppError::Internal.into()
+        e.into()
     })
 }

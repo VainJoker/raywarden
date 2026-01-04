@@ -7,9 +7,9 @@ use axum::{
     },
 };
 
-use crate::warden::{
+use crate::api::{
     AppState,
-    api::devices,
+    controller::devices,
 };
 
 pub fn devices_router() -> Router<AppState> {

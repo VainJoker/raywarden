@@ -17,12 +17,15 @@ use serde::{
 use worker::Env;
 
 use crate::{
-    errors::AppError,
+    api::AppState,
+    errors::{
+        AppError,
+        AuthError,
+    },
     infra::{
         ValidationOptions,
         decode,
     },
-    warden::AppState,
 };
 
 /// Application-specific extension claims
@@ -140,9 +143,7 @@ impl FromRequestParts<Arc<Env>> for Claims {
                     .strip_prefix("Bearer ")
                     .map(std::borrow::ToOwned::to_owned)
             })
-            .ok_or_else(|| {
-                AppError::Unauthorized("Missing or invalid token".to_string())
-            })?;
+            .ok_or_else(|| AppError::Auth(AuthError::MissingToken))?;
 
         let secret = state.secret("JWT_SECRET")?;
         let secret_bytes = secret.to_string();
@@ -154,7 +155,7 @@ impl FromRequestParts<Arc<Env>> for Claims {
             secret_bytes.as_bytes(),
             &ValidationOptions::default(),
         )
-        .map_err(|e| AppError::Unauthorized(format!("Invalid token: {e}")))?;
+        .map_err(AppError::from)?;
 
         Ok(token_data.claims)
     }
@@ -193,9 +194,7 @@ impl FromRequestParts<AppState> for Claims {
                     .strip_prefix("Bearer ")
                     .map(std::borrow::ToOwned::to_owned)
             })
-            .ok_or_else(|| {
-                AppError::Unauthorized("Missing or invalid token".to_string())
-            })?;
+            .ok_or_else(|| AppError::Auth(AuthError::MissingToken))?;
 
         let secret = state.config.jwt_secret.clone();
         let secret_bytes = secret.clone();
@@ -205,7 +204,7 @@ impl FromRequestParts<AppState> for Claims {
             secret_bytes.as_bytes(),
             &ValidationOptions::default(),
         )
-        .map_err(|e| AppError::Unauthorized(format!("Invalid token: {e}")))?;
+        .map_err(AppError::from)?;
 
         Ok(token_data.claims)
     }

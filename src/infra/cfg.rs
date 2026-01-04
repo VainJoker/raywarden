@@ -6,6 +6,7 @@ use worker::Env;
 use crate::errors::{
     AppError,
     AppResult,
+    ConfigError,
 };
 
 /// Load configuration from environment (cached in static).
@@ -71,27 +72,38 @@ impl Config {
 
         let jwt_secret = env
             .secret("JWT_SECRET")
-            .map_err(|e| AppError::Config(format!("JWT_SECRET: {e}")))?
+            .map_err(|e| {
+                log::error!("JWT_SECRET load failed: {e}");
+                AppError::Config(ConfigError::Missing(e.to_string()))
+            })?
             .to_string();
 
         if jwt_secret.is_empty() {
-            return Err(AppError::Config("JWT_SECRET cannot be empty".into()));
+            return Err(AppError::Config(ConfigError::Missing(
+                "JWT_SECRET".to_string(),
+            )));
         }
 
         let jwt_refresh_secret = env
             .secret("JWT_REFRESH_SECRET")
-            .map_err(|e| AppError::Config(format!("JWT_REFRESH_SECRET: {e}")))?
+            .map_err(|e| {
+                log::error!("JWT_REFRESH_SECRET load failed: {e}");
+                AppError::Config(ConfigError::Missing(e.to_string()))
+            })?
             .to_string();
 
         if jwt_refresh_secret.is_empty() {
-            return Err(AppError::Config(
-                "JWT_REFRESH_SECRET cannot be empty".into(),
-            ));
+            return Err(AppError::Config(ConfigError::Missing(
+                "JWT_REFRESH_SECRET".to_string(),
+            )));
         }
 
         let domain = env
             .var("DOMAIN")
-            .map_err(|e| AppError::Config(format!("DOMAIN: {e}")))?
+            .map_err(|e| {
+                log::error!("DOMAIN load failed: {e}");
+                AppError::Config(ConfigError::Missing("DOMAIN".to_string()))
+            })?
             .to_string();
 
         let allowed_origins = get_var_or("ALLOWED_ORIGINS", "")

@@ -2,9 +2,12 @@ use serde_json::Value;
 use worker::query;
 
 use crate::{
-    errors::AppError,
+    api::AppState,
+    errors::{
+        AppError,
+        DatabaseError,
+    },
     models::user::User,
-    warden::AppState,
 };
 
 pub struct UserKdfParams {
@@ -28,7 +31,7 @@ pub async fn get_kdf_params_by_email(
 
     let row: Option<Value> = query.first(None).await.map_err(|e| {
         log::warn!("get_kdf_params_by_email query failed: {e}");
-        AppError::Database
+        AppError::Database(DatabaseError::QueryFailed(e.to_string()))
     })?;
 
     if let Some(row) = row {
@@ -99,13 +102,13 @@ pub async fn insert_user(
     )
     .map_err(|e| {
         log::warn!("insert_user bind failed: {e}");
-        AppError::Database
+        AppError::Database(DatabaseError::QueryFailed(e.to_string()))
     })?
     .run()
     .await
     .map_err(|e| {
         log::warn!("insert_user run failed: {e}");
-        AppError::Database
+        AppError::Database(DatabaseError::QueryFailed(e.to_string()))
     })?;
 
     Ok(())

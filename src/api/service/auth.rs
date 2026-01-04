@@ -9,13 +9,13 @@ use serde_json::{
 };
 
 use crate::{
-    errors::AppError,
-    infra::jwtor as jwt,
-    models::user::User,
-    warden::{
+    api::{
         AppState,
         service::claims::Claims,
     },
+    errors::AppError,
+    infra::jwtor as jwt,
+    models::user::User,
 };
 
 /// Generates the JSON error response for 2FA required.

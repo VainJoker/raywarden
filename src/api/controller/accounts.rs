@@ -16,7 +16,26 @@ use worker::{
 };
 
 use crate::{
-    errors::AppError,
+    api::{
+        AppState,
+        service::{
+            claims::Claims,
+            kdf::{
+                DEFAULT_PBKDF2_ITERATIONS,
+                KDF_TYPE_ARGON2ID,
+                KDF_TYPE_PBKDF2,
+                ensure_supported_kdf,
+                validate_rotation_metadata,
+            },
+            rate,
+            user,
+        },
+    },
+    errors::{
+        AppError,
+        AuthError,
+        DatabaseError,
+    },
     infra::cryptor::{
         generate_salt,
         hash_password_for_storage,
@@ -36,21 +55,6 @@ use crate::{
             User,
         },
     },
-    warden::{
-        AppState,
-        service::{
-            claims::Claims,
-            kdf::{
-                DEFAULT_PBKDF2_ITERATIONS,
-                KDF_TYPE_ARGON2ID,
-                KDF_TYPE_PBKDF2,
-                ensure_supported_kdf,
-                validate_rotation_metadata,
-            },
-            rate,
-            user,
-        },
-    },
 };
 
 #[worker::send]
@@ -59,9 +63,11 @@ pub async fn prelogin(
     headers: HeaderMap,
     Json(payload): Json<serde_json::Value>,
 ) -> Result<Json<PreloginResponse>, AppError> {
-    let email = payload["email"]
-        .as_str()
-        .ok_or_else(|| AppError::BadRequest("Missing email".to_string()))?;
+    let email = payload["email"].as_str().ok_or_else(|| {
+        AppError::Auth(AuthError::InvalidCredentials(
+            "Missing email".to_string(),
+        ))
+    })?;
 
     let ip = rate::client_ip(&headers);
     let rate_limit_key = format!("prelogin:{ip}");
@@ -97,9 +103,9 @@ pub async fn register(
             .iter()
             .any(|pattern| glob_match(pattern, &payload.email))
     {
-        return Err(AppError::Unauthorized(
-            "Not allowed to signup".to_string(),
-        ));
+        return Err(AppError::Auth(AuthError::InvalidCredentials(
+            "Email is not allowed".to_string(),
+        )));
     }
 
     ensure_supported_kdf(
@@ -173,7 +179,9 @@ pub async fn revision_date(
         .await
         .map_err(|e| {
             log::error!("Database error fetching revision date: {e}");
-            AppError::Database
+            AppError::Database(DatabaseError::QueryFailed(
+                "Failed to fetch revision date".to_string(),
+            ))
         })?;
 
     // convert the timestamp to a millisecond-level Unix timestamp
@@ -200,9 +208,9 @@ pub async fn get_profile(
         .bind(&[user_id.into()])?
         .first(None)
         .await?
-        .ok_or_else(|| AppError::NotFound("User not found".to_string()))?;
+        .ok_or_else(|| AppError::Auth(AuthError::AccountLocked))?;
 
-    let profile = Profile::from_user(user)?;
+    let profile = Profile::from_user(user);
 
     Ok(Json(profile))
 }
@@ -214,7 +222,7 @@ pub async fn post_profile(
     Json(payload): Json<ProfileData>,
 ) -> Result<Json<Profile>, AppError> {
     if payload.name.len() > 50 {
-        return Err(AppError::BadRequest(
+        return Err(AppError::Params(
             "The field Name must be a string with a maximum length of 50."
                 .to_string(),
         ));
@@ -230,9 +238,11 @@ pub async fn post_profile(
         .await
         .map_err(|e| {
             log::error!("Database error fetching user for profile update: {e}");
-            AppError::Database
+            AppError::Database(DatabaseError::QueryFailed(
+                "Failed to fetch user for profile update".to_string(),
+            ))
         })?
-        .ok_or_else(|| AppError::NotFound("User not found".to_string()))?;
+        .ok_or_else(|| AppError::Auth(AuthError::AccountLocked))?;
 
     let mut user: User = serde_json::from_value(user_value).map_err(|e| {
         log::error!("Error deserializing user for profile update: {e}");
@@ -252,16 +262,20 @@ pub async fn post_profile(
     )
     .map_err(|e| {
         log::error!("Database error updating user profile: {e}");
-        AppError::Database
+        AppError::Database(DatabaseError::QueryFailed(
+            "Failed to update user profile".to_string(),
+        ))
     })?
     .run()
     .await
     .map_err(|e| {
         log::error!("Database error running update user profile query: {e}");
-        AppError::Database
+        AppError::Database(DatabaseError::QueryFailed(
+            "Failed to run update user profile query".to_string(),
+        ))
     })?;
 
-    let profile = Profile::from_user(user)?;
+    let profile = Profile::from_user(user);
 
     Ok(Json(profile))
 }
@@ -284,7 +298,7 @@ pub async fn put_avatar(
     if let Some(color) = &payload.avatar_color &&
         color.len() != 7
     {
-        return Err(AppError::BadRequest(
+        return Err(AppError::Params(
             "The field AvatarColor must be a HTML/Hex color code with a \
              length of 7 characters"
                 .to_string(),
@@ -301,9 +315,11 @@ pub async fn put_avatar(
         .await
         .map_err(|e| {
             log::error!("Database error fetching user for avatar update: {e}");
-            AppError::Database
+            AppError::Database(DatabaseError::QueryFailed(
+                "Failed to fetch user for avatar update".to_string(),
+            ))
         })?
-        .ok_or_else(|| AppError::NotFound("User not found".to_string()))?;
+        .ok_or_else(|| AppError::Auth(AuthError::UserNotFound))?;
 
     let mut user: User = serde_json::from_value(user_value).map_err(|e| {
         log::error!("Error deserializing user for avatar update: {e}");
@@ -323,16 +339,20 @@ pub async fn put_avatar(
     )
     .map_err(|e| {
         log::error!("Database error updating user avatar: {e}");
-        AppError::Database
+        AppError::Database(DatabaseError::QueryFailed(
+            "Failed to update user avatar".to_string(),
+        ))
     })?
     .run()
     .await
     .map_err(|e| {
         log::error!("Database error running update user avatar query: {e}");
-        AppError::Database
+        AppError::Database(DatabaseError::QueryFailed(
+            "Failed to run update user avatar query".to_string(),
+        ))
     })?;
 
-    let profile = Profile::from_user(user)?;
+    let profile = Profile::from_user(user);
 
     Ok(Json(profile))
 }
@@ -356,9 +376,13 @@ pub async fn delete_account(
             log::error!(
                 "Database error fetching user for account deletion: {e}"
             );
-            AppError::Database
+            AppError::Database(DatabaseError::QueryFailed(
+                "Failed to fetch user for account deletion".to_string(),
+            ))
         })?
-        .ok_or_else(|| AppError::NotFound("User not found".to_string()))?;
+        .ok_or_else(|| AppError::NotFound {
+            resource: "User not found".to_string(),
+        })?;
     let user: User = serde_json::from_value(user).map_err(|e| {
         log::error!("Error deserializing user for account deletion: {e}");
         AppError::Internal
@@ -366,13 +390,13 @@ pub async fn delete_account(
 
     // Verify the master password hash
     let provided_hash = payload.master_password_hash.ok_or_else(|| {
-        AppError::BadRequest("Missing master password hash".to_string())
+        AppError::Params("Missing master password hash".to_string())
     })?;
 
     let verification = user.verify_master_password(&provided_hash).await?;
 
     if !verification.is_valid() {
-        return Err(AppError::Unauthorized("Invalid password".to_string()));
+        return Err(AppError::Auth(AuthError::InvalidPassword));
     }
 
     // if attachments::attachments_enabled(env.as_ref()) {
@@ -383,19 +407,34 @@ pub async fn delete_account(
 
     // Delete all user's ciphers
     query!(&db, "DELETE FROM ciphers WHERE user_id = ?1", user_id)
-        .map_err(|_| AppError::Database)?
+        .map_err(|e| {
+            log::error!("Database error deleting user ciphers: {e}");
+            AppError::Database(DatabaseError::QueryFailed(
+                "Failed to delete user ciphers".to_string(),
+            ))
+        })?
         .run()
         .await?;
 
     // Delete all user's folders
     query!(&db, "DELETE FROM folders WHERE user_id = ?1", user_id)
-        .map_err(|_| AppError::Database)?
+        .map_err(|e| {
+            log::error!("Database error deleting user folders: {e}");
+            AppError::Database(DatabaseError::QueryFailed(
+                "Failed to delete user folders".to_string(),
+            ))
+        })?
         .run()
         .await?;
 
     // Delete the user
     query!(&db, "DELETE FROM users WHERE id = ?1", user_id)
-        .map_err(|_| AppError::Database)?
+        .map_err(|e| {
+            log::error!("Database error deleting user record: {e}");
+            AppError::Database(DatabaseError::QueryFailed(
+                "Failed to delete user".to_string(),
+            ))
+        })?
         .run()
         .await?;
 
@@ -422,9 +461,13 @@ pub async fn post_password(
             log::error!(
                 "Database error fetching user for password change: {e}"
             );
-            AppError::Database
+            AppError::Database(DatabaseError::QueryFailed(
+                "Failed to fetch user for password change".to_string(),
+            ))
         })?
-        .ok_or_else(|| AppError::NotFound("User not found".to_string()))?;
+        .ok_or_else(|| AppError::NotFound {
+            resource: "User not found".to_string(),
+        })?;
     let user: User = serde_json::from_value(user).map_err(|e| {
         log::error!("Error deserializing user for password change: {e}");
         AppError::Internal
@@ -436,7 +479,7 @@ pub async fn post_password(
         .await?;
 
     if !verification.is_valid() {
-        return Err(AppError::Unauthorized("Invalid password".to_string()));
+        return Err(AppError::Auth(AuthError::InvalidPassword));
     }
 
     // Generate new salt and hash the new password
@@ -463,7 +506,12 @@ pub async fn post_password(
         now,
         user_id
     )
-    .map_err(|_| AppError::Database)?
+    .map_err(|e| {
+        log::error!("Database error updating master password: {e}");
+        AppError::Database(DatabaseError::QueryFailed(
+            "Failed to update master password".to_string(),
+        ))
+    })?
     .run()
     .await?;
 
@@ -490,9 +538,13 @@ pub async fn post_rotatekey(
         .await
         .map_err(|e| {
             log::error!("Database error fetching user for key rotation: {e}");
-            AppError::Database
+            AppError::Database(DatabaseError::QueryFailed(
+                "Failed to fetch user for key rotation".to_string(),
+            ))
         })?
-        .ok_or_else(|| AppError::NotFound("User not found".to_string()))?;
+        .ok_or_else(|| AppError::NotFound {
+            resource: "User not found".to_string(),
+        })?;
     let user: User = serde_json::from_value(user).map_err(|e| {
         log::error!("Error deserializing user for key rotation: {e}");
         AppError::Internal
@@ -504,7 +556,7 @@ pub async fn post_rotatekey(
         .await?;
 
     if !verification.is_valid() {
-        return Err(AppError::Unauthorized("Invalid password".to_string()));
+        return Err(AppError::Auth(AuthError::InvalidPassword));
     }
 
     let unlock_data = &payload.account_unlock_data.master_password_unlock_data;
@@ -547,7 +599,7 @@ pub async fn post_rotatekey(
             personal_ciphers.len(),
             request_cipher_ids.len()
         );
-        return Err(AppError::BadRequest(
+        return Err(AppError::Params(
             "All ciphers must have an id for key rotation".to_string(),
         ));
     }
@@ -626,7 +678,7 @@ pub async fn post_rotatekey(
             db_folder_count,
             request_folder_ids.len()
         );
-        return Err(AppError::BadRequest(
+        return Err(AppError::Params(
             "All existing ciphers and folders must be included in the rotation"
                 .to_string(),
         ));
@@ -643,7 +695,7 @@ pub async fn post_rotatekey(
             "Missing ciphers or folders in rotation request: \
              {has_missing_ciphers:?} or {has_missing_folders:?}"
         );
-        return Err(AppError::BadRequest(
+        return Err(AppError::Params(
             "All existing ciphers and folders must be included in the rotation"
                 .to_string(),
         ));
@@ -669,7 +721,12 @@ pub async fn post_rotatekey(
             folder_id,
             user_id
         )
-        .map_err(|_| AppError::Database)?;
+        .map_err(|e| {
+            log::error!("Database error updating folder during rotation: {e}");
+            AppError::Database(DatabaseError::QueryFailed(
+                "Failed to update folder during rotation".to_string(),
+            ))
+        })?;
         folder_statements.push(stmt);
     }
 
@@ -712,7 +769,12 @@ pub async fn post_rotatekey(
             cipher_id,
             user_id
         )
-        .map_err(|_| AppError::Database)?;
+        .map_err(|e| {
+            log::error!("Database error updating cipher during rotation: {e}");
+            AppError::Database(DatabaseError::QueryFailed(
+                "Failed to update cipher during rotation".to_string(),
+            ))
+        })?;
         cipher_statements.push(stmt);
     }
 
@@ -763,7 +825,14 @@ pub async fn post_rotatekey(
         now,
         user_id
     )
-    .map_err(|_| AppError::Database)?
+    .map_err(|e| {
+        log::error!(
+            "Database error updating user account keys during rotation: {e}"
+        );
+        AppError::Database(DatabaseError::QueryFailed(
+            "Failed to update user account keys".to_string(),
+        ))
+    })?
     .run()
     .await?;
 
@@ -803,9 +872,13 @@ pub async fn post_kdf(
         .await
         .map_err(|e| {
             log::error!("Database error fetching user for KDF change: {e}");
-            AppError::Database
+            AppError::Database(DatabaseError::QueryFailed(
+                "Failed to fetch user for KDF change".to_string(),
+            ))
         })?
-        .ok_or_else(|| AppError::NotFound("User not found".to_string()))?;
+        .ok_or_else(|| AppError::NotFound {
+            resource: "User not found".to_string(),
+        })?;
     let user: User = serde_json::from_value(user).map_err(|e| {
         log::error!("Error deserializing user for KDF change: {e}");
         AppError::Internal
@@ -817,7 +890,7 @@ pub async fn post_kdf(
         .await?;
 
     if !verification.is_valid() {
-        return Err(AppError::Unauthorized("Invalid password".to_string()));
+        return Err(AppError::Auth(AuthError::InvalidPassword));
     }
 
     // Additional validation for complex format
@@ -826,14 +899,14 @@ pub async fn post_kdf(
     {
         // KDF settings must match between authentication and unlock
         if auth_data.kdf != unlock_data.kdf {
-            return Err(AppError::BadRequest(
+            return Err(AppError::Params(
                 "KDF settings must be equal for authentication and unlock"
                     .to_string(),
             ));
         }
         // Salt (email) must match
         if user.email != auth_data.salt || user.email != unlock_data.salt {
-            return Err(AppError::BadRequest(
+            return Err(AppError::Params(
                 "Invalid master password salt".to_string(),
             ));
         }
@@ -842,7 +915,7 @@ pub async fn post_kdf(
     // Extract KDF parameters from either format
     let (kdf_type, kdf_iterations, kdf_memory, kdf_parallelism) =
         payload.get_kdf_params().ok_or_else(|| {
-            AppError::BadRequest("Missing KDF parameters".to_string())
+            AppError::Params("Missing KDF parameters".to_string())
         })?;
 
     // Validate new KDF parameters
@@ -893,7 +966,12 @@ pub async fn post_kdf(
         now,
         user_id
     )
-    .map_err(|_| AppError::Database)?
+    .map_err(|e| {
+        log::error!("Database error updating KDF settings: {e}");
+        AppError::Database(DatabaseError::QueryFailed(
+            "Failed to update KDF settings".to_string(),
+        ))
+    })?
     .run()
     .await?;
 

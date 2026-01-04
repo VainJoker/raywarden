@@ -1,8 +1,8 @@
 use axum::http::HeaderMap;
 
 use crate::{
+    api::AppState,
     errors::AppError,
-    warden::AppState,
 };
 
 const LOGIN_RATE_LIMITER: &str = "LOGIN_RATE_LIMITER";
@@ -26,9 +26,10 @@ pub async fn check_rate_limit(
     if let Ok(outcome) = rate_limiter.limit(rate_limit_key).await &&
         !outcome.success
     {
-        return Err(AppError::TooManyRequests(
-            "Too many login attempts. Please try again later.".to_string(),
-        ));
+        return Err(AppError::TooManyRequests {
+            message: "Too many login attempts. Please try again later."
+                .to_string(),
+        });
     }
 
     Ok(())

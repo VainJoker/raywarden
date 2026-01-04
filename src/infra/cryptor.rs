@@ -16,7 +16,11 @@ use web_sys::{
 };
 use worker::js_sys;
 
-use crate::errors::AppError;
+use crate::errors::{
+    AppError,
+    AuthError,
+    CryptoError,
+};
 
 /// Number of PBKDF2 iterations for server-side password hashing
 const SERVER_PBKDF2_ITERATIONS: u32 = 100_000;
@@ -25,22 +29,35 @@ const SALT_LENGTH: usize = 16;
 /// Derived key length in bits
 const KEY_LENGTH_BITS: u32 = 256;
 
+fn crypto_error<E: std::fmt::Debug>(context: &str, err: E) -> AppError {
+    log::error!("{context}: {err:?}");
+    // Infer specific crypto error type from context
+    let error_type = if context.contains("PBKDF2") {
+        CryptoError::Pbkdf2Failed
+    } else if context.contains("HMAC") {
+        CryptoError::HmacFailed
+    } else if context.contains("random") || context.contains("salt") {
+        CryptoError::RandomGenerationFailed
+    } else if context.contains("algorithm") || context.contains("hash") {
+        CryptoError::HashFailed
+    } else {
+        CryptoError::KeyDerivationFailed
+    };
+    AppError::Crypto(error_type)
+}
+
 /// Gets the Crypto interface from the global scope.
 /// Works in Cloudflare Workers by using `js_sys::Reflect` instead of
 /// `WorkerGlobalScope`.
 fn get_crypto() -> Result<Crypto, AppError> {
     let global = js_sys::global();
-    let crypto_value = js_sys::Reflect::get(
-        &global,
-        &JsValue::from_str("crypto"),
-    )
-    .map_err(|e| {
-        AppError::Crypto(format!("Failed to get crypto property: {e:?}"))
-    })?;
+    let crypto_value =
+        js_sys::Reflect::get(&global, &JsValue::from_str("crypto"))
+            .map_err(|e| crypto_error("Failed to get crypto property", e))?;
 
-    crypto_value.dyn_into::<Crypto>().map_err(|e| {
-        AppError::Crypto(format!("Failed to cast to Crypto: {e:?}"))
-    })
+    crypto_value
+        .dyn_into::<Crypto>()
+        .map_err(|e| crypto_error("Failed to cast to Crypto", e))
 }
 
 /// Gets the `SubtleCrypto` interface from the global scope.
@@ -69,14 +86,10 @@ pub async fn pbkdf2_sha256(
                 false,
                 &js_sys::Array::of1(&JsValue::from_str("deriveBits")),
             )
-            .map_err(|e| {
-                AppError::Crypto(format!("PBKDF2 import_key failed: {e:?}"))
-            })?,
+            .map_err(|e| crypto_error("PBKDF2 import_key failed", e))?,
     )
     .await
-    .map_err(|e| {
-        AppError::Crypto(format!("PBKDF2 import_key await failed: {e:?}"))
-    })?;
+    .map_err(|e| crypto_error("PBKDF2 import_key await failed", e))?;
 
     let salt_array = Uint8Array::new_from_slice(salt);
     // Define PBKDF2 parameters
@@ -95,14 +108,10 @@ pub async fn pbkdf2_sha256(
                 &CryptoKey::from(key_material),
                 key_length_bits,
             )
-            .map_err(|e| {
-                AppError::Crypto(format!("PBKDF2 derive_bits failed: {e:?}"))
-            })?,
+            .map_err(|e| crypto_error("PBKDF2 derive_bits failed", e))?,
     )
     .await
-    .map_err(|e| {
-        AppError::Crypto(format!("PBKDF2 derive_bits await failed: {e:?}"))
-    })?;
+    .map_err(|e| crypto_error("PBKDF2 derive_bits await failed", e))?;
 
     Ok(js_sys::Uint8Array::new(&derived_bits).to_vec())
 }
@@ -113,9 +122,7 @@ pub fn generate_salt() -> Result<String, AppError> {
     let salt = Uint8Array::new_with_length(SALT_LENGTH as u32);
     crypto
         .get_random_values_with_array_buffer_view(&salt)
-        .map_err(|e| {
-            AppError::Crypto(format!("Failed to generate random salt: {e:?}"))
-        })?;
+        .map_err(|e| crypto_error("Failed to generate random salt", e))?;
 
     Ok(BASE64.encode(salt.to_vec()))
 }
@@ -126,9 +133,9 @@ pub async fn hash_password_for_storage(
     client_password_hash: &str,
     salt: &str,
 ) -> Result<String, AppError> {
-    let salt_bytes = BASE64.decode(salt).map_err(|e| {
-        AppError::Crypto(format!("Failed to decode salt: {e:?}"))
-    })?;
+    let salt_bytes = BASE64
+        .decode(salt)
+        .map_err(|e| crypto_error("Failed to decode salt", e))?;
 
     let derived = pbkdf2_sha256(
         client_password_hash.as_bytes(),
@@ -167,7 +174,7 @@ pub fn base32_decode(input: &str) -> Result<Vec<u8>, AppError> {
         .or_else(|| {
             base32::decode(base32::Alphabet::Rfc4648 { padding: false }, input)
         })
-        .ok_or_else(|| AppError::Crypto("Invalid Base32 input".to_string()))
+        .ok_or_else(|| AppError::Crypto(CryptoError::InvalidBase32))
 }
 
 /// Encodes bytes into a Base32 string (RFC 4648, uppercase).
@@ -182,9 +189,7 @@ pub fn generate_totp_secret() -> Result<String, AppError> {
     let secret = Uint8Array::new_with_length(20);
     crypto
         .get_random_values_with_array_buffer_view(&secret)
-        .map_err(|e| {
-            AppError::Crypto(format!("Failed to generate TOTP secret: {e:?}"))
-        })?;
+        .map_err(|e| crypto_error("Failed to generate TOTP secret", e))?;
 
     Ok(base32_encode(&secret.to_vec()))
 }
@@ -200,15 +205,13 @@ async fn hmac_sha1(key: &[u8], data: &[u8]) -> Result<Vec<u8>, AppError> {
         &JsValue::from_str("name"),
         &JsValue::from_str("HMAC"),
     )
-    .map_err(|e| {
-        AppError::Crypto(format!("Failed to set algorithm name: {e:?}"))
-    })?;
+    .map_err(|e| crypto_error("Failed to set algorithm name", e))?;
     js_sys::Reflect::set(
         &algorithm,
         &JsValue::from_str("hash"),
         &JsValue::from_str("SHA-1"),
     )
-    .map_err(|e| AppError::Crypto(format!("Failed to set hash: {e:?}")))?;
+    .map_err(|e| crypto_error("Failed to set hash", e))?;
 
     // Import the key
     let key_array = Uint8Array::new_from_slice(key);
@@ -223,14 +226,10 @@ async fn hmac_sha1(key: &[u8], data: &[u8]) -> Result<Vec<u8>, AppError> {
                 false,
                 &key_usages,
             )
-            .map_err(|e| {
-                AppError::Crypto(format!("HMAC import_key failed: {e:?}"))
-            })?,
+            .map_err(|e| crypto_error("HMAC import_key failed", e))?,
     )
     .await
-    .map_err(|e| {
-        AppError::Crypto(format!("HMAC import_key await failed: {e:?}"))
-    })?;
+    .map_err(|e| crypto_error("HMAC import_key await failed", e))?;
 
     // Sign the data using sign_with_str_and_buffer_source
     let data_array = Uint8Array::new_from_slice(data);
@@ -241,12 +240,10 @@ async fn hmac_sha1(key: &[u8], data: &[u8]) -> Result<Vec<u8>, AppError> {
                 &CryptoKey::from(crypto_key),
                 &data_array,
             )
-            .map_err(|e| {
-                AppError::Crypto(format!("HMAC sign failed: {e:?}"))
-            })?,
+            .map_err(|e| crypto_error("HMAC sign failed", e))?,
     )
     .await
-    .map_err(|e| AppError::Crypto(format!("HMAC sign await failed: {e:?}")))?;
+    .map_err(|e| crypto_error("HMAC sign await failed", e))?;
 
     Ok(Uint8Array::new(&signature).to_vec())
 }
@@ -302,9 +299,7 @@ pub async fn validate_totp(
 ) -> Result<i64, AppError> {
     // Validate code format
     if code.len() != 6 || !code.chars().all(|c| c.is_ascii_digit()) {
-        return Err(AppError::BadRequest(
-            "Invalid TOTP code format".to_string(),
-        ));
+        return Err(AppError::Auth(AuthError::InvalidTotp));
     }
 
     let current_time = chrono::Utc::now().timestamp();
@@ -328,10 +323,7 @@ pub async fn validate_totp(
         }
     }
 
-    Err(AppError::Unauthorized(format!(
-        "Invalid TOTP code. Server time: {}",
-        chrono::Utc::now().format("%Y-%m-%d %H:%M:%S UTC")
-    )))
+    Err(AppError::Auth(AuthError::InvalidTotp))
 }
 
 /// Generates a recovery code (20 characters, Base32 encoded).
@@ -340,9 +332,7 @@ pub fn generate_recovery_code() -> Result<String, AppError> {
     let bytes = Uint8Array::new_with_length(20);
     crypto
         .get_random_values_with_array_buffer_view(&bytes)
-        .map_err(|e| {
-            AppError::Crypto(format!("Failed to generate recovery code: {e:?}"))
-        })?;
+        .map_err(|e| crypto_error("Failed to generate recovery code", e))?;
 
     Ok(base32_encode(&bytes.to_vec()))
 }

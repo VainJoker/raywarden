@@ -4,7 +4,15 @@ use axum::{
 };
 
 use crate::{
-    errors::AppError,
+    api::{
+        AppState,
+        service::claims::Claims,
+    },
+    errors::{
+        AppError,
+        AuthError,
+        DatabaseError,
+    },
     models::{
         folder::{
             Folder,
@@ -12,10 +20,6 @@ use crate::{
         },
         sync::Profile,
         user::User,
-    },
-    warden::{
-        AppState,
-        service::claims::Claims,
     },
 };
 
@@ -30,18 +34,23 @@ pub async fn get_sync_data(
     // Fetch profile
     let user: User = db
         .prepare("SELECT * FROM users WHERE id = ?1")
-        .bind(&[user_id.clone().into()])?
+        .bind(&[user_id.clone().into()])
+        .map_err(map_db_error("sync:get_user bind"))?
         .first(None)
-        .await?
-        .ok_or_else(|| AppError::NotFound("User not found".to_string()))?;
+        .await
+        .map_err(map_db_error("sync:get_user first"))?
+        .ok_or_else(|| AppError::Auth(AuthError::UserNotFound))?;
 
     // Fetch folders
     let folders_db: Vec<Folder> = db
         .prepare("SELECT * FROM folders WHERE user_id = ?1")
-        .bind(&[user_id.clone().into()])?
+        .bind(&[user_id.clone().into()])
+        .map_err(map_db_error("sync:list_folders bind"))?
         .all()
-        .await?
-        .results()?;
+        .await
+        .map_err(map_db_error("sync:list_folders all"))?
+        .results()
+        .map_err(map_db_error("sync:list_folders results"))?;
 
     let folders: Vec<FolderResponse> = folders_db
         .into_iter()
@@ -60,7 +69,7 @@ pub async fn get_sync_data(
     // .await?;
 
     // Serialize profile and folders (small data, acceptable CPU cost)
-    let profile = Profile::from_user(user)?;
+    let profile = Profile::from_user(user);
     // Build a proper JSON value so Axum sets Content-Type: application/json
     let response = serde_json::json!({
         "profile": profile,
@@ -74,4 +83,11 @@ pub async fn get_sync_data(
     });
 
     Ok(Json(response))
+}
+
+fn map_db_error(context: &'static str) -> impl Fn(worker::Error) -> AppError {
+    move |e| {
+        log::error!("{context}: {e}");
+        AppError::Database(DatabaseError::QueryFailed(context.to_string()))
+    }
 }

@@ -19,7 +19,7 @@ use sync::sync_router;
 use twofactor::twofactor_router;
 use webauth::webauthn_router;
 
-use crate::warden::AppState;
+use crate::api::AppState;
 
 /// Build the main application router with all grouped routes.
 pub fn api_router(state: AppState) -> Router {

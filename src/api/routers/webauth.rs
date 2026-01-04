@@ -3,9 +3,9 @@ use axum::{
     routing::get,
 };
 
-use crate::warden::{
+use crate::api::{
     AppState,
-    api::webauth,
+    controller::webauth,
 };
 
 pub fn webauthn_router() -> Router<AppState> {
