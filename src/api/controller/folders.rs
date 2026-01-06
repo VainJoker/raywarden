@@ -55,7 +55,9 @@ pub async fn list_folders(
         })?
         .results()
         .map_err(|e| {
-            log::error!("Failed to parse query results for listing folders: {e:?}");
+            log::error!(
+                "Failed to parse query results for listing folders: {e:?}"
+            );
             AppError::Database(DatabaseError::QueryFailed(
                 "Failed to parse query results for listing folders".to_string(),
             ))

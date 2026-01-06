@@ -180,7 +180,9 @@ impl HttpStatusMapping for AppError {
             Self::TwoFactorRequired(_) => StatusCode::BAD_REQUEST,
             Self::NotFound { .. } => StatusCode::NOT_FOUND,
             Self::TooManyRequests { .. } => StatusCode::TOO_MANY_REQUESTS,
-            Self::Unauthorized { .. } | Self::Jwt(_) => StatusCode::UNAUTHORIZED,
+            Self::Unauthorized { .. } | Self::Jwt(_) => {
+                StatusCode::UNAUTHORIZED
+            }
             Self::Auth(auth_err) => auth_err.http_status_code(),
             Self::Config(_) |
             Self::Worker(_) |
@@ -198,8 +200,9 @@ impl HttpStatusMapping for AuthError {
             Self::InvalidPassword |
             Self::MissingToken |
             Self::InvalidTotp => StatusCode::UNAUTHORIZED,
-            Self::InsufficientPermissions |
-            Self::AccountLocked => StatusCode::FORBIDDEN,
+            Self::InsufficientPermissions | Self::AccountLocked => {
+                StatusCode::FORBIDDEN
+            }
             Self::InvalidKDF(_) => StatusCode::BAD_REQUEST,
             Self::UserNotFound => StatusCode::NOT_FOUND,
         }

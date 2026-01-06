@@ -1,3 +1,4 @@
+use chrono::Utc;
 use serde::{
     Deserialize,
     Deserializer,
@@ -10,8 +11,18 @@ use serde_json::{
     Value,
     json,
 };
+use worker::{
+    D1Database,
+    query,
+};
 
-use crate::models::attachment::AttachmentResponse;
+use crate::{
+    errors::{
+        AppError,
+        DatabaseError,
+    },
+    models::attachment::AttachmentResponse,
+};
 
 // Cipher types:
 //   Login = 1,
@@ -399,4 +410,65 @@ pub struct CipherListResponse {
 pub struct PartialCipherData {
     pub folder_id: Option<String>,
     pub favorite:  bool,
+}
+
+impl Cipher {
+    pub async fn touch_cipher_updated_at(
+        db: &D1Database,
+        cipher_id: &str,
+    ) -> Result<(), AppError> {
+        let now = Utc::now().format("%Y-%m-%dT%H:%M:%S%.3fZ").to_string();
+        query!(
+            db,
+            "UPDATE ciphers SET updated_at = ?1 WHERE id = ?2",
+            now,
+            cipher_id
+        )
+        .map_err(|_| {
+            AppError::Database(DatabaseError::QueryFailed(
+                "Failed to update cipher updated_at".to_string(),
+            ))
+        })?
+        .run()
+        .await?;
+        Ok(())
+    }
+
+    pub async fn ensure_cipher_for_user(
+        db: &D1Database,
+        cipher_id: &str,
+        user_id: &str,
+    ) -> Result<CipherDBModel, AppError> {
+        let cipher: Option<CipherDBModel> = db
+            .prepare("SELECT * FROM ciphers WHERE id = ?1 AND user_id = ?2")
+            .bind(&[cipher_id.into(), user_id.into()])?
+            .first(None)
+            .await
+            .map_err(|e| {
+                log::error!("Failed to fetch cipher for user: {e}");
+                AppError::Database(DatabaseError::QueryFailed(
+                    "Failed to fetch cipher".to_string(),
+                ))
+            })?;
+
+        let cipher = cipher.ok_or_else(|| {
+            AppError::Database(DatabaseError::QueryFailed(
+                "Cipher not found".to_string(),
+            ))
+        })?;
+
+        if cipher.organization_id.is_some() {
+            return Err(AppError::Database(DatabaseError::QueryFailed(
+                "Organization attachments are not supported".to_string(),
+            )));
+        }
+
+        if cipher.deleted_at.is_some() {
+            return Err(AppError::Database(DatabaseError::QueryFailed(
+                "Cipher is deleted".to_string(),
+            )));
+        }
+
+        Ok(cipher)
+    }
 }

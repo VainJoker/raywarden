@@ -1,11 +1,19 @@
+use chrono::Utc;
 use constant_time_eq::constant_time_eq;
 use serde::{
     Deserialize,
     Serialize,
 };
+use worker::{
+    D1Database,
+    query,
+};
 
 use crate::{
-    errors::AppError,
+    errors::{
+        AppError,
+        DatabaseError,
+    },
     infra::cryptor::verify_password,
     models::serde_helpers::bool_from_int,
 };
@@ -331,4 +339,27 @@ pub struct ProfileData {
 #[serde(rename_all = "camelCase")]
 pub struct AvatarData {
     pub avatar_color: Option<String>,
+}
+
+impl User {
+    pub async fn touch_user_updated_at(
+        db: &D1Database,
+        user_id: &str,
+    ) -> Result<(), AppError> {
+        let now = Utc::now().format("%Y-%m-%dT%H:%M:%S%.3fZ").to_string();
+        query!(
+            db,
+            "UPDATE users SET updated_at = ?1 WHERE id = ?2",
+            now,
+            user_id
+        )
+        .map_err(|_| {
+            AppError::Database(DatabaseError::QueryFailed(
+                "Failed to bind query for updating user".to_string(),
+            ))
+        })?
+        .run()
+        .await?;
+        Ok(())
+    }
 }

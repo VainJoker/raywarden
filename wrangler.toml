@@ -8,6 +8,7 @@ preview_urls = false
 [build]
 command = "cargo install -q worker-build@^0.7 && worker-build --release"
 
+
 # Rate limiting configuration for protecting sensitive endpoints
 # See: https://developers.cloudflare.com/workers/runtime-apis/bindings/rate-limit/
 [[ratelimits]]
@@ -62,11 +63,11 @@ database_name = "warden-db"
 database_id = "6bb5ee22-69d1-4f71-a9c2-8ff1187b988e"
 migrations_dir = "migrations"
 
-# # R2 bucket for file attachments (optional)
-# # Uncomment and configure this section to enable file attachments
-# # [[r2_buckets]]
-# # binding = "ATTACHMENTS_BUCKET"
-# # bucket_name = "warden-attachments"
+# R2 bucket for file attachments (optional)
+# Uncomment and configure this section to enable file attachments
+[[r2_buckets]]
+binding = "ATTACHMENTS_BUCKET"
+bucket_name = "warden-attachments"
 
 [env.dev]
 name = "raywarden-worker-dev"
@@ -88,11 +89,11 @@ workers_dev = true
 # database_id = "6bb5ee22-69d1-4f71-a9c2-8ff1187b988e"
 # migrations_dir = "migrations"
 
-# # R2 bucket for file attachments in dev environment (optional)
-# # Uncomment and configure this section to enable file attachments
-# # [[env.dev.r2_buckets]]
-# # binding = "ATTACHMENTS_BUCKET"
-# # bucket_name = "warden-attachments-dev"
+# R2 bucket for file attachments in dev environment (optional)
+# Uncomment and configure this section to enable file attachments
+[[env.dev.r2_buckets]]
+binding = "ATTACHMENTS_BUCKET"
+bucket_name = "warden-attachments-dev"
 
 # logs
 [env.dev.observability]

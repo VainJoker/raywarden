@@ -14,3 +14,8 @@ mv public/web-vault/* public/
 shopt -u dotglob
 rmdir public/web-vault
 rm bw_web_${LATEST_TAG}.tar.gz
+
+rm ./public/**/*.map
+
+mkdir -p public/css
+cp tools/vaultwarden.css public/css/vaultwarden.css
