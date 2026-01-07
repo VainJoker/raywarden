@@ -16,6 +16,10 @@ use crate::api::{
 pub fn accounts_router() -> Router<AppState> {
     Router::new()
         .route("/api/accounts/revision-date", get(accounts::revision_date))
+        .route(
+            "/api/auth-requests/pending",
+            get(accounts::get_auth_requests_pending),
+        )
         .route("/api/accounts/profile", get(accounts::get_profile))
         .route("/api/accounts/profile", post(accounts::post_profile))
         .route("/api/accounts/profile", put(accounts::put_profile))

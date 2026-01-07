@@ -43,6 +43,7 @@ use crate::{
     models::{
         cipher::CipherData,
         sync::Profile,
+        twofactor::TwoFactor,
         user::{
             AvatarData,
             ChangeKdfRequest,
@@ -149,6 +150,8 @@ pub async fn register(
         kdf_memory,
         kdf_parallelism,
         security_stamp: Uuid::new_v4().to_string(),
+        equivalent_domains: "[]".to_string(),
+        excluded_globals: "[]".to_string(),
         totp_recover: None,
         created_at: now.clone(),
         updated_at: now,
@@ -195,6 +198,20 @@ pub async fn revision_date(
     Ok(Json(revision_date))
 }
 
+/// GET /api/auth-requests/pending
+///
+/// Stub: always returns an empty list.
+#[worker::send]
+pub async fn get_auth_requests_pending(
+    _claims: Claims,
+) -> Result<Json<Value>, AppError> {
+    Ok(Json(json!({
+        "data": [],
+        "continuationToken": null,
+        "object": "list"
+    })))
+}
+
 #[worker::send]
 pub async fn get_profile(
     claims: Claims,
@@ -205,12 +222,14 @@ pub async fn get_profile(
 
     let user: User = db
         .prepare("SELECT * FROM users WHERE id = ?1")
-        .bind(&[user_id.into()])?
+        .bind(&[user_id.clone().into()])?
         .first(None)
         .await?
         .ok_or_else(|| AppError::Auth(AuthError::AccountLocked))?;
 
-    let profile = Profile::from_user(user);
+    let two_factor_enabled =
+        TwoFactor::two_factor_enabled(&db, &user_id).await?;
+    let profile = Profile::from_user(user, two_factor_enabled);
 
     Ok(Json(profile))
 }
@@ -275,7 +294,9 @@ pub async fn post_profile(
         ))
     })?;
 
-    let profile = Profile::from_user(user);
+    let two_factor_enabled =
+        TwoFactor::two_factor_enabled(&db, user_id).await?;
+    let profile = Profile::from_user(user, two_factor_enabled);
 
     Ok(Json(profile))
 }
@@ -352,7 +373,9 @@ pub async fn put_avatar(
         ))
     })?;
 
-    let profile = Profile::from_user(user);
+    let two_factor_enabled =
+        TwoFactor::two_factor_enabled(&db, user_id).await?;
+    let profile = Profile::from_user(user, two_factor_enabled);
 
     Ok(Json(profile))
 }

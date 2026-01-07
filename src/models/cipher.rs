@@ -11,6 +11,7 @@ use serde_json::{
     Value,
     json,
 };
+use wasm_bindgen::JsValue;
 use worker::{
     D1Database,
     query,
@@ -67,6 +68,11 @@ pub struct CipherData {
     pub notes:       Option<String>,
     #[serde(flatten)]
     pub type_fields: CipherTypeFields,
+}
+
+#[derive(Deserialize)]
+struct CipherJsonArrayRow {
+    ciphers_json: String,
 }
 
 // Custom deserialization function for booleans
@@ -470,5 +476,151 @@ impl Cipher {
         }
 
         Ok(cipher)
+    }
+
+    /// Execute a cipher JSON projection query and return the raw JSON array
+    /// string. This avoids JSON parsing in Rust, significantly reducing CPU
+    /// time.
+    pub async fn fetch_cipher_json_array_raw(
+        db: &worker::D1Database,
+        attachments_enabled: bool,
+        where_clause: &str,
+        params: &[JsValue],
+        order_clause: &str,
+    ) -> Result<String, AppError> {
+        let sql = Self::cipher_json_array_sql(
+            attachments_enabled,
+            where_clause,
+            order_clause,
+        );
+
+        let row: Option<CipherJsonArrayRow> = db
+            .prepare(&sql)
+            .bind(params)
+            .map_err(|e| {
+                log::error!("Failed to bind cipher JSON projection query: {e}");
+                AppError::Database(DatabaseError::QueryFailed(
+                    "Failed to query ciphers".to_string(),
+                ))
+            })?
+            .first(None)
+            .await
+            .map_err(|e| Self::map_d1_json_error(&e))?;
+
+        Ok(row.map_or_else(|| "[]".to_string(), |r| r.ciphers_json))
+    }
+
+    /// Build SQL that returns ciphers as a JSON array string (using
+    /// `json_group_array`).
+    fn cipher_json_array_sql(
+        attachments_enabled: bool,
+        where_clause: &str,
+        order_clause: &str,
+    ) -> String {
+        let cipher_expr = Self::cipher_json_expr(attachments_enabled);
+        // Use a subquery to ensure ORDER BY is applied before json_group_array
+        format!(
+            "SELECT COALESCE(json_group_array(json(sub.cipher_json)), '[]') \
+             AS ciphers_json
+        FROM (
+            SELECT {cipher_expr} AS cipher_json
+            FROM ciphers c
+            {where_clause}
+            {order_clause}
+        ) sub",
+        )
+    }
+
+    /// Build the SQL expression for a single cipher as JSON.
+    fn cipher_json_expr(attachments_enabled: bool) -> String {
+        let attachments_expr = if attachments_enabled {
+            "
+            (
+                SELECT CASE WHEN COUNT(1)=0 THEN NULL ELSE json_group_array(
+                    json_object(
+                        'id', a.id,
+                        'url', NULL,
+                        'fileName', a.file_name,
+                        'size', CAST(a.file_size AS TEXT),
+                        'sizeName',
+                            CASE
+                                WHEN a.file_size < 1024 THEN printf('%d B', \
+             a.file_size)
+                                WHEN a.file_size < 1048576 THEN printf('%.1f \
+             KB', a.file_size / 1024.0)
+                                WHEN a.file_size < 1073741824 THEN \
+             printf('%.1f MB', a.file_size / 1048576.0)
+                                WHEN a.file_size < 1099511627776 THEN \
+             printf('%.1f GB', a.file_size / 1073741824.0)
+                                ELSE printf('%.1f TB', a.file_size / \
+             1099511627776.0)
+                            END,
+                        'key', a.akey,
+                        'object', 'attachment'
+                    )
+                ) END
+                FROM attachments a
+                WHERE a.cipher_id = c.id
+            )
+        "
+        } else {
+            "NULL"
+        };
+
+        format!(
+            "json_object(
+            'object', 'cipherDetails',
+            'id', c.id,
+            'userId', c.user_id,
+            'organizationId', c.organization_id,
+            'folderId', c.folder_id,
+            'type', c.type,
+            'favorite', CASE WHEN c.favorite THEN json('true') ELSE \
+             json('false') END,
+            'edit', json('true'),
+            'viewPassword', json('true'),
+            'permissions', json_object('delete', json('true'), 'restore', \
+             json('true')),
+            'organizationUseTotp', json('false'),
+            'collectionIds', NULL,
+            'revisionDate', c.updated_at,
+            'creationDate', c.created_at,
+            'deletedDate', c.deleted_at,
+            'attachments', {attachments_expr},
+            'name', json_extract(c.data, '$.name'),
+            'notes', json_extract(c.data, '$.notes'),
+            'fields', json_extract(c.data, '$.fields'),
+            'passwordHistory', json_extract(c.data, '$.passwordHistory'),
+            'reprompt', COALESCE(json_extract(c.data, '$.reprompt'), 0),
+            'login', CASE WHEN c.type = 1 THEN json_extract(c.data, '$.login') \
+             ELSE NULL END,
+            'secureNote', CASE WHEN c.type = 2 THEN json_extract(c.data, \
+             '$.secureNote') ELSE NULL END,
+            'card', CASE WHEN c.type = 3 THEN json_extract(c.data, '$.card') \
+             ELSE NULL END,
+            'identity', CASE WHEN c.type = 4 THEN json_extract(c.data, \
+             '$.identity') ELSE NULL END,
+            'sshKey', CASE WHEN c.type = 5 THEN json_extract(c.data, \
+             '$.sshKey') ELSE NULL END
+        )"
+        )
+    }
+
+    pub fn map_d1_json_error(err: &worker::Error) -> AppError {
+        let msg = err.to_string();
+        let is_invalid_json = msg.contains("malformed JSON") ||
+            msg.contains("Invalid JSON") ||
+            msg.contains("json_each") && msg.contains("JSON") ||
+            msg.contains("json_extract") && msg.contains("JSON");
+
+        if is_invalid_json {
+            log::warn!("Invalid JSON body (D1): {msg}");
+            AppError::Params("Invalid JSON body".to_string())
+        } else {
+            log::error!("D1 query failed: {msg}");
+            AppError::Database(DatabaseError::QueryFailed(
+                "Database query failed".to_string(),
+            ))
+        }
     }
 }

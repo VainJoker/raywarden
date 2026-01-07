@@ -79,9 +79,9 @@ pub async fn insert_user(
         "INSERT INTO users (id, name, email, master_password_hash, \
          master_password_hint, password_salt, key, private_key, public_key, \
          kdf_type, kdf_iterations, kdf_memory, kdf_parallelism, \
-         security_stamp, totp_recover, created_at, updated_at) VALUES (?1, \
-         ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, \
-         ?17)",
+         security_stamp, equivalent_domains, excluded_globals,totp_recover, \
+         created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, \
+         ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19)",
         user.id,
         user.name,
         user.email,
@@ -96,6 +96,8 @@ pub async fn insert_user(
         user.kdf_memory,
         user.kdf_parallelism,
         user.security_stamp,
+        user.equivalent_domains,
+        user.excluded_globals,
         user.totp_recover,
         user.created_at,
         user.updated_at

@@ -6,6 +6,7 @@ pub mod devices;
 pub mod emergency;
 pub mod folders;
 pub mod identity;
+pub mod others;
 pub mod sync;
 pub mod twofactor;
 pub mod webauth;
@@ -19,6 +20,7 @@ use devices::devices_router;
 use emergency::emergency_router;
 use folders::folders_router;
 use identity::identity_router;
+use others::others_router;
 use sync::sync_router;
 use twofactor::twofactor_router;
 use webauth::webauthn_router;
@@ -39,5 +41,6 @@ pub fn api_router(state: AppState) -> Router {
         .merge(twofactor_router())
         .merge(emergency_router())
         .merge(webauthn_router())
+        .merge(others_router())
         .with_state(state)
 }

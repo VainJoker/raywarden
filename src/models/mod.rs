@@ -1,5 +1,6 @@
 pub mod attachment;
 pub mod cipher;
+pub mod domains;
 pub mod folder;
 pub mod import;
 pub mod serde_helpers;

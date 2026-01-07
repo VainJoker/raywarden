@@ -16,6 +16,8 @@ CREATE TABLE IF NOT EXISTS users (
     kdf_memory INTEGER, -- Argon2 memory parameter in MB (15-1024), NULL for PBKDF2
     kdf_parallelism INTEGER, -- Argon2 parallelism parameter (1-16), NULL for PBKDF2
     security_stamp TEXT,
+    equivalent_domains TEXT NOT NULL DEFAULT '[]', -- JSON: Vec<Vec<String>>
+    excluded_globals TEXT NOT NULL DEFAULT '[]', -- JSON: Vec<i32> (reserved for future global groups)
     totp_recover TEXT, -- Recovery code for 2FA
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL
@@ -88,3 +90,13 @@ CREATE TABLE IF NOT EXISTS folders (
     updated_at TEXT NOT NULL,
     FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
 );
+
+-- Global equivalent domains dataset (seeded separately, not bundled into the Worker)
+CREATE TABLE IF NOT EXISTS global_equivalent_domains (
+    type INTEGER PRIMARY KEY NOT NULL,
+    sort_order INTEGER NOT NULL,
+    domains_json TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_global_equivalent_domains_sort_order
+    ON global_equivalent_domains(sort_order);

@@ -7,7 +7,13 @@ use serde::{
     Serialize,
 };
 
-use crate::models::serde_helpers::bool_from_int;
+use crate::{
+    errors::{
+        AppError,
+        DatabaseError,
+    },
+    models::serde_helpers::bool_from_int,
+};
 
 /// Remember token expiration in days
 const REMEMBER_TOKEN_EXPIRATION_DAYS: i64 = 30;
@@ -74,6 +80,57 @@ impl TwoFactor {
             "type": self.atype,
             "object": "twoFactorProvider"
         })
+    }
+
+    /// List all 2FA records for a user (includes Remember tokens, excludes
+    /// atype >= 1000).
+    pub async fn list_user_twofactors(
+        db: &worker::D1Database,
+        user_id: &str,
+    ) -> Result<Vec<Self>, AppError> {
+        db.prepare(
+            "SELECT * FROM twofactor WHERE user_uuid = ?1 AND atype < 1000",
+        )
+        .bind(&[user_id.to_string().into()])?
+        .all()
+        .await
+        .map_err(|err| {
+            log::error!(
+                "Failed to query twofactor records for user {user_id}: {err}"
+            );
+            AppError::Database(DatabaseError::QueryFailed(
+                "list_user_twofactors".to_string(),
+            ))
+        })?
+        .results::<Self>()
+        .map_err(|err| {
+            log::error!(
+                "Failed to deserialize twofactor records for user {user_id}: \
+                 {err}"
+            );
+            AppError::Database(DatabaseError::QueryFailed(
+                "list_user_twofactors".to_string(),
+            ))
+        })
+    }
+
+    /// Whether the user has 2FA enabled.
+    ///
+    /// For now, we intentionally only treat Authenticator (TOTP) as a real 2FA
+    /// provider. Remember-device tokens are never considered a 2FA method
+    /// by themselves.
+    pub fn is_twofactor_enabled(twofactors: &[Self]) -> bool {
+        twofactors.iter().any(|tf| {
+            tf.enabled && tf.atype == TwoFactorType::Authenticator as i32
+        })
+    }
+
+    pub async fn two_factor_enabled(
+        db: &worker::D1Database,
+        user_id: &str,
+    ) -> Result<bool, AppError> {
+        let twofactors = Self::list_user_twofactors(db, user_id).await?;
+        Ok(Self::is_twofactor_enabled(&twofactors))
     }
 }
 

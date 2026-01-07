@@ -10,10 +10,7 @@ use axum::{
 
 use crate::api::{
     AppState,
-    controller::{
-        ciphers,
-        import,
-    },
+    controller::ciphers,
 };
 
 pub fn cipher_router() -> Router<AppState> {
@@ -66,5 +63,4 @@ pub fn cipher_router() -> Router<AppState> {
         // Purge vault - delete all ciphers and folders (requires password
         // verification)
         .route("/api/ciphers/purge", post(ciphers::purge_vault))
-        .route("/api/ciphers/import", post(import::import_data))
 }
