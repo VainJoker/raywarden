@@ -1,6 +1,6 @@
 name = "raywarden"
 main = "src/entry.js"
-compatibility_date = "2025-12-23"
+compatibility_date = "2026-01-06"
 keep_vars = true
 workers_dev = false
 preview_urls = false
@@ -29,8 +29,14 @@ html_handling = "auto-trailing-slash"
 # Only invoke Worker for API and Identity routes, serve static files directly for other routes
 run_worker_first = ["/api/*", "/identity/*"]
 
+[[routes]]
+pattern = "warden.vainjoker.online"
+zone_name = "vainjoker.online"
+custom_domain = true
+
 [vars]
 DOMAIN = "warden.vainjoker.online"
+ALLOWED_EMAILS = "hanjie.zhang1228@gmail.com"
 # Optional: Set the batch size for imports. Defaults to 30 if not set.
 # Set to 0 means no batching (all records imported in a single batch).
 # IMPORT_BATCH_SIZE = "30"
@@ -62,6 +68,9 @@ binding = "warden-db"
 database_name = "warden-db"
 database_id = "6bb5ee22-69d1-4f71-a9c2-8ff1187b988e"
 migrations_dir = "migrations"
+
+[observability.logs]
+enabled = true
 
 # R2 bucket for file attachments (optional)
 # Uncomment and configure this section to enable file attachments

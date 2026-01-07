@@ -2,6 +2,7 @@ use axum::{
     Form,
     Json,
     extract::State,
+    response::IntoResponse,
 };
 use chrono::{
     Duration,
@@ -19,7 +20,6 @@ use crate::{
     api::{
         AppState,
         service::{
-            auth,
             claims::Claims,
             rate,
         },
@@ -148,7 +148,7 @@ pub struct UserDecryptionOptions {
 pub async fn token(
     State(state): State<AppState>,
     Form(payload): Form<TokenRequest>,
-) -> Result<Json<TokenResponse>, AppError> {
+) -> Result<impl IntoResponse, AppError> {
     let db = state.get_db();
     match payload.grant_type.as_str() {
         "password" => {
@@ -233,7 +233,7 @@ pub async fn token(
                 let Some(twofactor_code) = &payload.two_factor_token else {
                     // Return 2FA required error
                     return Err(AppError::TwoFactorRequired(
-                        auth::json_err_twofactor(&twofactor_ids),
+                        twofactor_ids.into(),
                     ));
                 };
 
@@ -312,9 +312,7 @@ pub async fn token(
                                     .validate(device_id, twofactor_code)
                                 {
                                     return Err(AppError::TwoFactorRequired(
-                                        auth::json_err_twofactor(
-                                            &twofactor_ids,
-                                        ),
+                                        twofactor_ids.into(),
                                     ));
                                 }
 
@@ -356,12 +354,12 @@ pub async fn token(
                                 // Remember token valid, proceed with login
                             } else {
                                 return Err(AppError::TwoFactorRequired(
-                                    auth::json_err_twofactor(&twofactor_ids),
+                                    twofactor_ids.into(),
                                 ));
                             }
                         } else {
                             return Err(AppError::TwoFactorRequired(
-                                auth::json_err_twofactor(&twofactor_ids),
+                                twofactor_ids.into(),
                             ));
                         }
                     }

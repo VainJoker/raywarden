@@ -1,6 +1,10 @@
 use axum::http::StatusCode;
 use bizerror::*;
-use serde_json::Value;
+use serde_json::{
+    Map,
+    Value,
+    json,
+};
 use thiserror::Error as ThisError;
 
 // ============================================================================
@@ -56,7 +60,7 @@ pub enum AppError {
 
     #[bizcode(3110)]
     #[error("Two factor authentication required")]
-    TwoFactorRequired(Value),
+    TwoFactorRequired(Box<[i32]>),
 }
 
 #[derive(ThisError, BizError)]
@@ -164,6 +168,23 @@ impl AppError {
         Self::NotFound {
             resource: res.into(),
         }
+    }
+
+    pub fn twofactor_json(providers: &[i32]) -> Value {
+        let providers2: Map<String, Value> = providers
+            .iter()
+            .map(|p| (p.to_string(), Value::Null))
+            .collect();
+
+        json!({
+            "error": "invalid_grant",
+            "error_description": "Two factor required.",
+            "TwoFactorProviders": providers.iter().map(ToString::to_string).collect::<Vec<_>>(),
+            "TwoFactorProviders2": providers2,
+            "MasterPasswordPolicy": {
+                "Object": "masterPasswordPolicy"
+            }
+        })
     }
 }
 

@@ -31,7 +31,10 @@ use crate::{
         routers::api_router,
     },
     errors::{
-        AppError,
+        AppError::{
+            self,
+            TwoFactorRequired,
+        },
         AppResult,
         HttpStatusMapping as _,
     },
@@ -155,10 +158,13 @@ impl IntoResponse for AppError {
 
         let status_code = self.http_status_code();
         let error_code = self.code();
-        let message = self.to_string();
-
-        let response = ApiResponse::<()>::error(error_code, message);
-        (status_code, Json(response)).into_response()
+        if let TwoFactorRequired(v) = self {
+            (status_code, Json(Self::twofactor_json(&v))).into_response()
+        } else {
+            let response =
+                ApiResponse::<()>::error(error_code, self.to_string());
+            (status_code, Json(response)).into_response()
+        }
     }
 }
 

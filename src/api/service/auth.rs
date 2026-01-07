@@ -18,21 +18,6 @@ use crate::{
     models::user::User,
 };
 
-/// Generates the JSON error response for 2FA required.
-///
-/// Kept here so handlers don't need to know the exact Bitwarden-ish payload.
-pub fn json_err_twofactor(providers: &[i32]) -> Value {
-    serde_json::json!({
-        "error": "invalid_grant",
-        "error_description": "Two factor required.",
-        "TwoFactorProviders": providers.iter().map(std::string::ToString::to_string).collect::<Vec<String>>(),
-        "TwoFactorProviders2": {},
-        "MasterPasswordPolicy": {
-            "Object": "masterPasswordPolicy"
-        }
-    })
-}
-
 /// Generate access + refresh tokens and format the response.
 ///
 /// Contract:
