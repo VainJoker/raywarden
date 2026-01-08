@@ -4,8 +4,6 @@
 //! soft-deleted (marked with `deleted_at`) for longer than the configured
 //! retention period.
 
-use std::collections::HashSet;
-
 use chrono::{
     Duration,
     Utc,
@@ -13,10 +11,13 @@ use chrono::{
 use worker::{
     D1Database,
     Env,
-    query,
 };
 
-use crate::models::attachment::AttachmentDB;
+use crate::models::{
+    attachment::AttachmentDB,
+    cipher::CipherDB,
+    user::UserDB,
+};
 
 /// Default number of days to keep soft-deleted items before purging
 const DEFAULT_PURGE_DAYS: i64 = 30;
@@ -41,25 +42,12 @@ pub async fn purge_stale_pending_attachments(
     let pending_cutoff_str =
         pending_cutoff.format("%Y-%m-%dT%H:%M:%S%.3fZ").to_string();
 
-    let pending_count_result = query!(
-        &db,
-        "SELECT COUNT(*) as count FROM attachments_pending WHERE created_at < \
-         ?1",
-        pending_cutoff_str
-    )?
-    .first::<CountResult>(None)
-    .await?;
-
-    let pending_count = pending_count_result.map_or(0, |r| r.count);
+    let pending_count =
+        AttachmentDB::purge_pending_before(&db, &pending_cutoff_str)
+            .await
+            .map_err(|e| worker::Error::RustError(e.to_string()))?;
 
     if pending_count > 0 {
-        query!(
-            &db,
-            "DELETE FROM attachments_pending WHERE created_at < ?1",
-            pending_cutoff_str
-        )?
-        .run()
-        .await?;
         log::info!(
             "Purged {pending_count} pending attachment(s) older than \
              {PENDING_RETENTION_DAYS} day(s)"
@@ -106,32 +94,15 @@ pub async fn purge_deleted_ciphers(env: &Env) -> Result<u32, worker::Error> {
     );
 
     // First, get the list of affected user IDs before deletion
-    let affected_users_result: Vec<AffectedUser> = query!(
-        &db,
-        "SELECT DISTINCT user_id FROM ciphers WHERE deleted_at IS NOT NULL \
-         AND deleted_at < ?1 AND user_id IS NOT NULL",
-        cutoff_str
-    )?
-    .all()
-    .await?
-    .results()?;
-
-    let affected_user_ids: HashSet<String> = affected_users_result
-        .into_iter()
-        .filter_map(|u| u.user_id)
-        .collect();
+    let affected_user_ids =
+        CipherDB::list_soft_deleted_user_ids_before(&db, &cutoff_str)
+            .await
+            .map_err(|e| worker::Error::RustError(e.to_string()))?;
 
     // Count the records to be deleted (for logging purposes)
-    let count_result = query!(
-        &db,
-        "SELECT COUNT(*) as count FROM ciphers WHERE deleted_at IS NOT NULL \
-         AND deleted_at < ?1",
-        cutoff_str
-    )?
-    .first::<CountResult>(None)
-    .await?;
-
-    let count = count_result.map_or(0, |r| r.count);
+    let count = CipherDB::count_soft_deleted_before(&db, &cutoff_str)
+        .await
+        .map_err(|e| worker::Error::RustError(e.to_string()))?;
 
     if count > 0 {
         if AttachmentDB::attachments_enabled(env) {
@@ -150,28 +121,17 @@ pub async fn purge_deleted_ciphers(env: &Env) -> Result<u32, worker::Error> {
                 .map_err(|e| worker::Error::RustError(e.to_string()))?;
         }
 
-        // Delete the records
-        query!(
-            &db,
-            "DELETE FROM ciphers WHERE deleted_at IS NOT NULL AND deleted_at \
-             < ?1",
-            cutoff_str
-        )?
-        .run()
-        .await?;
+        CipherDB::delete_soft_deleted_before(&db, &cutoff_str)
+            .await
+            .map_err(|e| worker::Error::RustError(e.to_string()))?;
 
         log::info!("Successfully purged {count} soft-deleted cipher(s)");
 
         // Update the affected users' updated_at to trigger client sync
         for user_id in &affected_user_ids {
-            query!(
-                &db,
-                "UPDATE users SET updated_at = ?1 WHERE id = ?2",
-                now_str,
-                user_id
-            )?
-            .run()
-            .await?;
+            UserDB::set_updated_at(&db, user_id, &now_str)
+                .await
+                .map_err(|e| worker::Error::RustError(e.to_string()))?;
         }
 
         log::info!(
@@ -183,16 +143,4 @@ pub async fn purge_deleted_ciphers(env: &Env) -> Result<u32, worker::Error> {
     }
 
     Ok(count)
-}
-
-/// Helper struct for affected user query result
-#[derive(serde::Deserialize)]
-struct AffectedUser {
-    user_id: Option<String>,
-}
-
-/// Helper struct for count query result
-#[derive(serde::Deserialize)]
-struct CountResult {
-    count: u32,
 }

@@ -4,6 +4,7 @@ pub mod api;
 pub mod errors;
 pub mod infra;
 pub mod models;
+pub mod utils;
 
 use std::sync::OnceLock;
 

@@ -10,10 +10,6 @@ use serde_json::{
     json,
 };
 use uuid::Uuid;
-use worker::{
-    D1PreparedStatement,
-    query,
-};
 
 use crate::{
     api::{
@@ -34,16 +30,16 @@ use crate::{
     errors::{
         AppError,
         AuthError,
-        DatabaseError,
     },
     infra::cryptor::{
         generate_salt,
         hash_password_for_storage,
     },
     models::{
-        cipher::CipherData,
+        cipher::CipherDB,
+        folder::FolderDB,
         sync::Profile,
-        twofactor::TwoFactor,
+        twofactor::TwoFactorDB,
         user::{
             AvatarData,
             ChangeKdfRequest,
@@ -53,7 +49,7 @@ use crate::{
             ProfileData,
             RegisterRequest,
             RotateKeyRequest,
-            User,
+            UserDB,
         },
     },
 };
@@ -133,7 +129,7 @@ pub async fn register(
         (None, None)
     };
 
-    let user = User {
+    let user = UserDB {
         id: Uuid::new_v4().to_string(),
         name: payload.name,
         avatar_color: None,
@@ -173,28 +169,7 @@ pub async fn revision_date(
     State(state): State<AppState>,
 ) -> Result<Json<i64>, AppError> {
     let db = state.get_db();
-
-    // get the user's updated_at timestamp
-    let updated_at: Option<String> = db
-        .prepare("SELECT updated_at FROM users WHERE id = ?1")
-        .bind(&[claims.sub.into()])?
-        .first(Some("updated_at"))
-        .await
-        .map_err(|e| {
-            log::error!("Database error fetching revision date: {e}");
-            AppError::Database(DatabaseError::QueryFailed(
-                "Failed to fetch revision date".to_string(),
-            ))
-        })?;
-
-    // convert the timestamp to a millisecond-level Unix timestamp
-    let revision_date = updated_at
-        .and_then(|ts| chrono::DateTime::parse_from_rfc3339(&ts).ok())
-        .map_or_else(
-            || chrono::Utc::now().timestamp_millis(),
-            |dt| dt.timestamp_millis(),
-        );
-
+    let revision_date = UserDB::revision_date_ms(&db, &claims.sub).await?;
     Ok(Json(revision_date))
 }
 
@@ -220,15 +195,16 @@ pub async fn get_profile(
     let db = state.get_db();
     let user_id = claims.sub;
 
-    let user: User = db
-        .prepare("SELECT * FROM users WHERE id = ?1")
-        .bind(&[user_id.clone().into()])?
-        .first(None)
-        .await?
-        .ok_or_else(|| AppError::Auth(AuthError::AccountLocked))?;
+    let user = UserDB::fetch_by_id_with(
+        &db,
+        &user_id,
+        "Failed to fetch user for profile",
+        || AppError::Auth(AuthError::AccountLocked),
+    )
+    .await?;
 
     let two_factor_enabled =
-        TwoFactor::two_factor_enabled(&db, &user_id).await?;
+        TwoFactorDB::two_factor_enabled(&db, &user_id).await?;
     let profile = Profile::from_user(user, two_factor_enabled);
 
     Ok(Json(profile))
@@ -250,52 +226,22 @@ pub async fn post_profile(
     let db = state.get_db();
     let user_id = &claims.sub;
 
-    let user_value: Value = db
-        .prepare("SELECT * FROM users WHERE id = ?1")
-        .bind(&[user_id.clone().into()])?
-        .first(None)
-        .await
-        .map_err(|e| {
-            log::error!("Database error fetching user for profile update: {e}");
-            AppError::Database(DatabaseError::QueryFailed(
-                "Failed to fetch user for profile update".to_string(),
-            ))
-        })?
-        .ok_or_else(|| AppError::Auth(AuthError::AccountLocked))?;
-
-    let mut user: User = serde_json::from_value(user_value).map_err(|e| {
-        log::error!("Error deserializing user for profile update: {e}");
-        AppError::Internal
-    })?;
+    let mut user = UserDB::fetch_by_id_with(
+        &db,
+        user_id,
+        "Failed to fetch user for profile update",
+        || AppError::Auth(AuthError::AccountLocked),
+    )
+    .await?;
     let now = Utc::now().to_rfc3339();
 
     user.name = Some(payload.name);
     user.updated_at.clone_from(&now);
 
-    query!(
-        &db,
-        "UPDATE users SET name = ?1, updated_at = ?2 WHERE id = ?3",
-        user.name,
-        now,
-        user_id
-    )
-    .map_err(|e| {
-        log::error!("Database error updating user profile: {e}");
-        AppError::Database(DatabaseError::QueryFailed(
-            "Failed to update user profile".to_string(),
-        ))
-    })?
-    .run()
-    .await
-    .map_err(|e| {
-        log::error!("Database error running update user profile query: {e}");
-        AppError::Database(DatabaseError::QueryFailed(
-            "Failed to run update user profile query".to_string(),
-        ))
-    })?;
+    UserDB::update_profile_name(&db, user_id, &user.name, &now).await?;
 
     let two_factor_enabled =
-        TwoFactor::two_factor_enabled(&db, user_id).await?;
+        TwoFactorDB::two_factor_enabled(&db, user_id).await?;
     let profile = Profile::from_user(user, two_factor_enabled);
 
     Ok(Json(profile))
@@ -329,52 +275,22 @@ pub async fn put_avatar(
     let db = state.get_db();
     let user_id = &claims.sub;
 
-    let user_value: Value = db
-        .prepare("SELECT * FROM users WHERE id = ?1")
-        .bind(&[user_id.clone().into()])?
-        .first(None)
-        .await
-        .map_err(|e| {
-            log::error!("Database error fetching user for avatar update: {e}");
-            AppError::Database(DatabaseError::QueryFailed(
-                "Failed to fetch user for avatar update".to_string(),
-            ))
-        })?
-        .ok_or_else(|| AppError::Auth(AuthError::UserNotFound))?;
-
-    let mut user: User = serde_json::from_value(user_value).map_err(|e| {
-        log::error!("Error deserializing user for avatar update: {e}");
-        AppError::Internal
-    })?;
+    let mut user = UserDB::fetch_by_id_with(
+        &db,
+        user_id,
+        "Failed to fetch user for avatar update",
+        || AppError::Auth(AuthError::UserNotFound),
+    )
+    .await?;
     let now = Utc::now().to_rfc3339();
 
     user.avatar_color = payload.avatar_color;
     user.updated_at.clone_from(&now);
 
-    query!(
-        &db,
-        "UPDATE users SET avatar_color = ?1, updated_at = ?2 WHERE id = ?3",
-        user.avatar_color,
-        now,
-        user_id
-    )
-    .map_err(|e| {
-        log::error!("Database error updating user avatar: {e}");
-        AppError::Database(DatabaseError::QueryFailed(
-            "Failed to update user avatar".to_string(),
-        ))
-    })?
-    .run()
-    .await
-    .map_err(|e| {
-        log::error!("Database error running update user avatar query: {e}");
-        AppError::Database(DatabaseError::QueryFailed(
-            "Failed to run update user avatar query".to_string(),
-        ))
-    })?;
+    UserDB::update_avatar_color(&db, user_id, &user.avatar_color, &now).await?;
 
     let two_factor_enabled =
-        TwoFactor::two_factor_enabled(&db, user_id).await?;
+        TwoFactorDB::two_factor_enabled(&db, user_id).await?;
     let profile = Profile::from_user(user, two_factor_enabled);
 
     Ok(Json(profile))
@@ -390,26 +306,15 @@ pub async fn delete_account(
     let user_id = &claims.sub;
 
     // Get the user from the database
-    let user: Value = db
-        .prepare("SELECT * FROM users WHERE id = ?1")
-        .bind(&[user_id.clone().into()])?
-        .first(None)
-        .await
-        .map_err(|e| {
-            log::error!(
-                "Database error fetching user for account deletion: {e}"
-            );
-            AppError::Database(DatabaseError::QueryFailed(
-                "Failed to fetch user for account deletion".to_string(),
-            ))
-        })?
-        .ok_or_else(|| AppError::NotFound {
+    let user = UserDB::fetch_by_id_with(
+        &db,
+        user_id,
+        "Failed to fetch user for account deletion",
+        || AppError::NotFound {
             resource: "User not found".to_string(),
-        })?;
-    let user: User = serde_json::from_value(user).map_err(|e| {
-        log::error!("Error deserializing user for account deletion: {e}");
-        AppError::Internal
-    })?;
+        },
+    )
+    .await?;
 
     // Verify the master password hash
     let provided_hash = payload.master_password_hash.ok_or_else(|| {
@@ -429,37 +334,13 @@ pub async fn delete_account(
     // &keys).await?; }
 
     // Delete all user's ciphers
-    query!(&db, "DELETE FROM ciphers WHERE user_id = ?1", user_id)
-        .map_err(|e| {
-            log::error!("Database error deleting user ciphers: {e}");
-            AppError::Database(DatabaseError::QueryFailed(
-                "Failed to delete user ciphers".to_string(),
-            ))
-        })?
-        .run()
-        .await?;
+    CipherDB::purge_user_ciphers(&db, user_id).await?;
 
     // Delete all user's folders
-    query!(&db, "DELETE FROM folders WHERE user_id = ?1", user_id)
-        .map_err(|e| {
-            log::error!("Database error deleting user folders: {e}");
-            AppError::Database(DatabaseError::QueryFailed(
-                "Failed to delete user folders".to_string(),
-            ))
-        })?
-        .run()
-        .await?;
+    FolderDB::purge_user_folders(&db, user_id).await?;
 
     // Delete the user
-    query!(&db, "DELETE FROM users WHERE id = ?1", user_id)
-        .map_err(|e| {
-            log::error!("Database error deleting user record: {e}");
-            AppError::Database(DatabaseError::QueryFailed(
-                "Failed to delete user".to_string(),
-            ))
-        })?
-        .run()
-        .await?;
+    UserDB::delete_user(&db, user_id).await?;
 
     Ok(Json(json!({})))
 }
@@ -475,26 +356,15 @@ pub async fn post_password(
     let user_id = &claims.sub;
 
     // Get the user from the database
-    let user: Value = db
-        .prepare("SELECT * FROM users WHERE id = ?1")
-        .bind(&[user_id.clone().into()])?
-        .first(None)
-        .await
-        .map_err(|e| {
-            log::error!(
-                "Database error fetching user for password change: {e}"
-            );
-            AppError::Database(DatabaseError::QueryFailed(
-                "Failed to fetch user for password change".to_string(),
-            ))
-        })?
-        .ok_or_else(|| AppError::NotFound {
+    let user = UserDB::fetch_by_id_with(
+        &db,
+        user_id,
+        "Failed to fetch user for password change",
+        || AppError::NotFound {
             resource: "User not found".to_string(),
-        })?;
-    let user: User = serde_json::from_value(user).map_err(|e| {
-        log::error!("Error deserializing user for password change: {e}");
-        AppError::Internal
-    })?;
+        },
+    )
+    .await?;
 
     // Verify the current master password
     let verification = user
@@ -516,26 +386,16 @@ pub async fn post_password(
     let now = Utc::now().to_rfc3339();
 
     // Update user record
-    query!(
+    UserDB::update_master_password(
         &db,
-        "UPDATE users SET master_password_hash = ?1, password_salt = ?2, key \
-         = ?3, master_password_hint = ?4, security_stamp = ?5, updated_at = \
-         ?6 WHERE id = ?7",
-        new_hashed_password,
-        new_salt,
-        payload.key,
-        payload.master_password_hint,
-        new_security_stamp,
-        now,
-        user_id
+        user_id,
+        &new_hashed_password,
+        &new_salt,
+        &payload.key,
+        &payload.master_password_hint,
+        &new_security_stamp,
+        &now,
     )
-    .map_err(|e| {
-        log::error!("Database error updating master password: {e}");
-        AppError::Database(DatabaseError::QueryFailed(
-            "Failed to update master password".to_string(),
-        ))
-    })?
-    .run()
     .await?;
 
     Ok(Json(json!({})))
@@ -554,24 +414,15 @@ pub async fn post_rotatekey(
     let batch_size = state.config.import_batch_size as usize;
 
     // Get the user from the database
-    let user: Value = db
-        .prepare("SELECT * FROM users WHERE id = ?1")
-        .bind(&[user_id.clone().into()])?
-        .first(None)
-        .await
-        .map_err(|e| {
-            log::error!("Database error fetching user for key rotation: {e}");
-            AppError::Database(DatabaseError::QueryFailed(
-                "Failed to fetch user for key rotation".to_string(),
-            ))
-        })?
-        .ok_or_else(|| AppError::NotFound {
+    let user = UserDB::fetch_by_id_with(
+        &db,
+        user_id,
+        "Failed to fetch user for key rotation",
+        || AppError::NotFound {
             resource: "User not found".to_string(),
-        })?;
-    let user: User = serde_json::from_value(user).map_err(|e| {
-        log::error!("Error deserializing user for key rotation: {e}");
-        AppError::Internal
-    })?;
+        },
+    )
+    .await?;
 
     // Verify the current master password
     let verification = user
@@ -608,6 +459,7 @@ pub async fn post_rotatekey(
         .ciphers
         .iter()
         .filter(|c| c.organization_id.is_none())
+        .cloned()
         .collect();
 
     let request_cipher_ids: Vec<String> = personal_ciphers
@@ -646,169 +498,33 @@ pub async fn post_rotatekey(
             AppError::Internal
         })?;
 
-    // Batch: 2 COUNT queries + 2 EXCEPT queries
-    let validation_results = db
-        .batch(vec![
-            // Count ciphers in DB
-            db.prepare(
-                "SELECT COUNT(*) AS cnt FROM ciphers WHERE user_id = ?1 AND \
-                 organization_id IS NULL",
-            )
-            .bind(&[user_id.clone().into()])?,
-            // Count folders in DB
-            db.prepare(
-                "SELECT COUNT(*) AS cnt FROM folders WHERE user_id = ?1",
-            )
-            .bind(&[user_id.clone().into()])?,
-            // DB cipher IDs EXCEPT request cipher IDs (finds missing)
-            db.prepare(
-                "SELECT id FROM ciphers WHERE user_id = ?1 AND \
-                 organization_id IS NULL
-                 EXCEPT
-                 SELECT value FROM json_each(?2) LIMIT 1",
-            )
-            .bind(&[user_id.clone().into(), cipher_ids_json.into()])?,
-            // DB folder IDs EXCEPT request folder IDs (finds missing)
-            db.prepare(
-                "SELECT id FROM folders WHERE user_id = ?1
-                 EXCEPT
-                 SELECT value FROM json_each(?2) LIMIT 1",
-            )
-            .bind(&[user_id.clone().into(), folder_ids_json.into()])?,
-        ])
-        .await?;
-
-    // Check counts match
-    let db_cipher_count = validation_results[0]
-        .results::<Value>()?
-        .first()
-        .and_then(|v| v.get("cnt")?.as_i64())
-        .unwrap_or(0) as usize;
-    let db_folder_count = validation_results[1]
-        .results::<Value>()?
-        .first()
-        .and_then(|v| v.get("cnt")?.as_i64())
-        .unwrap_or(0) as usize;
-
-    if db_cipher_count != request_cipher_ids.len() ||
-        db_folder_count != request_folder_ids.len()
-    {
-        log::error!(
-            "Cipher or folder count mismatch in rotation request: {:?} != \
-             {:?} or {:?} != {:?}",
-            db_cipher_count,
-            request_cipher_ids.len(),
-            db_folder_count,
-            request_folder_ids.len()
-        );
-        return Err(AppError::Params(
-            "All existing ciphers and folders must be included in the rotation"
-                .to_string(),
-        ));
-    }
-
-    // Check EXCEPT results (if count matches but IDs differ)
-    let has_missing_ciphers =
-        !validation_results[2].results::<Value>()?.is_empty();
-    let has_missing_folders =
-        !validation_results[3].results::<Value>()?.is_empty();
-
-    if has_missing_ciphers || has_missing_folders {
-        log::error!(
-            "Missing ciphers or folders in rotation request: \
-             {has_missing_ciphers:?} or {has_missing_folders:?}"
-        );
-        return Err(AppError::Params(
-            "All existing ciphers and folders must be included in the rotation"
-                .to_string(),
-        ));
-    }
+    UserDB::validate_rotation_state(
+        &db,
+        user_id,
+        &cipher_ids_json,
+        &folder_ids_json,
+    )
+    .await?;
 
     let now = Utc::now().to_rfc3339();
 
-    // Update all folders with new encrypted names (batch operation)
-    // Skip null folder IDs (Bitwarden client bug: https://github.com/bitwarden/clients/issues/8453)
-    let mut folder_statements: Vec<D1PreparedStatement> =
-        Vec::with_capacity(payload.account_data.folders.len());
-    for folder in &payload.account_data.folders {
-        // Skip null folder id entries
-        let Some(folder_id) = &folder.id else {
-            continue;
-        };
-        let stmt = query!(
-            &db,
-            "UPDATE folders SET name = ?1, updated_at = ?2 WHERE id = ?3 AND \
-             user_id = ?4",
-            folder.name,
-            now,
-            folder_id,
-            user_id
-        )
-        .map_err(|e| {
-            log::error!("Database error updating folder during rotation: {e}");
-            AppError::Database(DatabaseError::QueryFailed(
-                "Failed to update folder during rotation".to_string(),
-            ))
-        })?;
-        folder_statements.push(stmt);
-    }
+    UserDB::rotate_folders(
+        &db,
+        user_id,
+        &payload.account_data.folders,
+        &now,
+        batch_size,
+    )
+    .await?;
 
-    // batch_size == 0 means "no chunking"; use a single batch
-    if batch_size == 0 {
-        db.batch(folder_statements).await?;
-    } else {
-        for chunk in folder_statements.chunks(batch_size) {
-            db.batch(chunk.to_vec()).await?;
-        }
-    }
-
-    // Update all ciphers with new encrypted data (batch operation)
-    // Only update personal ciphers (organization_id is None)
-    let mut cipher_statements: Vec<D1PreparedStatement> =
-        Vec::with_capacity(personal_ciphers.len());
-    for cipher in personal_ciphers {
-        // id is guaranteed to exist (validated above)
-        let cipher_id = cipher.id.as_ref().expect("Cipher id missing");
-
-        let cipher_data = CipherData {
-            name:        cipher.name.clone(),
-            notes:       cipher.notes.clone(),
-            type_fields: cipher.type_fields.clone(),
-        };
-
-        let data = serde_json::to_string(&cipher_data).map_err(|e| {
-            log::error!("Error serializing cipher data for rotation: {e}");
-            AppError::Internal
-        })?;
-
-        let stmt = query!(
-            &db,
-            "UPDATE ciphers SET data = ?1, folder_id = ?2, favorite = ?3, \
-             updated_at = ?4 WHERE id = ?5 AND user_id = ?6",
-            data,
-            cipher.folder_id,
-            cipher.favorite.unwrap_or(false),
-            now,
-            cipher_id,
-            user_id
-        )
-        .map_err(|e| {
-            log::error!("Database error updating cipher during rotation: {e}");
-            AppError::Database(DatabaseError::QueryFailed(
-                "Failed to update cipher during rotation".to_string(),
-            ))
-        })?;
-        cipher_statements.push(stmt);
-    }
-
-    // batch_size == 0 means "no chunking"; use a single batch
-    if batch_size == 0 {
-        db.batch(cipher_statements).await?;
-    } else {
-        for chunk in cipher_statements.chunks(batch_size) {
-            db.batch(chunk.to_vec()).await?;
-        }
-    }
+    UserDB::rotate_personal_ciphers(
+        &db,
+        user_id,
+        &personal_ciphers,
+        &now,
+        batch_size,
+    )
+    .await?;
 
     // Generate new salt and hash the new password
     let new_salt = generate_salt()?;
@@ -829,34 +545,20 @@ pub async fn post_rotatekey(
             (None, None)
         };
 
-    // Update user record with new keys and password
-    query!(
+    UserDB::update_account_keys_after_rotation(
         &db,
-        "UPDATE users SET master_password_hash = ?1, password_salt = ?2, key \
-         = ?3, private_key = ?4, kdf_type = ?5, kdf_iterations = ?6, \
-         kdf_memory = ?7, kdf_parallelism = ?8, security_stamp = ?9, \
-         updated_at = ?10 WHERE id = ?11",
-        new_hashed_password,
-        new_salt,
-        unlock_data.master_key_encrypted_user_key,
-        payload.account_keys.user_key_encrypted_account_private_key,
+        user_id,
+        &new_hashed_password,
+        &new_salt,
+        &unlock_data.master_key_encrypted_user_key,
+        &payload.account_keys.user_key_encrypted_account_private_key,
         unlock_data.kdf_type,
         unlock_data.kdf_iterations,
         kdf_memory,
         kdf_parallelism,
-        new_security_stamp,
-        now,
-        user_id
+        &new_security_stamp,
+        &now,
     )
-    .map_err(|e| {
-        log::error!(
-            "Database error updating user account keys during rotation: {e}"
-        );
-        AppError::Database(DatabaseError::QueryFailed(
-            "Failed to update user account keys".to_string(),
-        ))
-    })?
-    .run()
     .await?;
 
     Ok(Json(json!({})))
@@ -888,24 +590,15 @@ pub async fn post_kdf(
     let user_id = &claims.sub;
 
     // Get the user from the database
-    let user: Value = db
-        .prepare("SELECT * FROM users WHERE id = ?1")
-        .bind(&[user_id.clone().into()])?
-        .first(None)
-        .await
-        .map_err(|e| {
-            log::error!("Database error fetching user for KDF change: {e}");
-            AppError::Database(DatabaseError::QueryFailed(
-                "Failed to fetch user for KDF change".to_string(),
-            ))
-        })?
-        .ok_or_else(|| AppError::NotFound {
+    let user = UserDB::fetch_by_id_with(
+        &db,
+        user_id,
+        "Failed to fetch user for KDF change",
+        || AppError::NotFound {
             resource: "User not found".to_string(),
-        })?;
-    let user: User = serde_json::from_value(user).map_err(|e| {
-        log::error!("Error deserializing user for KDF change: {e}");
-        AppError::Internal
-    })?;
+        },
+    )
+    .await?;
 
     // Verify the current master password
     let verification = user
@@ -972,30 +665,19 @@ pub async fn post_kdf(
     let new_key = payload.get_new_key();
 
     // Update user record with new KDF settings and password
-    query!(
+    UserDB::update_kdf_settings(
         &db,
-        "UPDATE users SET master_password_hash = ?1, password_salt = ?2, key \
-         = ?3, kdf_type = ?4, kdf_iterations = ?5, kdf_memory = ?6, \
-         kdf_parallelism = ?7, security_stamp = ?8, updated_at = ?9 WHERE id \
-         = ?10",
-        new_hashed_password,
-        new_salt,
+        user_id,
+        &new_hashed_password,
+        &new_salt,
         new_key,
         kdf_type,
         kdf_iterations,
         final_kdf_memory,
         final_kdf_parallelism,
-        new_security_stamp,
-        now,
-        user_id
+        &new_security_stamp,
+        &now,
     )
-    .map_err(|e| {
-        log::error!("Database error updating KDF settings: {e}");
-        AppError::Database(DatabaseError::QueryFailed(
-            "Failed to update KDF settings".to_string(),
-        ))
-    })?
-    .run()
     .await?;
 
     Ok(Json(json!({})))

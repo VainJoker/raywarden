@@ -9,28 +9,22 @@ use axum::{
 };
 use chrono::Utc;
 use uuid::Uuid;
-use worker::{
-    D1PreparedStatement,
-    query,
-};
 
 use crate::{
     api::{
         AppState,
         service::claims::Claims,
     },
-    errors::{
-        AppError,
-        DatabaseError,
-    },
+    errors::AppError,
     models::{
         cipher::{
             Cipher,
+            CipherDB,
             CipherData,
         },
-        folder::Folder,
+        folder::FolderDB,
         import::ImportRequest,
-        user::User,
+        user::UserDB,
     },
 };
 
@@ -48,25 +42,15 @@ pub async fn import_data(
     let batch_size = state.config.import_batch_size as usize;
 
     // Get existing folders for this user
-    let existing_folder_rows = query!(
-        &db,
-        "SELECT id FROM folders WHERE user_id = ?1",
-        &claims.sub
-    )
-    .map_err(|_| {
-        AppError::Database(DatabaseError::QueryFailed(
-            "Failed to query existing folders".to_string(),
-        ))
-    })?
-    .all()
-    .await?
-    .results::<FolderIdRow>()?;
-
     let existing_folders: HashSet<String> =
-        existing_folder_rows.into_iter().map(|row| row.id).collect();
+        FolderDB::list_for_user(&db, &claims.sub)
+            .await?
+            .into_iter()
+            .map(|folder| folder.id)
+            .collect();
 
     // Process folders and build the folder_id list
-    let mut folder_statements: Vec<D1PreparedStatement> = Vec::new();
+    let mut folders_to_insert: Vec<FolderDB> = Vec::new();
     let mut folders: Vec<String> = Vec::with_capacity(data.folders.len());
 
     for import_folder in data.folders {
@@ -76,7 +60,7 @@ pub async fn import_data(
                 id.clone()
             } else {
                 // Folder doesn't exist, create new one with provided ID
-                let folder = Folder {
+                let folder = FolderDB {
                     id:         id.clone(),
                     user_id:    claims.sub.clone(),
                     name:       import_folder.name.clone(),
@@ -84,29 +68,13 @@ pub async fn import_data(
                     updated_at: now.clone(),
                 };
 
-                let stmt = query!(
-                    &db,
-                    "INSERT INTO folders (id, user_id, name, created_at, \
-                     updated_at) VALUES (?1, ?2, ?3, ?4, ?5)",
-                    folder.id,
-                    folder.user_id,
-                    folder.name,
-                    folder.created_at,
-                    folder.updated_at
-                )
-                .map_err(|_| {
-                    AppError::Database(DatabaseError::QueryFailed(
-                        "Failed to insert folder".to_string(),
-                    ))
-                })?;
-
-                folder_statements.push(stmt);
+                folders_to_insert.push(folder);
                 id.clone()
             }
         } else {
             // No ID provided, create new folder with generated UUID
             let new_id = Uuid::new_v4().to_string();
-            let folder = Folder {
+            let folder = FolderDB {
                 id:         new_id.clone(),
                 user_id:    claims.sub.clone(),
                 name:       import_folder.name.clone(),
@@ -114,23 +82,7 @@ pub async fn import_data(
                 updated_at: now.clone(),
             };
 
-            let stmt = query!(
-                &db,
-                "INSERT INTO folders (id, user_id, name, created_at, \
-                 updated_at) VALUES (?1, ?2, ?3, ?4, ?5)",
-                folder.id,
-                folder.user_id,
-                folder.name,
-                folder.created_at,
-                folder.updated_at
-            )
-            .map_err(|_| {
-                AppError::Database(DatabaseError::QueryFailed(
-                    "Failed to insert folder".to_string(),
-                ))
-            })?;
-
-            folder_statements.push(stmt);
+            folders_to_insert.push(folder);
             new_id
         };
 
@@ -138,16 +90,7 @@ pub async fn import_data(
     }
 
     // Execute folder inserts in batches
-    if !folder_statements.is_empty() {
-        // db::execute_in_batches(&db, folder_statements, batch_size).await?;
-        if batch_size == 0 {
-            db.batch(folder_statements).await?;
-        } else {
-            for chunk in folder_statements.chunks(batch_size) {
-                db.batch(chunk.to_vec()).await?;
-            }
-        }
-    }
+    FolderDB::insert_batch(&db, &folders_to_insert, batch_size).await?;
 
     // Build the relations map: cipher_index -> folder_index
     // Each cipher can only be in one folder at a time
@@ -158,7 +101,7 @@ pub async fn import_data(
     }
 
     // Prepare all cipher insert statements
-    let mut cipher_statements: Vec<D1PreparedStatement> =
+    let mut cipher_batch: Vec<(Cipher, String)> =
         Vec::with_capacity(data.ciphers.len());
 
     for (index, import_cipher) in data.ciphers.into_iter().enumerate() {
@@ -202,47 +145,11 @@ pub async fn import_data(
             AppError::Internal
         })?;
 
-        let stmt = query!(
-            &db,
-            "INSERT INTO ciphers (id, user_id, organization_id, type, data, \
-             favorite, folder_id, created_at, updated_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
-            cipher.id,
-            cipher.user_id,
-            cipher.organization_id,
-            cipher.r#type,
-            data,
-            cipher.favorite,
-            cipher.folder_id,
-            cipher.created_at,
-            cipher.updated_at,
-        )
-        .map_err(|_| {
-            AppError::Database(DatabaseError::QueryFailed(
-                "Failed to insert cipher".to_string(),
-            ))
-        })?;
-
-        cipher_statements.push(stmt);
+        cipher_batch.push((cipher, data));
     }
 
     // Execute cipher inserts in batches
-    if !cipher_statements.is_empty() {
-        // db::execute_in_batches(&db, cipher_statements, batch_size).await?;
-        if batch_size == 0 {
-            db.batch(cipher_statements).await?;
-        } else {
-            for chunk in cipher_statements.chunks(batch_size) {
-                db.batch(chunk.to_vec()).await?;
-            }
-        }
-    }
-    User::touch_user_updated_at(&db, &claims.sub).await?;
+    CipherDB::insert_ciphers_batch(&db, &cipher_batch, batch_size).await?;
+    UserDB::touch_user_updated_at(&db, &claims.sub).await?;
     Ok(Json(()))
-}
-
-/// Helper struct for querying existing folder IDs
-#[derive(serde::Deserialize)]
-struct FolderIdRow {
-    id: String,
 }

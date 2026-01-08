@@ -14,10 +14,8 @@ use serde_json::{
 
 use crate::{
     api::AppState,
-    errors::{
-        AppError,
-        DatabaseError,
-    },
+    errors::AppError,
+    models::meta::MetaDB,
 };
 
 /// GET /api/now
@@ -38,15 +36,7 @@ pub async fn alive(
 ) -> Result<Json<String>, AppError> {
     // Verify D1 binding is present + basic query works.
     let db = state.get_db();
-    db.prepare("SELECT 1 as ok")
-        .first::<i32>(Some("ok"))
-        .await
-        .map_err(|err| {
-            log::error!("Failed to verify database connectivity: {err}");
-            AppError::Database(DatabaseError::QueryFailed(
-                "Failed to verify database connectivity".to_string(),
-            ))
-        })?;
+    MetaDB::ping(&db).await?;
     Ok(now().await)
 }
 

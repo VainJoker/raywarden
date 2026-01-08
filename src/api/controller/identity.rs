@@ -13,8 +13,6 @@ use serde::{
     Deserializer,
     Serialize,
 };
-use serde_json::Value;
-use worker::query;
 
 use crate::{
     api::{
@@ -27,7 +25,6 @@ use crate::{
     errors::{
         AppError,
         AuthError,
-        DatabaseError,
     },
     infra::{
         cryptor::{
@@ -41,10 +38,10 @@ use crate::{
     models::{
         twofactor::{
             RememberTokenData,
-            TwoFactor,
+            TwoFactorDB,
             TwoFactorType,
         },
-        user::User,
+        user::UserDB,
     },
 };
 
@@ -111,29 +108,17 @@ pub struct TokenResponse {
     refresh_token:           String,
     #[serde(rename = "Key")]
     key:                     String,
-    #[serde(rename = "PrivateKey")]
     private_key:             String,
-    #[serde(rename = "Kdf")]
     kdf:                     i32,
-    #[serde(rename = "KdfIterations")]
     kdf_iterations:          i32,
-    #[serde(rename = "KdfMemory", skip_serializing_if = "Option::is_none")]
+    #[serde(skip_serializing_if = "Option::is_none")]
     kdf_memory:              Option<i32>,
-    #[serde(
-        rename = "KdfParallelism",
-        skip_serializing_if = "Option::is_none"
-    )]
+    #[serde(skip_serializing_if = "Option::is_none")]
     kdf_parallelism:         Option<i32>,
-    #[serde(rename = "ResetMasterPassword")]
-    reset_master_password:   bool,
-    #[serde(rename = "ForcePasswordReset")]
     force_password_reset:    bool,
-    #[serde(rename = "UserDecryptionOptions")]
+    reset_master_password:   bool,
     user_decryption_options: UserDecryptionOptions,
-    #[serde(
-        rename = "TwoFactorToken",
-        skip_serializing_if = "Option::is_none"
-    )]
+    #[serde(skip_serializing_if = "Option::is_none")]
     two_factor_token:        Option<String>,
 }
 
@@ -164,27 +149,23 @@ pub async fn token(
             let rate_limit_key = format!("login:{}", username.to_lowercase());
             rate::check_rate_limit(&state, rate_limit_key).await?;
 
-            let user_value: Value = db
-                .prepare("SELECT * FROM users WHERE email = ?1")
-                .bind(&[username.to_lowercase().into()])?
-                .first(None)
-                .await
-                .map_err(|e| {
-                    log::warn!("user lookup failed: {e}");
+            let user = UserDB::fetch_by_email_with(
+                &db,
+                &username,
+                "Failed to fetch user for login",
+                || {
                     AppError::Auth(AuthError::InvalidCredentials(
                         "Invalid credentials".to_string(),
                     ))
-                })?
-                .ok_or_else(|| {
-                    AppError::Auth(AuthError::InvalidCredentials(
-                        "Invalid credentials".to_string(),
-                    ))
-                })?;
-            let user: User =
-                serde_json::from_value(user_value).map_err(|e| {
-                    log::warn!("Failed to deserialize user: {e}");
-                    AppError::Internal
-                })?;
+                },
+            )
+            .await
+            .map_err(|e| {
+                log::warn!("user lookup failed: {e}");
+                AppError::Auth(AuthError::InvalidCredentials(
+                    "Invalid credentials".to_string(),
+                ))
+            })?;
 
             let verification =
                 user.verify_master_password(&password_hash).await?;
@@ -196,28 +177,14 @@ pub async fn token(
             }
 
             // Check for 2FA
-            let twofactors: Vec<TwoFactor> = db
-                .prepare(
-                    "SELECT * FROM twofactor WHERE user_uuid = ?1 AND atype < \
-                     1000",
-                )
-                .bind(&[user.id.clone().into()])?
-                .all()
-                .await
-                .map_err(|e| {
-                    log::warn!("twofactor query failed: {e}");
-                    AppError::Database(DatabaseError::QueryFailed(
-                        e.to_string(),
-                    ))
-                })?
-                .results()
-                .unwrap_or_default();
+            let twofactors =
+                TwoFactorDB::list_user_twofactors(&db, &user.id).await?;
 
             let mut two_factor_remember_token: Option<String> = None;
 
             // Filter out Remember type - it's not a real 2FA provider, just a
             // convenience feature
-            let real_twofactors: Vec<&TwoFactor> = twofactors
+            let real_twofactors: Vec<&TwoFactorDB> = twofactors
                 .iter()
                 .filter(|tf| tf.atype != TwoFactorType::Remember as i32)
                 .collect();
@@ -263,29 +230,12 @@ pub async fn token(
                         .await?;
 
                         // Update last_used
-                        query!(
+                        TwoFactorDB::update_last_used(
                             &db,
-                            "UPDATE twofactor SET last_used = ?1 WHERE uuid = \
-                             ?2",
+                            &tf.uuid,
                             new_last_used,
-                            &tf.uuid
                         )
-                        .map_err(|e| {
-                            log::warn!("twofactor last_used bind failed: {e}");
-                            AppError::Database(DatabaseError::QueryFailed(
-                                e.to_string(),
-                            ))
-                        })?
-                        .run()
-                        .await
-                        .map_err(|e| {
-                            log::warn!(
-                                "twofactor last_used update failed: {e}"
-                            );
-                            AppError::Database(DatabaseError::QueryFailed(
-                                e.to_string(),
-                            ))
-                        })?;
+                        .await?;
                     }
                     Some(TwoFactorType::Remember) => {
                         // Remember is handled separately - client sends
@@ -319,37 +269,12 @@ pub async fn token(
                                 // Update database with cleaned tokens (remove
                                 // expired)
                                 let updated_data = token_data.to_json();
-                                query!(
+                                TwoFactorDB::update_data(
                                     &db,
-                                    "UPDATE twofactor SET data = ?1 WHERE \
-                                     uuid = ?2",
+                                    &tf.uuid,
                                     &updated_data,
-                                    &tf.uuid
                                 )
-                                .map_err(|e| {
-                                    log::warn!(
-                                        "remember token bind failed: {e}"
-                                    );
-                                    AppError::Database(
-                                        DatabaseError::QueryFailed(
-                                            e.to_string(),
-                                        ),
-                                    )
-                                })?
-                                .run()
-                                .await
-                                .map_err(
-                                    |e| {
-                                        log::warn!(
-                                            "remember token update failed: {e}"
-                                        );
-                                        AppError::Database(
-                                            DatabaseError::QueryFailed(
-                                                e.to_string(),
-                                            ),
-                                        )
-                                    },
-                                )?;
+                                .await?;
 
                                 // Remember token valid, proceed with login
                             } else {
@@ -366,9 +291,11 @@ pub async fn token(
                     Some(TwoFactorType::RecoveryCode) => {
                         // Check recovery code
                         if let Some(ref stored_code) = user.totp_recover {
+                            let stored_upper = stored_code.to_uppercase();
+                            let provided_upper = twofactor_code.to_uppercase();
                             if !ct_eq(
-                                &stored_code.to_uppercase(),
-                                &twofactor_code.to_uppercase(),
+                                stored_upper.as_str(),
+                                provided_upper.as_str(),
                             ) {
                                 return Err(AppError::Auth(
                                     AuthError::InvalidTotp,
@@ -376,46 +303,8 @@ pub async fn token(
                             }
 
                             // Delete all 2FA and clear recovery code
-                            query!(
-                                &db,
-                                "DELETE FROM twofactor WHERE user_uuid = ?1",
-                                &user.id
-                            )
-                            .map_err(|e| {
-                                log::warn!("twofactor delete bind failed: {e}");
-                                AppError::Database(DatabaseError::QueryFailed(
-                                    e.to_string(),
-                                ))
-                            })?
-                            .run()
-                            .await
-                            .map_err(|e| {
-                                log::warn!("twofactor delete failed: {e}");
-                                AppError::Database(DatabaseError::QueryFailed(
-                                    e.to_string(),
-                                ))
-                            })?;
-
-                            query!(
-                                &db,
-                                "UPDATE users SET totp_recover = NULL WHERE \
-                                 id = ?1",
-                                &user.id
-                            )
-                            .map_err(|e| {
-                                log::warn!("recovery clear bind failed: {e}");
-                                AppError::Database(DatabaseError::QueryFailed(
-                                    e.to_string(),
-                                ))
-                            })?
-                            .run()
-                            .await
-                            .map_err(|e| {
-                                log::warn!("recovery clear failed: {e}");
-                                AppError::Database(DatabaseError::QueryFailed(
-                                    e.to_string(),
-                                ))
-                            })?;
+                            TwoFactorDB::delete_for_user(&db, &user.id).await?;
+                            UserDB::clear_recovery_code(&db, &user.id).await?;
                         } else {
                             return Err(AppError::Auth(AuthError::InvalidTotp));
                         }
@@ -451,33 +340,10 @@ pub async fn token(
 
                     let json_data = token_data.to_json();
 
-                    // Store or update remember token
-                    query!(
-                        &db,
-                        "INSERT INTO twofactor (uuid, user_uuid, atype, \
-                         enabled, data, last_used) 
-                             VALUES (?1, ?2, ?3, 1, ?4, 0)
-                             ON CONFLICT(user_uuid, atype) DO UPDATE SET data \
-                         = ?4",
-                        uuid::Uuid::new_v4().to_string(),
-                        &user.id,
-                        TwoFactorType::Remember as i32,
-                        &json_data
+                    TwoFactorDB::upsert_remember_token(
+                        &db, &user.id, &json_data,
                     )
-                    .map_err(|e| {
-                        log::warn!("remember token upsert bind failed: {e}");
-                        AppError::Database(DatabaseError::QueryFailed(
-                            e.to_string(),
-                        ))
-                    })?
-                    .run()
-                    .await
-                    .map_err(|e| {
-                        log::warn!("remember token upsert failed: {e}");
-                        AppError::Database(DatabaseError::QueryFailed(
-                            e.to_string(),
-                        ))
-                    })?;
+                    .await?;
 
                     two_factor_remember_token = Some(remember_token);
                 }
@@ -494,32 +360,13 @@ pub async fn token(
                 let now = Utc::now().to_rfc3339();
 
                 // Update user in database
-                query!(
-                    &db,
-                    "UPDATE users SET master_password_hash = ?1, \
-                     password_salt = ?2, updated_at = ?3 WHERE id = ?4",
-                    &new_hash,
-                    &new_salt,
-                    &now,
-                    &user.id
+                UserDB::migrate_legacy_password(
+                    &db, &user.id, &new_hash, &new_salt, &now,
                 )
-                .map_err(|e| {
-                    log::warn!("legacy migration bind failed: {e}");
-                    AppError::Database(DatabaseError::QueryFailed(
-                        e.to_string(),
-                    ))
-                })?
-                .run()
-                .await
-                .map_err(|e| {
-                    log::warn!("legacy migration update failed: {e}");
-                    AppError::Database(DatabaseError::QueryFailed(
-                        e.to_string(),
-                    ))
-                })?;
+                .await?;
 
                 // Return updated user
-                User {
+                UserDB {
                     master_password_hash: new_hash,
                     password_salt: Some(new_salt),
                     updated_at: now,
@@ -561,19 +408,16 @@ pub async fn token(
             // token".to_string()))?;
 
             let user_id = token_data.claims.sub;
-            let user: Value = db
-                .prepare("SELECT * FROM users WHERE id = ?1")
-                .bind(&[user_id.into()])?
-                .first(None)
-                .await
-                .map_err(|e| {
-                    log::warn!("refresh_token user query failed: {e}");
-                    AppError::Auth(AuthError::UserNotFound)
-                })?
-                .ok_or_else(|| AppError::Auth(AuthError::UserNotFound))?;
-            let user: User = serde_json::from_value(user).map_err(|e| {
-                log::warn!("Failed to deserialize refresh user: {e}");
-                AppError::Internal
+            let user = UserDB::fetch_by_id_with(
+                &db,
+                &user_id,
+                "Failed to fetch user for refresh_token",
+                || AppError::Auth(AuthError::UserNotFound),
+            )
+            .await
+            .map_err(|e| {
+                log::warn!("refresh_token user query failed: {e}");
+                AppError::Auth(AuthError::UserNotFound)
             })?;
 
             generate_tokens_and_response(user, &state, None)
@@ -583,7 +427,7 @@ pub async fn token(
 }
 
 fn generate_tokens_and_response(
-    user: User,
+    user: UserDB,
     state: &AppState,
     two_factor_token: Option<String>,
 ) -> Result<Json<TokenResponse>, AppError> {

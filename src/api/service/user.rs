@@ -7,7 +7,8 @@ use crate::{
         AppError,
         DatabaseError,
     },
-    models::user::User,
+    infra::DB,
+    models::user::UserDB,
 };
 
 pub struct UserKdfParams {
@@ -70,48 +71,47 @@ pub async fn get_kdf_params_by_email(
 
 pub async fn insert_user(
     state: &AppState,
-    user: &User,
+    user: &UserDB,
 ) -> Result<(), AppError> {
     let db = state.get_db();
 
-    query!(
-        &db,
-        "INSERT INTO users (id, name, email, master_password_hash, \
-         master_password_hint, password_salt, key, private_key, public_key, \
-         kdf_type, kdf_iterations, kdf_memory, kdf_parallelism, \
-         security_stamp, equivalent_domains, excluded_globals,totp_recover, \
-         created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, \
-         ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19)",
-        user.id,
-        user.name,
-        user.email,
-        user.master_password_hash,
-        user.master_password_hint,
-        user.password_salt,
-        user.key,
-        user.private_key,
-        user.public_key,
-        user.kdf_type,
-        user.kdf_iterations,
-        user.kdf_memory,
-        user.kdf_parallelism,
-        user.security_stamp,
-        user.equivalent_domains,
-        user.excluded_globals,
-        user.totp_recover,
-        user.created_at,
-        user.updated_at
+    DB::run_query(
+        async {
+            query!(
+                &db,
+                "INSERT INTO users (id, name, email, master_password_hash, \
+                 master_password_hint, password_salt, key, private_key, \
+                 public_key, kdf_type, kdf_iterations, kdf_memory, \
+                 kdf_parallelism, security_stamp, equivalent_domains, \
+                 excluded_globals,totp_recover, created_at, updated_at) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, \
+                 ?13, ?14, ?15, ?16, ?17, ?18, ?19)",
+                user.id,
+                user.name,
+                user.email,
+                user.master_password_hash,
+                user.master_password_hint,
+                user.password_salt,
+                user.key,
+                user.private_key,
+                user.public_key,
+                user.kdf_type,
+                user.kdf_iterations,
+                user.kdf_memory,
+                user.kdf_parallelism,
+                user.security_stamp,
+                user.equivalent_domains,
+                user.excluded_globals,
+                user.totp_recover,
+                user.created_at,
+                user.updated_at
+            )?
+            .run()
+            .await
+        },
+        "Failed to insert user",
     )
-    .map_err(|e| {
-        log::warn!("insert_user bind failed: {e}");
-        AppError::Database(DatabaseError::QueryFailed(e.to_string()))
-    })?
-    .run()
-    .await
-    .map_err(|e| {
-        log::warn!("insert_user run failed: {e}");
-        AppError::Database(DatabaseError::QueryFailed(e.to_string()))
-    })?;
+    .await?;
 
     Ok(())
 }

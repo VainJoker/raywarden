@@ -19,7 +19,6 @@ use worker::{
     D1Database,
     Env,
     HttpMetadata,
-    query,
 };
 
 use crate::{
@@ -27,18 +26,18 @@ use crate::{
         AppState,
         service::claims::Claims,
     },
-    errors::{
-        AppError,
-        DatabaseError,
-    },
+    errors::AppError,
     infra::jwtor as jwt,
     models::{
         attachment::{
             AttachmentDB,
             AttachmentResponse,
         },
-        cipher::Cipher,
-        user::User,
+        cipher::{
+            Cipher,
+            CipherDB,
+        },
+        user::UserDB,
     },
 };
 
@@ -106,7 +105,7 @@ pub async fn create_attachment(
     let base_url = state.get_domain();
 
     let cipher =
-        Cipher::ensure_cipher_for_user(&db, &cipher_id, &claims.sub).await?;
+        CipherDB::ensure_cipher_for_user(&db, &cipher_id, &claims.sub).await?;
 
     let AttachmentCreateRequest {
         key,
@@ -146,27 +145,18 @@ pub async fn create_attachment(
 
     let attachment_id = Uuid::new_v4().to_string();
     let now = Utc::now().format("%Y-%m-%dT%H:%M:%S%.3fZ").to_string();
-    query!(
-        &db,
-        "INSERT INTO attachments_pending (id, cipher_id, file_name, \
-         file_size, akey, created_at, updated_at, organization_id)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6, ?7)",
-        attachment_id,
-        cipher.id,
-        file_name,
-        declared_size,
-        key,
-        now,
-        cipher.organization_id,
-    )
-    .map_err(|e| {
-        log::error!("Failed to bind insert pending attachment query: {e}");
-        AppError::Database(DatabaseError::QueryFailed(
-            "Failed to insert pending attachment".to_string(),
-        ))
-    })?
-    .run()
-    .await?;
+    let pending_attachment = AttachmentDB {
+        id:              attachment_id.clone(),
+        cipher_id:       cipher.id.clone(),
+        file_name:       file_name.clone(),
+        file_size:       declared_size,
+        akey:            Some(key.clone()),
+        created_at:      now.clone(),
+        updated_at:      now.clone(),
+        organization_id: cipher.organization_id.clone(),
+    };
+
+    AttachmentDB::insert_pending(&db, &pending_attachment).await?;
 
     // Return upload URL pointing to local upload endpoint
     let url = upload_url(
@@ -180,17 +170,6 @@ pub async fn create_attachment(
     hydrate_cipher_attachments(&db, &state.env, &mut cipher_response).await?;
 
     // add pending attachment to response
-    let pending_attachment = AttachmentDB {
-        id: attachment_id.clone(),
-        cipher_id: cipher_id.clone(),
-        file_name,
-        file_size: declared_size,
-        akey: Some(key),
-        created_at: now.clone(),
-        updated_at: now,
-        organization_id: cipher_response.organization_id.clone(),
-    };
-
     let pending_response = pending_attachment.to_response(None);
     match &mut cipher_response.attachments {
         Some(list) => list.push(pending_response),
@@ -221,7 +200,7 @@ pub async fn upload_attachment_v2_data(
     let db = state.get_db();
 
     let _cipher =
-        Cipher::ensure_cipher_for_user(&db, &cipher_id, &claims.sub).await?;
+        CipherDB::ensure_cipher_for_user(&db, &cipher_id, &claims.sub).await?;
 
     let mut pending =
         AttachmentDB::fetch_pending_attachment(&db, &attachment_id).await?;
@@ -237,21 +216,7 @@ pub async fn upload_attachment_v2_data(
 
     // Validate actual size against declared value deviation
     if let Err(e) = validate_size_within_declared(&pending, actual_size) {
-        query!(
-            &db,
-            "DELETE FROM attachments_pending WHERE id = ?1",
-            pending.id
-        )
-        .map_err(|err| {
-            log::error!(
-                "Failed to bind delete pending attachment query: {err}"
-            );
-            AppError::Database(DatabaseError::QueryFailed(
-                "Failed to delete pending attachment".to_string(),
-            ))
-        })?
-        .run()
-        .await?;
+        AttachmentDB::delete_pending(&db, &pending.id).await?;
         return Err(e);
     }
 
@@ -284,45 +249,17 @@ pub async fn upload_attachment_v2_data(
 
     // Finalize: move pending -> attachments and touch timestamps
     let now = now_string();
-    query!(
-        &db,
-        "INSERT INTO attachments (id, cipher_id, file_name, file_size, akey, \
-         created_at, updated_at, organization_id)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
-        pending.id,
-        pending.cipher_id,
-        pending.file_name,
-        actual_size,
-        pending.akey,
-        pending.created_at,
-        now,
-        pending.organization_id,
-    )
-    .map_err(|e| {
-        log::error!("Failed to bind finalize attachment insert query: {e}");
-        AppError::Database(DatabaseError::QueryFailed(
-            "Failed to finalize attachment".to_string(),
-        ))
-    })?
-    .run()
-    .await?;
+    let finalized = AttachmentDB {
+        file_size: actual_size,
+        updated_at: now.clone(),
+        ..pending.clone()
+    };
 
-    query!(
-        &db,
-        "DELETE FROM attachments_pending WHERE id = ?1",
-        pending.id
-    )
-    .map_err(|e| {
-        log::error!("Failed to bind delete pending attachment query: {e}");
-        AppError::Database(DatabaseError::QueryFailed(
-            "Failed to delete pending attachment".to_string(),
-        ))
-    })?
-    .run()
-    .await?;
+    AttachmentDB::insert_finalized(&db, &finalized, &now).await?;
+    AttachmentDB::delete_pending(&db, &finalized.id).await?;
 
-    Cipher::touch_cipher_updated_at(&db, &cipher_id).await?;
-    User::touch_user_updated_at(&db, &claims.sub).await?;
+    CipherDB::touch_cipher_updated_at(&db, &cipher_id).await?;
+    UserDB::touch_user_updated_at(&db, &claims.sub).await?;
 
     Ok(Json(()))
 }
@@ -340,7 +277,7 @@ pub async fn upload_attachment_legacy(
     let db = state.get_db();
 
     let cipher =
-        Cipher::ensure_cipher_for_user(&db, &cipher_id, &claims.sub).await?;
+        CipherDB::ensure_cipher_for_user(&db, &cipher_id, &claims.sub).await?;
 
     let (file_bytes, content_type, key, file_name) =
         read_multipart(&mut multipart).await?;
@@ -362,28 +299,18 @@ pub async fn upload_attachment_legacy(
 
     let attachment_id = Uuid::new_v4().to_string();
     let now = now_string();
+    let attachment = AttachmentDB {
+        id:              attachment_id.clone(),
+        cipher_id:       cipher.id.clone(),
+        file_name:       file_name.clone(),
+        file_size:       actual_size,
+        akey:            Some(key.clone()),
+        created_at:      now.clone(),
+        updated_at:      now.clone(),
+        organization_id: cipher.organization_id.clone(),
+    };
 
-    query!(
-        &db,
-        "INSERT INTO attachments (id, cipher_id, file_name, file_size, akey, \
-         created_at, updated_at, organization_id)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6, ?7)",
-        attachment_id,
-        cipher.id,
-        file_name,
-        actual_size,
-        key,
-        now,
-        cipher.organization_id,
-    )
-    .map_err(|e| {
-        log::error!("Failed to bind insert attachment query: {e}");
-        AppError::Database(DatabaseError::QueryFailed(
-            "Failed to insert attachment".to_string(),
-        ))
-    })?
-    .run()
-    .await?;
+    AttachmentDB::insert_finalized(&db, &attachment, &now).await?;
 
     // Save to R2
     upload_to_r2(
@@ -394,8 +321,8 @@ pub async fn upload_attachment_legacy(
     )
     .await?;
 
-    Cipher::touch_cipher_updated_at(&db, &cipher_id).await?;
-    User::touch_user_updated_at(&db, &claims.sub).await?;
+    CipherDB::touch_cipher_updated_at(&db, &cipher_id).await?;
+    UserDB::touch_user_updated_at(&db, &claims.sub).await?;
 
     // reload cipher to return fresh updated_at and attachments state
     let mut cipher_response: Cipher = cipher.into();
@@ -416,7 +343,7 @@ pub async fn get_attachment(
     let db = state.get_db();
 
     let cipher =
-        Cipher::ensure_cipher_for_user(&db, &cipher_id, &claims.sub).await?;
+        CipherDB::ensure_cipher_for_user(&db, &cipher_id, &claims.sub).await?;
     let attachment =
         AttachmentDB::fetch_attachment(&db, &attachment_id).await?;
 
@@ -447,7 +374,7 @@ pub async fn delete_attachment(
     let db = state.get_db();
 
     let cipher =
-        Cipher::ensure_cipher_for_user(&db, &cipher_id, &claims.sub).await?;
+        CipherDB::ensure_cipher_for_user(&db, &cipher_id, &claims.sub).await?;
     let attachment =
         AttachmentDB::fetch_attachment(&db, &attachment_id).await?;
 
@@ -460,22 +387,14 @@ pub async fn delete_attachment(
     // Delete R2 object; ignore missing objects
     AttachmentDB::delete_r2_objects(&bucket, &[attachment.r2_key()]).await?;
 
-    query!(&db, "DELETE FROM attachments WHERE id = ?1", attachment.id)
-        .map_err(|e| {
-            log::error!("Failed to bind delete attachment query: {e}");
-            AppError::Database(DatabaseError::QueryFailed(
-                "Failed to delete attachment".to_string(),
-            ))
-        })?
-        .run()
-        .await?;
+    AttachmentDB::delete_attachment(&db, &attachment.id).await?;
 
-    Cipher::touch_cipher_updated_at(&db, &cipher_id).await?;
-    User::touch_user_updated_at(&db, &claims.sub).await?;
+    CipherDB::touch_cipher_updated_at(&db, &cipher_id).await?;
+    UserDB::touch_user_updated_at(&db, &claims.sub).await?;
 
     // Reload cipher to return fresh updated_at and attachments state
     let mut cipher_response: Cipher =
-        Cipher::ensure_cipher_for_user(&db, &cipher_id, &claims.sub)
+        CipherDB::ensure_cipher_for_user(&db, &cipher_id, &claims.sub)
             .await?
             .into();
     hydrate_cipher_attachments(&db, &state.env, &mut cipher_response).await?;

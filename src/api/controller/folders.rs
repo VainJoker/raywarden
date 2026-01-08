@@ -11,21 +11,20 @@ use serde_json::{
     json,
 };
 use uuid::Uuid;
-use worker::query;
 
 use crate::{
     api::{
         AppState,
         service::claims::Claims,
     },
-    errors::{
-        AppError,
-        DatabaseError,
-    },
-    models::folder::{
-        CreateFolderRequest,
-        Folder,
-        FolderResponse,
+    errors::AppError,
+    models::{
+        folder::{
+            CreateFolderRequest,
+            FolderDB,
+            FolderResponse,
+        },
+        user::UserDB,
     },
 };
 
@@ -35,33 +34,7 @@ pub async fn list_folders(
     State(state): State<AppState>,
 ) -> Result<Json<Value>, AppError> {
     let db = state.get_db();
-
-    let folders_db: Vec<Folder> = db
-        .prepare("SELECT * FROM folders WHERE user_id = ?1")
-        .bind(&[claims.sub.clone().into()])
-        .map_err(|e| {
-            log::error!("Failed to bind query for listing folders: {e:?}");
-            AppError::Database(DatabaseError::QueryFailed(
-                "Failed to bind query for listing folders".to_string(),
-            ))
-        })?
-        .all()
-        .await
-        .map_err(|e| {
-            log::error!("Failed to execute query for listing folders: {e:?}");
-            AppError::Database(DatabaseError::QueryFailed(
-                "Failed to execute query for listing folders".to_string(),
-            ))
-        })?
-        .results()
-        .map_err(|e| {
-            log::error!(
-                "Failed to parse query results for listing folders: {e:?}"
-            );
-            AppError::Database(DatabaseError::QueryFailed(
-                "Failed to parse query results for listing folders".to_string(),
-            ))
-        })?;
+    let folders_db = FolderDB::list_for_user(&db, &claims.sub).await?;
 
     let folders: Vec<FolderResponse> = folders_db
         .into_iter()
@@ -82,34 +55,7 @@ pub async fn get_folder(
     Path(id): Path<String>,
 ) -> Result<Json<FolderResponse>, AppError> {
     let db = state.get_db();
-
-    let folder: Folder = query!(
-        &db,
-        "SELECT * FROM folders WHERE id = ?1 AND user_id = ?2",
-        &id,
-        &claims.sub
-    )
-    .map_err(|e| {
-        log::error!("Failed to bind query for getting folder: {e:?}");
-        AppError::Database(DatabaseError::QueryFailed(
-            "Failed to bind query for getting folder".to_string(),
-        ))
-    })?
-    .first(None)
-    .await
-    .map_err(|e| {
-        log::error!("Failed to execute query for getting folder: {e:?}");
-        AppError::Database(DatabaseError::QueryFailed(
-            "Failed to execute query for getting folder".to_string(),
-        ))
-    })?
-    .ok_or_else(|| {
-        AppError::Params(
-            "Invalid folder: Folder does not exist or belongs to another user"
-                .to_string(),
-        )
-    })?;
-
+    let folder = FolderDB::get_for_user(&db, &id, &claims.sub).await?;
     Ok(Json(folder.into()))
 }
 
@@ -120,10 +66,9 @@ pub async fn create_folder(
     Json(payload): Json<CreateFolderRequest>,
 ) -> Result<Json<FolderResponse>, AppError> {
     let db = state.get_db();
-    let now = Utc::now();
-    let now = now.format("%Y-%m-%dT%H:%M:%S%.3fZ").to_string();
+    let now = Utc::now().format("%Y-%m-%dT%H:%M:%S%.3fZ").to_string();
 
-    let folder = Folder {
+    let folder = FolderDB {
         id:         Uuid::new_v4().to_string(),
         user_id:    claims.sub.clone(),
         name:       payload.name,
@@ -131,46 +76,8 @@ pub async fn create_folder(
         updated_at: now.clone(),
     };
 
-    query!(
-        &db,
-        "INSERT INTO folders (id, user_id, name, created_at, updated_at) \
-         VALUES (?1, ?2, ?3, ?4, ?5)",
-        folder.id,
-        folder.user_id,
-        folder.name,
-        folder.created_at,
-        folder.updated_at
-    )
-    .map_err(|e| {
-        log::error!("Failed to bind query for creating folder: {e:?}");
-        AppError::Database(DatabaseError::QueryFailed(
-            "Failed to bind query for creating folder".to_string(),
-        ))
-    })?
-    .run()
-    .await
-    .map_err(|e| {
-        log::error!("Failed to execute query for creating folder: {e:?}");
-        AppError::Database(DatabaseError::QueryFailed(
-            "Failed to execute query for creating folder".to_string(),
-        ))
-    })?;
-
-    let now = Utc::now().format("%Y-%m-%dT%H:%M:%S%.3fZ").to_string();
-    query!(
-        &db,
-        "UPDATE users SET updated_at = ?1 WHERE id = ?2",
-        now,
-        &claims.sub
-    )
-    .map_err(|e| {
-        log::error!("Failed to bind query for updating user: {e:?}");
-        AppError::Database(DatabaseError::QueryFailed(
-            "Failed to bind query for updating user".to_string(),
-        ))
-    })?
-    .run()
-    .await?;
+    FolderDB::insert(&db, &folder).await?;
+    UserDB::touch_user_updated_at(&db, &claims.sub).await?;
 
     let response = FolderResponse {
         id:            folder.id,
@@ -190,37 +97,12 @@ pub async fn delete_folder(
 ) -> Result<Json<()>, AppError> {
     let db = state.get_db();
 
-    query!(
-        &db,
-        "DELETE FROM folders WHERE id = ?1 AND user_id = ?2",
-        id,
-        claims.sub
-    )
-    .map_err(|_| {
-        AppError::Database(DatabaseError::QueryFailed(
-            "Failed to bind query for deleting folder".to_string(),
-        ))
-    })?
-    .run()
-    .await?;
-
-    let now = Utc::now().format("%Y-%m-%dT%H:%M:%S%.3fZ").to_string();
-    query!(
-        &db,
-        "UPDATE users SET updated_at = ?1 WHERE id = ?2",
-        now,
-        &claims.sub
-    )
-    .map_err(|_| {
-        AppError::Database(DatabaseError::QueryFailed(
-            "Failed to bind query for updating user".to_string(),
-        ))
-    })?
-    .run()
-    .await?;
+    FolderDB::delete_for_user(&db, &id, &claims.sub).await?;
+    UserDB::touch_user_updated_at(&db, &claims.sub).await?;
 
     Ok(Json(()))
 }
+
 #[worker::send]
 pub async fn update_folder(
     claims: Claims,
@@ -229,28 +111,11 @@ pub async fn update_folder(
     Json(payload): Json<CreateFolderRequest>,
 ) -> Result<Json<FolderResponse>, AppError> {
     let db = state.get_db();
-    let now = Utc::now();
-    let now = now.format("%Y-%m-%dT%H:%M:%S%.3fZ").to_string();
+    let now = Utc::now().format("%Y-%m-%dT%H:%M:%S%.3fZ").to_string();
 
-    let existing_folder: Folder = query!(
-        &db,
-        "SELECT * FROM folders WHERE id = ?1 AND user_id = ?2",
-        id,
-        claims.sub
-    )
-    .map_err(|e| {
-        log::error!("Failed to bind query for getting existing folder: {e:?}");
-        AppError::Database(DatabaseError::QueryFailed(
-            "Failed to bind query for getting existing folder".to_string(),
-        ))
-    })?
-    .first(None)
-    .await?
-    .ok_or(AppError::NotFound {
-        resource: "Folder not found".to_string(),
-    })?;
+    let existing_folder = FolderDB::get_for_user(&db, &id, &claims.sub).await?;
 
-    let folder = Folder {
+    let folder = FolderDB {
         id:         id.clone(),
         user_id:    existing_folder.user_id,
         name:       payload.name,
@@ -258,39 +123,8 @@ pub async fn update_folder(
         updated_at: now.clone(),
     };
 
-    query!(
-        &db,
-        "UPDATE folders SET name = ?1, updated_at = ?2 WHERE id = ?3 AND \
-         user_id = ?4",
-        folder.name,
-        folder.updated_at,
-        folder.id,
-        folder.user_id
-    )
-    .map_err(|e| {
-        log::error!("Failed to bind query for updating folder: {e:?}");
-        AppError::Database(DatabaseError::QueryFailed(
-            "Failed to bind query for updating folder".to_string(),
-        ))
-    })?
-    .run()
-    .await?;
-
-    let now = Utc::now().format("%Y-%m-%dT%H:%M:%S%.3fZ").to_string();
-    query!(
-        &db,
-        "UPDATE users SET updated_at = ?1 WHERE id = ?2",
-        now,
-        &claims.sub
-    )
-    .map_err(|e| {
-        log::error!("Failed to bind query for updating user: {e:?}");
-        AppError::Database(DatabaseError::QueryFailed(
-            "Failed to bind query for updating user".to_string(),
-        ))
-    })?
-    .run()
-    .await?;
+    FolderDB::update_for_user(&db, &folder).await?;
+    UserDB::touch_user_updated_at(&db, &claims.sub).await?;
 
     let response = FolderResponse {
         id:            folder.id,

@@ -77,7 +77,7 @@ pub fn ensure_supported_kdf(
 }
 
 pub fn validate_rotation_metadata(
-    user: &crate::models::user::User,
+    user: &crate::models::user::UserDB,
     unlock_data: &crate::models::user::MasterPasswordUnlockData,
     account_public_key: &str,
 ) -> Result<(), AppError> {

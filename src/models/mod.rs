@@ -3,6 +3,7 @@ pub mod cipher;
 pub mod domains;
 pub mod folder;
 pub mod import;
+pub mod meta;
 pub mod serde_helpers;
 pub mod sync;
 pub mod twofactor;

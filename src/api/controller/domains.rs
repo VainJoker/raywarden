@@ -7,19 +7,17 @@ use serde_json::{
     Value,
     json,
 };
-use worker::query;
 
 use crate::{
     api::{
         AppState,
         service::claims::Claims,
     },
-    errors::{
-        AppError,
-        AuthError,
-        DatabaseError,
+    errors::AppError,
+    models::domains::{
+        DomainsDB,
+        EquivDomainData,
     },
-    models::domains::EquivDomainData,
 };
 
 /// GET /api/settings/domains
@@ -42,38 +40,16 @@ pub async fn get_domains(
 ) -> Result<Json<Value>, AppError> {
     let db = state.get_db();
 
-    let row: Option<Value> = db
-        .prepare(
-            "SELECT equivalent_domains, excluded_globals FROM users WHERE id \
-             = ?1",
-        )
-        .bind(&[claims.sub.into()])?
-        .first(None)
-        .await
-        .map_err(|e| {
-            log::warn!("query user domains failed: {e}");
-            AppError::Database(DatabaseError::QueryFailed(
-                "Failed to query user domains".to_string(),
-            ))
-        })?;
-
-    let row = row.ok_or_else(|| AppError::Auth(AuthError::UserNotFound))?;
-
-    let equivalent_domains = row
-        .get("equivalent_domains")
-        .and_then(|v| v.as_str())
-        .unwrap_or("[]");
-    let excluded_globals = row
-        .get("excluded_globals")
-        .and_then(|v| v.as_str())
-        .unwrap_or("[]");
+    let domains = DomainsDB::fetch_by_user_id(&db, &claims.sub).await?;
+    let equivalent_domains = domains.equivalent_domains;
+    let excluded_globals = domains.excluded_globals;
 
     // Include ALL global groups and mark `excluded` (settings UI semantics).
     // Falls back to [] if the dataset isn't seeded yet.
     let global_equivalent_domains =
         EquivDomainData::global_equivalent_domains_json(
             &db,
-            excluded_globals,
+            &excluded_globals,
             true,
         )
         .await;
@@ -112,29 +88,14 @@ pub async fn post_domains(
         })?;
 
     let now = Utc::now().to_rfc3339();
-    query!(
+    DomainsDB::update_for_user(
         &db,
-        "UPDATE users SET equivalent_domains = ?1, excluded_globals = ?2, \
-         updated_at = ?3 WHERE id = ?4",
-        equivalent_domains_json,
-        excluded_globals_json,
-        now,
-        claims.sub
+        &claims.sub,
+        &equivalent_domains_json,
+        &excluded_globals_json,
+        &now,
     )
-    .map_err(|err| {
-        log::error!("Failed to prepare domains update query: {err}");
-        AppError::Database(DatabaseError::QueryFailed(
-            "Failed to update domains".to_string(),
-        ))
-    })?
-    .run()
-    .await
-    .map_err(|err| {
-        log::error!("Failed to execute domains update: {err}");
-        AppError::Database(DatabaseError::QueryFailed(
-            "Failed to update domains".to_string(),
-        ))
-    })?;
+    .await?;
 
     Ok(Json(json!({})))
 }

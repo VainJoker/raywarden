@@ -6,12 +6,15 @@ use serde::{
     Deserialize,
     Serialize,
 };
+use uuid::Uuid;
+use worker::query;
 
 use crate::{
     errors::{
         AppError,
         DatabaseError,
     },
+    infra::DB,
     models::serde_helpers::bool_from_int,
 };
 
@@ -50,9 +53,9 @@ impl TwoFactorType {
     }
 }
 
-/// `TwoFactor` database model
+/// `TwoFactorDB` database model
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct TwoFactor {
+pub struct TwoFactorDB {
     pub uuid:      String,
     pub user_uuid: String,
     pub atype:     i32,
@@ -62,7 +65,7 @@ pub struct TwoFactor {
     pub last_used: i64,
 }
 
-impl TwoFactor {
+impl TwoFactorDB {
     pub fn new(user_uuid: String, atype: TwoFactorType, data: String) -> Self {
         Self {
             uuid: uuid::Uuid::new_v4().to_string(),
@@ -131,6 +134,185 @@ impl TwoFactor {
     ) -> Result<bool, AppError> {
         let twofactors = Self::list_user_twofactors(db, user_id).await?;
         Ok(Self::is_twofactor_enabled(&twofactors))
+    }
+
+    pub async fn get_for_user_by_type(
+        db: &worker::D1Database,
+        user_id: &str,
+        atype: i32,
+    ) -> Result<Option<Self>, AppError> {
+        db.prepare(
+            "SELECT * FROM twofactor WHERE user_uuid = ?1 AND atype = ?2",
+        )
+        .bind(&[user_id.to_string().into(), atype.into()])?
+        .first(None)
+        .await
+        .map_err(|err| {
+            log::error!(
+                "Failed to fetch twofactor type {atype} for user {user_id}: \
+                 {err}"
+            );
+            AppError::Database(DatabaseError::QueryFailed(
+                "Failed to fetch twofactor record".to_string(),
+            ))
+        })?
+        .map(|value| {
+            serde_json::from_value(value).map_err(|err| {
+                log::error!("Failed to deserialize twofactor record: {err}");
+                AppError::Internal
+            })
+        })
+        .transpose()
+    }
+
+    pub async fn delete_types_for_user(
+        db: &worker::D1Database,
+        user_id: &str,
+        types: &[i32],
+    ) -> Result<(), AppError> {
+        if types.is_empty() {
+            return Ok(());
+        }
+
+        let placeholders = vec!["?"; types.len()].join(",");
+        let sql = format!(
+            "DELETE FROM twofactor WHERE user_uuid = ?1 AND atype IN \
+             ({placeholders})"
+        );
+
+        let mut binds = vec![user_id.to_string().into()];
+        binds.extend(types.iter().copied().map(Into::into));
+
+        DB::run_query(
+            async { db.prepare(sql).bind(&binds)?.run().await.map(|_| ()) },
+            "Failed to delete twofactor entries",
+        )
+        .await
+    }
+
+    pub async fn delete_type_for_user(
+        db: &worker::D1Database,
+        user_id: &str,
+        atype: i32,
+    ) -> Result<(), AppError> {
+        Self::delete_types_for_user(db, user_id, &[atype]).await
+    }
+
+    pub async fn insert_twofactor(
+        db: &worker::D1Database,
+        tf: &Self,
+    ) -> Result<(), AppError> {
+        DB::run_query(
+            async {
+                query!(
+                    db,
+                    "INSERT INTO twofactor (uuid, user_uuid, atype, enabled, \
+                     data, last_used) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                    tf.uuid,
+                    tf.user_uuid,
+                    tf.atype,
+                    i32::from(tf.enabled),
+                    tf.data,
+                    tf.last_used
+                )?
+                .run()
+                .await
+                .map(|_| ())
+            },
+            "Failed to insert twofactor record",
+        )
+        .await
+    }
+
+    pub async fn update_last_used(
+        db: &worker::D1Database,
+        uuid: &str,
+        last_used: i64,
+    ) -> Result<(), AppError> {
+        DB::run_query(
+            async {
+                query!(
+                    db,
+                    "UPDATE twofactor SET last_used = ?1 WHERE uuid = ?2",
+                    last_used,
+                    uuid
+                )?
+                .run()
+                .await
+                .map(|_| ())
+            },
+            "Failed to update twofactor last_used",
+        )
+        .await
+    }
+
+    pub async fn update_data(
+        db: &worker::D1Database,
+        uuid: &str,
+        data: &str,
+    ) -> Result<(), AppError> {
+        DB::run_query(
+            async {
+                query!(
+                    db,
+                    "UPDATE twofactor SET data = ?1 WHERE uuid = ?2",
+                    data,
+                    uuid
+                )?
+                .run()
+                .await
+                .map(|_| ())
+            },
+            "Failed to update twofactor data",
+        )
+        .await
+    }
+
+    pub async fn delete_for_user(
+        db: &worker::D1Database,
+        user_id: &str,
+    ) -> Result<(), AppError> {
+        DB::run_query(
+            async {
+                query!(
+                    db,
+                    "DELETE FROM twofactor WHERE user_uuid = ?1",
+                    user_id
+                )?
+                .run()
+                .await
+                .map(|_| ())
+            },
+            "Failed to delete twofactor entries",
+        )
+        .await
+    }
+
+    pub async fn upsert_remember_token(
+        db: &worker::D1Database,
+        user_id: &str,
+        json_data: &str,
+    ) -> Result<(), AppError> {
+        DB::run_query(
+            async {
+                query!(
+                    db,
+                    "INSERT INTO twofactor (uuid, user_uuid, atype, enabled, \
+                     data, last_used)
+                         VALUES (?1, ?2, ?3, 1, ?4, 0)
+                         ON CONFLICT(user_uuid, atype) DO UPDATE SET data = ?4",
+                    Uuid::new_v4().to_string(),
+                    user_id,
+                    TwoFactorType::Remember as i32,
+                    json_data
+                )?
+                .run()
+                .await
+                .map(|_| ())
+            },
+            "Failed to upsert remember token",
+        )
+        .await
     }
 }
 

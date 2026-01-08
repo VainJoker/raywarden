@@ -11,7 +11,6 @@ use chrono::{
 };
 use serde_json::Value;
 use uuid::Uuid;
-use worker::query;
 
 use crate::{
     api::{
@@ -22,21 +21,21 @@ use crate::{
     errors::{
         AppError,
         AuthError,
-        DatabaseError,
     },
     models::{
         attachment::AttachmentDB,
         cipher::{
             Cipher,
-            CipherDBModel,
+            CipherDB,
             CipherData,
             CipherRequestData,
             CreateCipherRequest,
             PartialCipherData,
         },
+        folder::FolderDB,
         user::{
             PasswordOrOtpData,
-            User,
+            UserDB,
         },
     },
 };
@@ -50,31 +49,6 @@ use crate::{
 //         ([(header::CONTENT_TYPE, "application/json")],
 // self.0).into_response()     }
 // }
-
-/// Helper to fetch a cipher by id for a user or return `NotFound`.
-async fn fetch_cipher_for_user(
-    db: &worker::D1Database,
-    cipher_id: &str,
-    user_id: &str,
-) -> Result<CipherDBModel, AppError> {
-    db.prepare("SELECT * FROM ciphers WHERE id = ?1 AND user_id = ?2")
-        .bind(&[cipher_id.to_string().into(), user_id.to_string().into()])
-        .map_err(|e| {
-            log::error!("Failed to bind fetch cipher query: {e}");
-            AppError::Database(DatabaseError::QueryFailed(
-                "Failed to fetch cipher".to_string(),
-            ))
-        })?
-        .first(None)
-        .await
-        .map_err(|e| {
-            log::error!("Failed to execute fetch cipher query: {e}");
-            AppError::Database(DatabaseError::QueryFailed(
-                "Failed to fetch cipher".to_string(),
-            ))
-        })?
-        .ok_or_else(|| AppError::not_found("Cipher not found"))
-}
 
 #[worker::send]
 pub async fn create_cipher(
@@ -126,39 +100,11 @@ pub async fn create_cipher(
         AppError::Internal
     })?;
 
-    query!(
-        &db,
-        "INSERT INTO ciphers (id, user_id, organization_id, type, data, \
-         favorite, folder_id, created_at, updated_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
-        cipher.id,
-        cipher.user_id,
-        cipher.organization_id,
-        cipher.r#type,
-        data,
-        cipher.favorite,
-        cipher.folder_id,
-        cipher.created_at,
-        cipher.updated_at,
-    )
-    .map_err(|e| {
-        log::error!("Failed to bind insert cipher query: {e}");
-        AppError::Database(DatabaseError::QueryFailed(
-            "Failed to insert cipher".to_string(),
-        ))
-    })?
-    .run()
-    .await
-    .map_err(|e| {
-        log::error!("Failed to execute insert cipher query: {e}");
-        AppError::Database(DatabaseError::QueryFailed(
-            "Failed to insert cipher".to_string(),
-        ))
-    })?;
+    CipherDB::insert_cipher(&db, &cipher, &data).await?;
 
     attachments::hydrate_cipher_attachments(&db, &state.env, &mut cipher)
         .await?;
-    User::touch_user_updated_at(&db, &claims.sub).await?;
+    UserDB::touch_user_updated_at(&db, &claims.sub).await?;
 
     Ok(Json(cipher))
 }
@@ -174,55 +120,12 @@ pub async fn update_cipher(
     let now = Utc::now();
     let now = now.format("%Y-%m-%dT%H:%M:%S%.3fZ").to_string();
 
-    let existing_cipher: crate::models::cipher::CipherDBModel = query!(
-        &db,
-        "SELECT * FROM ciphers WHERE id = ?1 AND user_id = ?2",
-        id,
-        claims.sub
-    )
-    .map_err(|e| {
-        log::error!("Failed to bind fetch cipher query: {e}");
-        AppError::Database(DatabaseError::QueryFailed(
-            "Failed to fetch cipher".to_string(),
-        ))
-    })?
-    .first(None)
-    .await
-    .map_err(|e| {
-        log::error!("Failed to execute fetch cipher query: {e}");
-        AppError::Database(DatabaseError::QueryFailed(
-            "Failed to fetch cipher".to_string(),
-        ))
-    })?
-    .ok_or_else(|| AppError::not_found("Cipher not found"))?;
+    let existing_cipher =
+        CipherDB::fetch_for_user(&db, &id, &claims.sub).await?;
 
     // Validate folder ownership if provided
     if let Some(ref folder_id) = payload.folder_id {
-        let folder_exists: Option<serde_json::Value> = db
-            .prepare("SELECT id FROM folders WHERE id = ?1 AND user_id = ?2")
-            .bind(&[folder_id.clone().into(), claims.sub.clone().into()])
-            .map_err(|e| {
-                log::error!("Failed to bind folder ownership query: {e}");
-                AppError::Database(DatabaseError::QueryFailed(
-                    "Failed to validate folder".to_string(),
-                ))
-            })?
-            .first(None)
-            .await
-            .map_err(|e| {
-                log::error!("Failed to execute folder ownership query: {e}");
-                AppError::Database(DatabaseError::QueryFailed(
-                    "Failed to validate folder".to_string(),
-                ))
-            })?;
-
-        if folder_exists.is_none() {
-            return Err(AppError::Params(
-                "Invalid folder: Folder does not exist or belongs to another \
-                 user"
-                    .to_string(),
-            ));
-        }
+        FolderDB::ensure_for_user(&db, folder_id, &claims.sub).await?;
     }
 
     // Reject updates based on stale client data when the last known revision is
@@ -296,38 +199,11 @@ pub async fn update_cipher(
         AppError::Internal
     })?;
 
-    query!(
-        &db,
-        "UPDATE ciphers SET organization_id = ?1, type = ?2, data = ?3, \
-         favorite = ?4, folder_id = ?5, updated_at = ?6 WHERE id = ?7 AND \
-         user_id = ?8",
-        cipher.organization_id,
-        cipher.r#type,
-        data,
-        cipher.favorite,
-        cipher.folder_id,
-        cipher.updated_at,
-        id,
-        claims.sub,
-    )
-    .map_err(|e| {
-        log::error!("Failed to bind update cipher query: {e}");
-        AppError::Database(DatabaseError::QueryFailed(
-            "Failed to update cipher".to_string(),
-        ))
-    })?
-    .run()
-    .await
-    .map_err(|e| {
-        log::error!("Failed to execute update cipher query: {e}");
-        AppError::Database(DatabaseError::QueryFailed(
-            "Failed to update cipher".to_string(),
-        ))
-    })?;
+    CipherDB::update_cipher(&db, &cipher, &data, &id, &claims.sub).await?;
 
     attachments::hydrate_cipher_attachments(&db, &state.env, &mut cipher)
         .await?;
-    User::touch_user_updated_at(&db, &claims.sub).await?;
+    UserDB::touch_user_updated_at(&db, &claims.sub).await?;
 
     Ok(Json(cipher))
 }
@@ -340,7 +216,7 @@ pub async fn list_ciphers(
 ) -> Result<Json<Value>, AppError> {
     let db = state.get_db();
     let include_attachments = AttachmentDB::attachments_enabled(&state.env);
-    let ciphers_json = Cipher::fetch_cipher_json_array_raw(
+    let ciphers_json = CipherDB::fetch_cipher_json_array_raw(
         &db,
         include_attachments,
         "WHERE c.user_id = ?1 AND c.deleted_at IS NULL",
@@ -368,7 +244,7 @@ pub async fn get_cipher(
     Path(id): Path<String>,
 ) -> Result<Json<Cipher>, AppError> {
     let db = state.get_db();
-    let cipher = fetch_cipher_for_user(&db, &id, &claims.sub).await?;
+    let cipher = CipherDB::fetch_for_user(&db, &id, &claims.sub).await?;
     let mut cipher: Cipher = cipher.into();
 
     attachments::hydrate_cipher_attachments(&db, &state.env, &mut cipher)
@@ -400,66 +276,27 @@ pub async fn update_cipher_partial(
 
     // Validate folder ownership if provided
     if let Some(ref folder_id) = payload.folder_id {
-        let folder_exists: Option<serde_json::Value> = db
-            .prepare("SELECT id FROM folders WHERE id = ?1 AND user_id = ?2")
-            .bind(&[folder_id.clone().into(), user_id.clone().into()])
-            .map_err(|e| {
-                log::error!("Failed to bind folder ownership query: {e}");
-                AppError::Database(DatabaseError::QueryFailed(
-                    "Failed to validate folder".to_string(),
-                ))
-            })?
-            .first(None)
-            .await
-            .map_err(|e| {
-                log::error!("Failed to execute folder ownership query: {e}");
-                AppError::Database(DatabaseError::QueryFailed(
-                    "Failed to validate folder".to_string(),
-                ))
-            })?;
-
-        if folder_exists.is_none() {
-            return Err(AppError::Params(
-                "Invalid folder: Folder does not exist or belongs to another \
-                 user"
-                    .to_string(),
-            ));
-        }
+        FolderDB::ensure_for_user(&db, folder_id, user_id).await?;
     }
 
     // Ensure cipher exists and belongs to user
-    fetch_cipher_for_user(&db, &id, user_id).await?;
+    CipherDB::fetch_for_user(&db, &id, user_id).await?;
 
     let now = Utc::now().format("%Y-%m-%dT%H:%M:%S%.3fZ").to_string();
 
-    query!(
+    CipherDB::update_cipher_partial(
         &db,
-        "UPDATE ciphers SET folder_id = ?1, favorite = ?2, updated_at = ?3 \
-         WHERE id = ?4 AND user_id = ?5",
         payload.folder_id,
         payload.favorite,
-        now,
-        id,
+        &now,
+        &id,
         user_id,
     )
-    .map_err(|e| {
-        log::error!("Failed to bind update cipher partial query: {e}");
-        AppError::Database(DatabaseError::QueryFailed(
-            "Failed to update cipher".to_string(),
-        ))
-    })?
-    .run()
-    .await
-    .map_err(|e| {
-        log::error!("Failed to execute update cipher partial query: {e}");
-        AppError::Database(DatabaseError::QueryFailed(
-            "Failed to update cipher".to_string(),
-        ))
-    })?;
+    .await?;
 
-    User::touch_user_updated_at(&db, user_id).await?;
+    UserDB::touch_user_updated_at(&db, user_id).await?;
 
-    let cipher = fetch_cipher_for_user(&db, &id, user_id).await?;
+    let cipher = CipherDB::fetch_for_user(&db, &id, user_id).await?;
     let mut cipher: Cipher = cipher.into();
 
     attachments::hydrate_cipher_attachments(&db, &state.env, &mut cipher)
@@ -479,30 +316,9 @@ pub async fn soft_delete_cipher(
     let db = state.get_db();
     let now = Utc::now().format("%Y-%m-%dT%H:%M:%S%.3fZ").to_string();
 
-    query!(
-        &db,
-        "UPDATE ciphers SET deleted_at = ?1, updated_at = ?1 WHERE id = ?2 \
-         AND user_id = ?3",
-        now,
-        id,
-        claims.sub
-    )
-    .map_err(|e| {
-        log::error!("Failed to bind soft-delete cipher query: {e}");
-        AppError::Database(DatabaseError::QueryFailed(
-            "Failed to soft-delete cipher".to_string(),
-        ))
-    })?
-    .run()
-    .await
-    .map_err(|e| {
-        log::error!("Failed to execute soft-delete cipher query: {e}");
-        AppError::Database(DatabaseError::QueryFailed(
-            "Failed to soft-delete cipher".to_string(),
-        ))
-    })?;
+    CipherDB::soft_delete_cipher(&db, &id, &claims.sub, &now).await?;
 
-    User::touch_user_updated_at(&db, &claims.sub).await?;
+    UserDB::touch_user_updated_at(&db, &claims.sub).await?;
 
     Ok(Json(()))
 }
@@ -522,25 +338,9 @@ pub async fn soft_delete_ciphers_bulk(
     let db = state.get_db();
     let now = Utc::now().format("%Y-%m-%dT%H:%M:%S%.3fZ").to_string();
 
-    query!(
-        &db,
-        "UPDATE ciphers SET deleted_at = ?1, updated_at = ?1 WHERE user_id = \
-         ?2 AND id IN (SELECT value FROM json_each(?3, '$.ids'))",
-        now,
-        claims.sub,
-        body
-    )
-    .map_err(|e| {
-        log::error!("Failed to bind bulk soft-delete query: {e}");
-        AppError::Database(DatabaseError::QueryFailed(
-            "Failed to soft-delete ciphers".to_string(),
-        ))
-    })?
-    .run()
-    .await
-    .map_err(|e| Cipher::map_d1_json_error(&e))?;
+    CipherDB::soft_delete_ciphers_bulk(&db, &claims.sub, &body, &now).await?;
 
-    User::touch_user_updated_at(&db, &claims.sub).await?;
+    UserDB::touch_user_updated_at(&db, &claims.sub).await?;
 
     Ok(Json(()))
 }
@@ -571,28 +371,9 @@ pub async fn hard_delete_cipher(
         AttachmentDB::delete_r2_objects(&bucket, &keys).await?;
     }
 
-    query!(
-        &db,
-        "DELETE FROM ciphers WHERE id = ?1 AND user_id = ?2",
-        id,
-        claims.sub
-    )
-    .map_err(|e| {
-        log::error!("Failed to bind hard-delete cipher query: {e}");
-        AppError::Database(DatabaseError::QueryFailed(
-            "Failed to delete cipher".to_string(),
-        ))
-    })?
-    .run()
-    .await
-    .map_err(|e| {
-        log::error!("Failed to execute hard-delete cipher query: {e}");
-        AppError::Database(DatabaseError::QueryFailed(
-            "Failed to delete cipher".to_string(),
-        ))
-    })?;
+    CipherDB::hard_delete_cipher(&db, &id, &claims.sub).await?;
 
-    User::touch_user_updated_at(&db, &claims.sub).await?;
+    UserDB::touch_user_updated_at(&db, &claims.sub).await?;
 
     Ok(Json(()))
 }
@@ -623,24 +404,9 @@ pub async fn hard_delete_ciphers_bulk(
         AttachmentDB::delete_r2_objects(&bucket, &keys).await?;
     }
 
-    query!(
-        &db,
-        "DELETE FROM ciphers WHERE user_id = ?1 AND id IN (SELECT value FROM \
-         json_each(?2, '$.ids'))",
-        claims.sub,
-        body
-    )
-    .map_err(|e| {
-        log::error!("Failed to bind bulk hard-delete query: {e}");
-        AppError::Database(DatabaseError::QueryFailed(
-            "Failed to delete ciphers".to_string(),
-        ))
-    })?
-    .run()
-    .await
-    .map_err(|e| Cipher::map_d1_json_error(&e))?;
+    CipherDB::hard_delete_ciphers_bulk(&db, &claims.sub, &body).await?;
 
-    User::touch_user_updated_at(&db, &claims.sub).await?;
+    UserDB::touch_user_updated_at(&db, &claims.sub).await?;
 
     Ok(Json(()))
 }
@@ -656,58 +422,14 @@ pub async fn restore_cipher(
     let db = state.get_db();
     let now = Utc::now().format("%Y-%m-%dT%H:%M:%S%.3fZ").to_string();
 
-    // Update the cipher to clear deleted_at
-    query!(
-        &db,
-        "UPDATE ciphers SET deleted_at = NULL, updated_at = ?1 WHERE id = ?2 \
-         AND user_id = ?3",
-        now,
-        id,
-        claims.sub
-    )
-    .map_err(|e| {
-        log::error!("Failed to bind restore cipher query: {e}");
-        AppError::Database(DatabaseError::QueryFailed(
-            "Failed to restore cipher".to_string(),
-        ))
-    })?
-    .run()
-    .await
-    .map_err(|e| {
-        log::error!("Failed to execute restore cipher query: {e}");
-        AppError::Database(DatabaseError::QueryFailed(
-            "Failed to restore cipher".to_string(),
-        ))
-    })?;
-
-    // Fetch and return the restored cipher
-    let cipher_db: crate::models::cipher::CipherDBModel = query!(
-        &db,
-        "SELECT * FROM ciphers WHERE id = ?1 AND user_id = ?2",
-        id,
-        claims.sub
-    )
-    .map_err(|e| {
-        log::error!("Failed to bind fetch restored cipher query: {e}");
-        AppError::Database(DatabaseError::QueryFailed(
-            "Failed to fetch cipher".to_string(),
-        ))
-    })?
-    .first(None)
-    .await
-    .map_err(|e| {
-        log::error!("Failed to execute fetch restored cipher query: {e}");
-        AppError::Database(DatabaseError::QueryFailed(
-            "Failed to fetch cipher".to_string(),
-        ))
-    })?
-    .ok_or_else(|| AppError::not_found("Cipher not found"))?;
+    let cipher_db =
+        CipherDB::restore_cipher(&db, &id, &claims.sub, &now).await?;
 
     let mut cipher: Cipher = cipher_db.into();
     attachments::hydrate_cipher_attachments(&db, &state.env, &mut cipher)
         .await?;
 
-    User::touch_user_updated_at(&db, &claims.sub).await?;
+    UserDB::touch_user_updated_at(&db, &claims.sub).await?;
 
     Ok(Json(cipher))
 }
@@ -727,27 +449,10 @@ pub async fn restore_ciphers_bulk(
     let db = state.get_db();
     let now = Utc::now().format("%Y-%m-%dT%H:%M:%S%.3fZ").to_string();
 
-    // Single bulk UPDATE using json_each() with path
-    query!(
-        &db,
-        "UPDATE ciphers SET deleted_at = NULL, updated_at = ?1 WHERE user_id \
-         = ?2 AND id IN (SELECT value FROM json_each(?3, '$.ids'))",
-        now,
-        claims.sub,
-        body
-    )
-    .map_err(|e| {
-        log::error!("Failed to bind bulk restore query: {e}");
-        AppError::Database(DatabaseError::QueryFailed(
-            "Failed to restore ciphers".to_string(),
-        ))
-    })?
-    .run()
-    .await
-    .map_err(|e| Cipher::map_d1_json_error(&e))?;
+    CipherDB::restore_ciphers_bulk(&db, &claims.sub, &body, &now).await?;
 
     let include_attachments = AttachmentDB::attachments_enabled(&state.env);
-    let ciphers_json = Cipher::fetch_cipher_json_array_raw(
+    let ciphers_json = CipherDB::fetch_cipher_json_array_raw(
         &db,
         include_attachments,
         "WHERE c.user_id = ?1 AND c.id IN (SELECT value FROM json_each(?2, \
@@ -757,7 +462,7 @@ pub async fn restore_ciphers_bulk(
     )
     .await?;
 
-    User::touch_user_updated_at(&db, &claims.sub).await?;
+    UserDB::touch_user_updated_at(&db, &claims.sub).await?;
 
     // Build response JSON via string concatenation (no parsing!)
     let response = format!(
@@ -818,39 +523,11 @@ pub async fn create_cipher_simple(
         AppError::Internal
     })?;
 
-    query!(
-        &db,
-        "INSERT INTO ciphers (id, user_id, organization_id, type, data, \
-         favorite, folder_id, created_at, updated_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
-        cipher.id,
-        cipher.user_id,
-        cipher.organization_id,
-        cipher.r#type,
-        data,
-        cipher.favorite,
-        cipher.folder_id,
-        cipher.created_at,
-        cipher.updated_at,
-    )
-    .map_err(|e| {
-        log::error!("Failed to bind insert cipher query: {e}");
-        AppError::Database(DatabaseError::QueryFailed(
-            "Failed to insert cipher".to_string(),
-        ))
-    })?
-    .run()
-    .await
-    .map_err(|e| {
-        log::error!("Failed to execute insert cipher query: {e}");
-        AppError::Database(DatabaseError::QueryFailed(
-            "Failed to insert cipher".to_string(),
-        ))
-    })?;
+    CipherDB::insert_cipher(&db, &cipher, &data).await?;
 
     attachments::hydrate_cipher_attachments(&db, &state.env, &mut cipher)
         .await?;
-    User::touch_user_updated_at(&db, &claims.sub).await?;
+    UserDB::touch_user_updated_at(&db, &claims.sub).await?;
 
     Ok(Json(cipher))
 }
@@ -873,41 +550,14 @@ pub async fn move_cipher_selected(
 
     // Validate folder exists and belongs to user (if folder_id is provided)
     // Uses json_extract to get folderId from request body
-    let folder_invalid: Option<Value> = db
-        .prepare(
-            "SELECT 1 WHERE json_extract(?1, '$.folderId') IS NOT NULL 
-             AND NOT EXISTS (
-                 SELECT 1 FROM folders WHERE id = json_extract(?1, \
-             '$.folderId') AND user_id = ?2
-             )",
-        )
-        .bind(&[body.clone().into(), user_id.clone().into()])?
-        .first(None)
-        .await
-        .map_err(|e| Cipher::map_d1_json_error(&e))?;
-
-    if folder_invalid.is_some() {
-        return Err(AppError::Params(
-            "Invalid folder: Folder does not exist or belongs to another user"
-                .to_string(),
-        ));
-    }
+    FolderDB::ensure_json_folder_exists(&db, &body, user_id).await?;
 
     // Update folder_id for all ciphers that belong to the user and are in the
     // ids list Uses json_extract for folderId and json_each for ids array
-    db.prepare(
-        "UPDATE ciphers SET folder_id = json_extract(?1, '$.folderId'), \
-         updated_at = ?2 
-         WHERE user_id = ?3 AND id IN (SELECT value FROM json_each(?1, \
-         '$.ids'))",
-    )
-    .bind(&[body.into(), now.into(), user_id.clone().into()])?
-    .run()
-    .await
-    .map_err(|e| Cipher::map_d1_json_error(&e))?;
+    CipherDB::move_selected(&db, user_id, &body, &now).await?;
 
     // Update user's revision date
-    User::touch_user_updated_at(&db, user_id).await?;
+    UserDB::touch_user_updated_at(&db, user_id).await?;
 
     Ok(Json(()))
 }
@@ -928,28 +578,13 @@ pub async fn purge_vault(
     let user_id = &claims.sub;
 
     // Get the user from the database
-    let user: Value = db
-        .prepare("SELECT * FROM users WHERE id = ?1")
-        .bind(&[user_id.clone().into()])
-        .map_err(|e| {
-            log::error!("Failed to bind fetch user query: {e}");
-            AppError::Database(DatabaseError::QueryFailed(
-                "Failed to fetch user".to_string(),
-            ))
-        })?
-        .first(None)
-        .await
-        .map_err(|e| {
-            log::error!("Failed to execute fetch user query: {e}");
-            AppError::Database(DatabaseError::QueryFailed(
-                "Failed to fetch user".to_string(),
-            ))
-        })?
-        .ok_or(AppError::Auth(AuthError::UserNotFound))?;
-    let user: User = serde_json::from_value(user).map_err(|e| {
-        log::error!("Failed to deserialize user row: {e}");
-        AppError::Internal
-    })?;
+    let user = UserDB::fetch_by_id_with(
+        &db,
+        user_id,
+        "Failed to fetch user for vault purge",
+        || AppError::Auth(AuthError::UserNotFound),
+    )
+    .await?;
 
     // Validate password (OTP not supported in this simplified version)
     let provided_hash = payload.master_password_hash.ok_or_else(|| {
@@ -970,41 +605,11 @@ pub async fn purge_vault(
     }
 
     // Delete all user's ciphers (both active and soft-deleted)
-    query!(&db, "DELETE FROM ciphers WHERE user_id = ?1", user_id)
-        .map_err(|e| {
-            log::error!("Failed to bind purge ciphers query: {e}");
-            AppError::Database(DatabaseError::QueryFailed(
-                "Failed to purge ciphers".to_string(),
-            ))
-        })?
-        .run()
-        .await
-        .map_err(|e| {
-            log::error!("Failed to execute purge ciphers query: {e}");
-            AppError::Database(DatabaseError::QueryFailed(
-                "Failed to purge ciphers".to_string(),
-            ))
-        })?;
-
-    // Delete all user's folders
-    query!(&db, "DELETE FROM folders WHERE user_id = ?1", user_id)
-        .map_err(|e| {
-            log::error!("Failed to bind purge folders query: {e}");
-            AppError::Database(DatabaseError::QueryFailed(
-                "Failed to purge folders".to_string(),
-            ))
-        })?
-        .run()
-        .await
-        .map_err(|e| {
-            log::error!("Failed to execute purge folders query: {e}");
-            AppError::Database(DatabaseError::QueryFailed(
-                "Failed to purge folders".to_string(),
-            ))
-        })?;
+    CipherDB::purge_user_ciphers(&db, user_id).await?;
+    FolderDB::purge_user_folders(&db, user_id).await?;
 
     // Update user's revision date to trigger client sync
-    User::touch_user_updated_at(&db, user_id).await?;
+    UserDB::touch_user_updated_at(&db, user_id).await?;
 
     Ok(Json(()))
 }

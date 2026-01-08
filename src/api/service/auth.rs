@@ -15,7 +15,7 @@ use crate::{
     },
     errors::AppError,
     infra::jwtor as jwt,
-    models::user::User,
+    models::user::UserDB,
 };
 
 /// Generate access + refresh tokens and format the response.
@@ -25,7 +25,7 @@ use crate::{
 /// - Outputs: `TokenResponse`-shaped JSON (built in the handler today).
 /// - Errors: `AppError::Internal` for signing failures.
 pub fn generate_tokens(
-    user: &User,
+    user: &UserDB,
     state: &AppState,
 ) -> Result<(String, String, i64), AppError> {
     // Align with the project's Claims shape (infra/jwtor.rs)
@@ -79,7 +79,7 @@ pub fn generate_tokens(
 ///
 /// This is intentionally low-level to avoid introducing a new DTO layer.
 pub fn token_response_json(
-    user: &User,
+    user: &UserDB,
     access_token: &str,
     refresh_token: &str,
     expires_in: i64,

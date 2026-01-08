@@ -11,11 +11,15 @@ use worker::{
     Bucket,
     D1Database,
     Env,
+    query,
 };
 
-use crate::errors::{
-    AppError,
-    DatabaseError,
+use crate::{
+    errors::{
+        AppError,
+        DatabaseError,
+    },
+    infra::DB,
 };
 
 pub const ATTACHMENTS_BUCKET: &str = "ATTACHMENTS_BUCKET";
@@ -55,7 +59,157 @@ pub struct AttachmentKeyRow {
     pub id:        String,
 }
 
+#[derive(Debug, Deserialize, Default)]
+struct CountRow {
+    count: u32,
+}
+
 impl AttachmentDB {
+    pub async fn insert_pending(
+        db: &D1Database,
+        pending: &Self,
+    ) -> Result<(), AppError> {
+        DB::run_query(
+            async {
+                query!(
+                    db,
+                    "INSERT INTO attachments_pending (id, cipher_id, \
+                     file_name, file_size, akey, created_at, updated_at, \
+                     organization_id)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6, ?7)",
+                    pending.id,
+                    pending.cipher_id,
+                    pending.file_name,
+                    pending.file_size,
+                    pending.akey,
+                    pending.created_at,
+                    pending.organization_id,
+                )?
+                .run()
+                .await
+                .map(|_| ())
+            },
+            "Failed to insert pending attachment",
+        )
+        .await
+    }
+
+    pub async fn insert_finalized(
+        db: &D1Database,
+        attachment: &Self,
+        now: &str,
+    ) -> Result<(), AppError> {
+        DB::run_query(
+            async {
+                query!(
+                    db,
+                    "INSERT INTO attachments (id, cipher_id, file_name, \
+                     file_size, akey, created_at, updated_at, organization_id)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                    attachment.id,
+                    attachment.cipher_id,
+                    attachment.file_name,
+                    attachment.file_size,
+                    attachment.akey,
+                    attachment.created_at,
+                    now,
+                    attachment.organization_id,
+                )?
+                .run()
+                .await
+                .map(|_| ())
+            },
+            "Failed to finalize attachment",
+        )
+        .await
+    }
+
+    pub async fn delete_pending(
+        db: &D1Database,
+        attachment_id: &str,
+    ) -> Result<(), AppError> {
+        DB::run_query(
+            async {
+                query!(
+                    db,
+                    "DELETE FROM attachments_pending WHERE id = ?1",
+                    attachment_id
+                )?
+                .run()
+                .await
+                .map(|_| ())
+            },
+            "Failed to delete pending attachment",
+        )
+        .await
+    }
+
+    pub async fn purge_pending_before(
+        db: &D1Database,
+        cutoff_exclusive: &str,
+    ) -> Result<u32, AppError> {
+        let pending_count = query!(
+            db,
+            "SELECT COUNT(*) as count FROM attachments_pending WHERE \
+             created_at < ?1",
+            cutoff_exclusive
+        )
+        .map_err(|e| {
+            log::error!("Failed to prepare pending attachment count: {e}");
+            AppError::Database(DatabaseError::QueryFailed(
+                "Failed to count pending attachments".to_string(),
+            ))
+        })?
+        .first::<CountRow>(None)
+        .await
+        .map_err(|e| {
+            log::error!("Failed to count pending attachments: {e}");
+            AppError::Database(DatabaseError::QueryFailed(
+                "Failed to count pending attachments".to_string(),
+            ))
+        })?
+        .map_or(0, |row| row.count);
+
+        if pending_count > 0 {
+            DB::run_query(
+                async {
+                    query!(
+                        db,
+                        "DELETE FROM attachments_pending WHERE created_at < ?1",
+                        cutoff_exclusive
+                    )?
+                    .run()
+                    .await
+                    .map(|_| ())
+                },
+                "Failed to purge pending attachments",
+            )
+            .await?;
+        }
+
+        Ok(pending_count)
+    }
+
+    pub async fn delete_attachment(
+        db: &D1Database,
+        attachment_id: &str,
+    ) -> Result<(), AppError> {
+        DB::run_query(
+            async {
+                query!(
+                    db,
+                    "DELETE FROM attachments WHERE id = ?1",
+                    attachment_id
+                )?
+                .run()
+                .await
+                .map(|_| ())
+            },
+            "Failed to delete attachment",
+        )
+        .await
+    }
+
     pub fn r2_key(&self) -> String {
         format!("{}/{}", self.cipher_id, self.id)
     }

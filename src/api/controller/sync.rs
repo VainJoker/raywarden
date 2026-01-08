@@ -22,15 +22,15 @@ use crate::{
     },
     models::{
         attachment::AttachmentDB,
-        cipher::Cipher,
+        cipher::CipherDB,
         domains::EquivDomainData,
         folder::{
-            Folder,
+            FolderDB,
             FolderResponse,
         },
         sync::Profile,
-        twofactor::TwoFactor,
-        user::User,
+        twofactor::TwoFactorDB,
+        user::UserDB,
     },
 };
 
@@ -52,15 +52,16 @@ pub async fn get_sync_data(
     let db = state.get_db();
 
     // Fetch profile
-    let user: User = db
-        .prepare("SELECT * FROM users WHERE id = ?1")
-        .bind(&[user_id.clone().into()])?
-        .first(None)
-        .await?
-        .ok_or_else(|| AppError::Auth(AuthError::UserNotFound))?;
+    let user = UserDB::fetch_by_id_with(
+        &db,
+        &user_id,
+        "Failed to fetch user for sync",
+        || AppError::Auth(AuthError::UserNotFound),
+    )
+    .await?;
 
     let two_factor_enabled =
-        TwoFactor::two_factor_enabled(&db, &user_id).await?;
+        TwoFactorDB::two_factor_enabled(&db, &user_id).await?;
 
     let has_master_password = !user.master_password_hash.is_empty();
     let equivalent_domains = user.equivalent_domains.clone();
@@ -87,13 +88,7 @@ pub async fn get_sync_data(
     };
 
     // Fetch folders
-    let folders_db: Vec<Folder> = db
-        .prepare("SELECT * FROM folders WHERE user_id = ?1")
-        .bind(&[user_id.clone().into()])?
-        .all()
-        .await?
-        .results()?;
-
+    let folders_db = FolderDB::list_for_user(&db, &user_id).await?;
     let folders: Vec<FolderResponse> = folders_db
         .into_iter()
         .map(std::convert::Into::into)
@@ -101,7 +96,7 @@ pub async fn get_sync_data(
 
     // Fetch ciphers as raw JSON array string (no parsing in Rust!)
     let include_attachments = AttachmentDB::attachments_enabled(&state.env);
-    let ciphers_json = Cipher::fetch_cipher_json_array_raw(
+    let ciphers_json = CipherDB::fetch_cipher_json_array_raw(
         &db,
         include_attachments,
         "WHERE c.user_id = ?1",

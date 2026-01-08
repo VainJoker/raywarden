@@ -4,7 +4,7 @@ use serde_json::Value;
 
 use super::{
     folder::FolderResponse,
-    user::User,
+    user::UserDB,
 };
 
 #[derive(Debug, Serialize)]
@@ -47,7 +47,7 @@ pub struct Profile {
 }
 
 impl Profile {
-    pub fn from_user(user: User, two_factor_enabled: bool) -> Self {
+    pub fn from_user(user: UserDB, two_factor_enabled: bool) -> Self {
         let creation_date =
             chrono::DateTime::parse_from_rfc3339(&user.created_at)
                 .unwrap_or_default()

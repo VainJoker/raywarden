@@ -1,3 +1,5 @@
+use std::collections::HashSet;
+
 use chrono::Utc;
 use serde::{
     Deserialize,
@@ -14,6 +16,7 @@ use serde_json::{
 use wasm_bindgen::JsValue;
 use worker::{
     D1Database,
+    D1PreparedStatement,
     query,
 };
 
@@ -22,6 +25,7 @@ use crate::{
         AppError,
         DatabaseError,
     },
+    infra::DB,
     models::attachment::AttachmentResponse,
 };
 
@@ -73,6 +77,16 @@ pub struct CipherData {
 #[derive(Deserialize)]
 struct CipherJsonArrayRow {
     ciphers_json: String,
+}
+
+#[derive(Deserialize)]
+struct AffectedUserRow {
+    user_id: Option<String>,
+}
+
+#[derive(Deserialize, Default)]
+struct CountRow {
+    count: u32,
 }
 
 // Custom deserialization function for booleans
@@ -180,7 +194,7 @@ pub struct Cipher {
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
-pub struct CipherDBModel {
+pub struct CipherDB {
     pub id:              String,
     pub user_id:         String,
     pub organization_id: Option<String>,
@@ -193,8 +207,8 @@ pub struct CipherDBModel {
     pub updated_at:      String,
 }
 
-impl From<CipherDBModel> for Cipher {
-    fn from(val: CipherDBModel) -> Self {
+impl From<CipherDB> for Cipher {
+    fn from(val: CipherDB) -> Self {
         Self {
             id:                    val.id,
             user_id:               Some(val.user_id),
@@ -418,7 +432,7 @@ pub struct PartialCipherData {
     pub favorite:  bool,
 }
 
-impl Cipher {
+impl CipherDB {
     pub async fn touch_cipher_updated_at(
         db: &D1Database,
         cipher_id: &str,
@@ -440,12 +454,460 @@ impl Cipher {
         Ok(())
     }
 
+    /// Insert a new cipher row.
+    pub async fn insert_cipher(
+        db: &D1Database,
+        cipher: &Cipher,
+        data_json: &str,
+    ) -> Result<(), AppError> {
+        DB::run_query(
+            async {
+                query!(
+                    db,
+                    "INSERT INTO ciphers (id, user_id, organization_id, type, \
+                     data, favorite, folder_id, created_at, updated_at)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                    cipher.id,
+                    cipher.user_id,
+                    cipher.organization_id,
+                    cipher.r#type,
+                    data_json,
+                    cipher.favorite,
+                    cipher.folder_id,
+                    cipher.created_at,
+                    cipher.updated_at,
+                )?
+                .run()
+                .await
+                .map(|_| ())
+            },
+            "Failed to insert cipher",
+        )
+        .await
+    }
+
+    /// Insert multiple ciphers using batch execution.
+    pub async fn insert_ciphers_batch(
+        db: &D1Database,
+        ciphers: &[(Cipher, String)],
+        batch_size: usize,
+    ) -> Result<(), AppError> {
+        if ciphers.is_empty() {
+            return Ok(());
+        }
+
+        let mut statements: Vec<D1PreparedStatement> =
+            Vec::with_capacity(ciphers.len());
+
+        for (cipher, data_json) in ciphers {
+            let stmt = query!(
+                db,
+                "INSERT INTO ciphers (id, user_id, organization_id, type, \
+                 data, favorite, folder_id, created_at, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                cipher.id,
+                cipher.user_id,
+                cipher.organization_id,
+                cipher.r#type,
+                data_json,
+                cipher.favorite,
+                cipher.folder_id,
+                cipher.created_at,
+                cipher.updated_at,
+            )
+            .map_err(|e| {
+                AppError::Database(DatabaseError::QueryFailed(format!(
+                    "Failed to prepare cipher insert: {e}"
+                )))
+            })?;
+
+            statements.push(stmt);
+        }
+
+        if batch_size == 0 {
+            DB::run_query(
+                async { db.batch(statements).await.map(|_| ()) },
+                "Failed to insert ciphers",
+            )
+            .await
+        } else {
+            for chunk in statements.chunks(batch_size) {
+                DB::run_query(
+                    async { db.batch(chunk.to_vec()).await.map(|_| ()) },
+                    "Failed to insert ciphers",
+                )
+                .await?;
+            }
+
+            Ok(())
+        }
+    }
+
+    pub async fn update_cipher(
+        db: &D1Database,
+        cipher: &Cipher,
+        data_json: &str,
+        id: &str,
+        user_id: &str,
+    ) -> Result<(), AppError> {
+        DB::run_query(
+            async {
+                query!(
+                    db,
+                    "UPDATE ciphers SET organization_id = ?1, type = ?2, data \
+                     = ?3, favorite = ?4, folder_id = ?5, updated_at = ?6 \
+                     WHERE id = ?7 AND user_id = ?8",
+                    cipher.organization_id,
+                    cipher.r#type,
+                    data_json,
+                    cipher.favorite,
+                    cipher.folder_id,
+                    cipher.updated_at,
+                    id,
+                    user_id,
+                )?
+                .run()
+                .await
+                .map(|_| ())
+            },
+            "Failed to update cipher",
+        )
+        .await
+    }
+
+    pub async fn update_cipher_partial(
+        db: &D1Database,
+        folder_id: Option<String>,
+        favorite: bool,
+        now: &str,
+        id: &str,
+        user_id: &str,
+    ) -> Result<(), AppError> {
+        DB::run_query(
+            async {
+                query!(
+                    db,
+                    "UPDATE ciphers SET folder_id = ?1, favorite = ?2, \
+                     updated_at = ?3 WHERE id = ?4 AND user_id = ?5",
+                    folder_id,
+                    favorite,
+                    now,
+                    id,
+                    user_id,
+                )?
+                .run()
+                .await
+                .map(|_| ())
+            },
+            "Failed to update cipher",
+        )
+        .await
+    }
+
+    pub async fn soft_delete_cipher(
+        db: &D1Database,
+        id: &str,
+        user_id: &str,
+        now: &str,
+    ) -> Result<(), AppError> {
+        DB::run_query(
+            async {
+                query!(
+                    db,
+                    "UPDATE ciphers SET deleted_at = ?1, updated_at = ?1 \
+                     WHERE id = ?2 AND user_id = ?3",
+                    now,
+                    id,
+                    user_id
+                )?
+                .run()
+                .await
+                .map(|_| ())
+            },
+            "Failed to soft-delete cipher",
+        )
+        .await
+    }
+
+    pub async fn soft_delete_ciphers_bulk(
+        db: &D1Database,
+        user_id: &str,
+        body: &str,
+        now: &str,
+    ) -> Result<(), AppError> {
+        query!(
+            db,
+            "UPDATE ciphers SET deleted_at = ?1, updated_at = ?1 WHERE \
+             user_id = ?2 AND id IN (SELECT value FROM json_each(?3, \
+             \'$.ids\'))",
+            now,
+            user_id,
+            body
+        )
+        .map_err(|e| {
+            log::error!("Failed to bind bulk soft-delete query: {e}");
+            AppError::Database(DatabaseError::QueryFailed(
+                "Failed to soft-delete ciphers".to_string(),
+            ))
+        })?
+        .run()
+        .await
+        .map_err(|e| Self::map_d1_json_error(&e))
+        .map(|_| ())
+    }
+
+    pub async fn hard_delete_cipher(
+        db: &D1Database,
+        id: &str,
+        user_id: &str,
+    ) -> Result<(), AppError> {
+        DB::run_query(
+            async {
+                query!(
+                    db,
+                    "DELETE FROM ciphers WHERE id = ?1 AND user_id = ?2",
+                    id,
+                    user_id
+                )?
+                .run()
+                .await
+                .map(|_| ())
+            },
+            "Failed to delete cipher",
+        )
+        .await
+    }
+
+    pub async fn hard_delete_ciphers_bulk(
+        db: &D1Database,
+        user_id: &str,
+        body: &str,
+    ) -> Result<(), AppError> {
+        query!(
+            db,
+            "DELETE FROM ciphers WHERE user_id = ?1 AND id IN (SELECT value \
+             FROM json_each(?2, \'$.ids\'))",
+            user_id,
+            body
+        )
+        .map_err(|e| {
+            log::error!("Failed to bind bulk hard-delete query: {e}");
+            AppError::Database(DatabaseError::QueryFailed(
+                "Failed to delete ciphers".to_string(),
+            ))
+        })?
+        .run()
+        .await
+        .map_err(|e| Self::map_d1_json_error(&e))
+        .map(|_| ())
+    }
+
+    pub async fn restore_cipher(
+        db: &D1Database,
+        id: &str,
+        user_id: &str,
+        now: &str,
+    ) -> Result<Self, AppError> {
+        query!(
+            db,
+            "UPDATE ciphers SET deleted_at = NULL, updated_at = ?1 WHERE id = \
+             ?2 AND user_id = ?3",
+            now,
+            id,
+            user_id
+        )
+        .map_err(|e| {
+            log::error!("Failed to bind restore cipher query: {e}");
+            AppError::Database(DatabaseError::QueryFailed(
+                "Failed to restore cipher".to_string(),
+            ))
+        })?
+        .run()
+        .await
+        .map_err(|e| {
+            log::error!("Failed to execute restore cipher query: {e}");
+            AppError::Database(DatabaseError::QueryFailed(
+                "Failed to restore cipher".to_string(),
+            ))
+        })?;
+
+        Self::fetch_for_user(db, id, user_id).await
+    }
+
+    pub async fn restore_ciphers_bulk(
+        db: &D1Database,
+        user_id: &str,
+        body: &str,
+        now: &str,
+    ) -> Result<(), AppError> {
+        query!(
+            db,
+            "UPDATE ciphers SET deleted_at = NULL, updated_at = ?1 WHERE \
+             user_id = ?2 AND id IN (SELECT value FROM json_each(?3, \
+             \'$.ids\'))",
+            now,
+            user_id,
+            body
+        )
+        .map_err(|e| {
+            log::error!("Failed to bind bulk restore query: {e}");
+            AppError::Database(DatabaseError::QueryFailed(
+                "Failed to restore ciphers".to_string(),
+            ))
+        })?
+        .run()
+        .await
+        .map_err(|e| Self::map_d1_json_error(&e))
+        .map(|_| ())
+    }
+
+    pub async fn move_selected(
+        db: &D1Database,
+        user_id: &str,
+        body: &str,
+        now: &str,
+    ) -> Result<(), AppError> {
+        db.prepare(
+            "UPDATE ciphers SET folder_id = json_extract(?1, '$.folderId'), \
+             updated_at = ?2 WHERE user_id = ?3 AND id IN (SELECT value FROM \
+             json_each(?1, '$.ids'))",
+        )
+        .bind(&[
+            body.to_owned().into(),
+            now.to_owned().into(),
+            user_id.into(),
+        ])?
+        .run()
+        .await
+        .map_err(|e| Self::map_d1_json_error(&e))
+        .map(|_| ())
+    }
+
+    pub async fn list_soft_deleted_user_ids_before(
+        db: &D1Database,
+        cutoff_exclusive: &str,
+    ) -> Result<HashSet<String>, AppError> {
+        let rows: Vec<AffectedUserRow> = query!(
+            db,
+            "SELECT DISTINCT user_id FROM ciphers WHERE deleted_at IS NOT \
+             NULL AND deleted_at < ?1 AND user_id IS NOT NULL",
+            cutoff_exclusive
+        )
+        .map_err(|e| {
+            AppError::Database(DatabaseError::QueryFailed(format!(
+                "Failed to prepare affected users query: {e}"
+            )))
+        })?
+        .all()
+        .await
+        .map_err(|e| {
+            AppError::Database(DatabaseError::QueryFailed(format!(
+                "Failed to fetch affected users: {e}"
+            )))
+        })?
+        .results()
+        .map_err(|e| {
+            AppError::Database(DatabaseError::QueryFailed(format!(
+                "Failed to parse affected users: {e}"
+            )))
+        })?;
+
+        Ok(rows.into_iter().filter_map(|row| row.user_id).collect())
+    }
+
+    pub async fn count_soft_deleted_before(
+        db: &D1Database,
+        cutoff_exclusive: &str,
+    ) -> Result<u32, AppError> {
+        let count_row = query!(
+            db,
+            "SELECT COUNT(*) as count FROM ciphers WHERE deleted_at IS NOT \
+             NULL AND deleted_at < ?1",
+            cutoff_exclusive
+        )
+        .map_err(|e| {
+            AppError::Database(DatabaseError::QueryFailed(format!(
+                "Failed to prepare soft-delete count query: {e}"
+            )))
+        })?
+        .first::<CountRow>(None)
+        .await
+        .map_err(|e| {
+            AppError::Database(DatabaseError::QueryFailed(format!(
+                "Failed to count soft-deleted ciphers: {e}"
+            )))
+        })?;
+
+        Ok(count_row.map_or(0, |row| row.count))
+    }
+
+    pub async fn delete_soft_deleted_before(
+        db: &D1Database,
+        cutoff_exclusive: &str,
+    ) -> Result<(), AppError> {
+        DB::run_query(
+            async {
+                query!(
+                    db,
+                    "DELETE FROM ciphers WHERE deleted_at IS NOT NULL AND \
+                     deleted_at < ?1",
+                    cutoff_exclusive
+                )?
+                .run()
+                .await
+                .map(|_| ())
+            },
+            "Failed to purge soft-deleted ciphers",
+        )
+        .await
+    }
+
+    pub async fn purge_user_ciphers(
+        db: &D1Database,
+        user_id: &str,
+    ) -> Result<(), AppError> {
+        DB::run_query(
+            async {
+                query!(db, "DELETE FROM ciphers WHERE user_id = ?1", user_id)?
+                    .run()
+                    .await
+                    .map(|_| ())
+            },
+            "Failed to purge ciphers",
+        )
+        .await
+    }
+
+    pub async fn fetch_for_user(
+        db: &D1Database,
+        cipher_id: &str,
+        user_id: &str,
+    ) -> Result<Self, AppError> {
+        db.prepare("SELECT * FROM ciphers WHERE id = ?1 AND user_id = ?2")
+            .bind(&[cipher_id.to_string().into(), user_id.to_string().into()])
+            .map_err(|e| {
+                log::error!("Failed to bind fetch cipher query: {e}");
+                AppError::Database(DatabaseError::QueryFailed(
+                    "Failed to fetch cipher".to_string(),
+                ))
+            })?
+            .first(None)
+            .await
+            .map_err(|e| {
+                log::error!("Failed to execute fetch cipher query: {e}");
+                AppError::Database(DatabaseError::QueryFailed(
+                    "Failed to fetch cipher".to_string(),
+                ))
+            })?
+            .ok_or_else(|| AppError::not_found("Cipher not found"))
+    }
+
     pub async fn ensure_cipher_for_user(
         db: &D1Database,
         cipher_id: &str,
         user_id: &str,
-    ) -> Result<CipherDBModel, AppError> {
-        let cipher: Option<CipherDBModel> = db
+    ) -> Result<Self, AppError> {
+        let cipher: Option<Self> = db
             .prepare("SELECT * FROM ciphers WHERE id = ?1 AND user_id = ?2")
             .bind(&[cipher_id.into(), user_id.into()])?
             .first(None)

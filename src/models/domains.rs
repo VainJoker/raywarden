@@ -1,9 +1,101 @@
 use log::warn;
 use serde::Deserialize;
 use serde_json::Value;
+use worker::{
+    D1Database,
+    query,
+};
+
+use crate::{
+    errors::{
+        AppError,
+        AuthError,
+        DatabaseError,
+    },
+    infra::DB,
+};
+
+#[derive(Debug)]
+pub struct DomainsDB {
+    pub equivalent_domains: String,
+    pub excluded_globals:   String,
+}
+
+impl DomainsDB {
+    pub async fn fetch_by_user_id(
+        db: &D1Database,
+        user_id: &str,
+    ) -> Result<Self, AppError> {
+        let row: Option<Value> = db
+            .prepare(
+                "SELECT equivalent_domains, excluded_globals FROM users WHERE \
+                 id = ?1",
+            )
+            .bind(&[user_id.into()])
+            .map_err(|e| {
+                warn!("query user domains failed: {e}");
+                AppError::Database(DatabaseError::QueryFailed(
+                    "Failed to query user domains".to_string(),
+                ))
+            })?
+            .first(None)
+            .await
+            .map_err(|e| {
+                warn!("query user domains failed: {e}");
+                AppError::Database(DatabaseError::QueryFailed(
+                    "Failed to query user domains".to_string(),
+                ))
+            })?;
+
+        let row = row.ok_or_else(|| AppError::Auth(AuthError::UserNotFound))?;
+
+        let equivalent_domains = row
+            .get("equivalent_domains")
+            .and_then(|v| v.as_str())
+            .unwrap_or("[]")
+            .to_string();
+        let excluded_globals = row
+            .get("excluded_globals")
+            .and_then(|v| v.as_str())
+            .unwrap_or("[]")
+            .to_string();
+
+        Ok(Self {
+            equivalent_domains,
+            excluded_globals,
+        })
+    }
+
+    pub async fn update_for_user(
+        db: &D1Database,
+        user_id: &str,
+        equivalent_domains_json: &str,
+        excluded_globals_json: &str,
+        updated_at: &str,
+    ) -> Result<(), AppError> {
+        DB::run_query(
+            async {
+                query!(
+                    db,
+                    "UPDATE users SET equivalent_domains = ?1, \
+                     excluded_globals = ?2, updated_at = ?3 WHERE id = ?4",
+                    equivalent_domains_json,
+                    excluded_globals_json,
+                    updated_at,
+                    user_id
+                )?
+                .run()
+                .await
+                .map(|_| ())
+            },
+            "Failed to update domains",
+        )
+        .await
+    }
+}
 
 async fn run_once(
-    db: &worker::D1Database,
+    db: &D1Database,
     sql: &str,
     excluded: &str,
 ) -> Result<String, ()> {
