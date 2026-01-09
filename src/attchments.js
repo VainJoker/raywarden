@@ -11,66 +11,122 @@
 
 const JWT_EXPECTED_ALG = "HS256";
 const JWT_VALIDATION_LEEWAY_SECS = 60;
-// JWT validation using Web Crypto API (no external dependencies)
-async function verifyJwt(token, secret) {
-  const encoder = new TextEncoder();
-  const parts = token.split(".");
-  if (parts.length !== 3) {
-    throw new Error("Invalid token format");
+const SIZE_LEEWAY_BYTES = 1024 * 1024; // 1 MiB
+
+const TEXT_ENCODER = new TextEncoder();
+const TEXT_DECODER = new TextDecoder();
+
+class HttpError extends Error {
+  constructor(status, message) {
+    super(message);
+    this.name = "HttpError";
+    this.status = status;
+  }
+}
+
+function jsonError(status, message) {
+  return new Response(JSON.stringify({ error: message }), {
+    status,
+    headers: { "Content-Type": "application/json" },
+  });
+}
+
+function requireBucket(env) {
+  const bucket = env.ATTACHMENTS_BUCKET;
+  if (!bucket) {
+    throw new HttpError(400, "Attachments are not enabled");
+  }
+  return bucket;
+}
+
+function requireDatabase(env) {
+  const db = getDatabase(env);
+  if (!db) {
+    throw new HttpError(500, "Database not available");
+  }
+  return db;
+}
+
+// Cache CryptoKey derived from JWT_SECRET across requests.
+// Cloudflare Workers keep module scope warm between requests, so this saves
+// importKey cost on hot paths.
+let JWT_KEY_CACHE = {
+  secret: null,
+  keyPromise: null,
+};
+
+async function getJwtHmacKey(secret) {
+  if (!secret) {
+    throw new HttpError(500, "JWT_SECRET not configured");
   }
 
-  const [headerB64, payloadB64, signatureB64] = parts;
-
-  let header;
-  try {
-    header = JSON.parse(new TextDecoder().decode(base64UrlDecode(headerB64)));
-  } catch {
-    throw new Error("Invalid token header");
+  if (JWT_KEY_CACHE.secret === secret && JWT_KEY_CACHE.keyPromise) {
+    return JWT_KEY_CACHE.keyPromise;
   }
 
-  if (!header || typeof header !== "object" || header.alg !== JWT_EXPECTED_ALG) {
-    throw new Error("Invalid token algorithm");
-  }
-
-  // Import the secret key for HMAC-SHA256
-  const key = await crypto.subtle.importKey(
+  const keyPromise = crypto.subtle.importKey(
     "raw",
-    encoder.encode(secret),
+    TEXT_ENCODER.encode(secret),
     { name: "HMAC", hash: "SHA-256" },
     false,
     ["verify"]
   );
 
+  JWT_KEY_CACHE = { secret, keyPromise };
+  return keyPromise;
+}
+
+function decodeJsonFromB64Url(b64Url) {
+  try {
+    return JSON.parse(TEXT_DECODER.decode(base64UrlDecode(b64Url)));
+  } catch {
+    throw new HttpError(401, "Invalid token");
+  }
+}
+
+// JWT validation using Web Crypto API (no external dependencies)
+async function verifyJwt(token, key) {
+  const parts = token.split(".");
+  if (parts.length !== 3) {
+    throw new HttpError(401, "Invalid token");
+  }
+
+  const [headerB64, payloadB64, signatureB64] = parts;
+
+  const header = decodeJsonFromB64Url(headerB64);
+
+  if (!header || typeof header !== "object" || header.alg !== JWT_EXPECTED_ALG) {
+    throw new HttpError(401, "Invalid token");
+  }
+
   // Decode the signature (base64url to Uint8Array)
   const signature = base64UrlDecode(signatureB64);
 
   // Verify the signature
-  const data = encoder.encode(`${headerB64}.${payloadB64}`);
+  const data = TEXT_ENCODER.encode(`${headerB64}.${payloadB64}`);
   const valid = await crypto.subtle.verify("HMAC", key, signature, data);
 
   if (!valid) {
-    throw new Error("Invalid token signature");
+    throw new HttpError(401, "Invalid token");
   }
 
-  // Decode and parse the payload
-  let payload;
-  try {
-    payload = JSON.parse(new TextDecoder().decode(base64UrlDecode(payloadB64)));
-  } catch {
-    throw new Error("Invalid token payload");
-  }
+  const payload = decodeJsonFromB64Url(payloadB64);
 
   if (!payload || typeof payload !== "object") {
-    throw new Error("Invalid token payload");
+    throw new HttpError(401, "Invalid token");
   }
   
   if (typeof payload.exp !== "number") {
-    throw new Error("Invalid token exp");
+    throw new HttpError(401, "Invalid token");
   }
   
   const now = Math.floor(Date.now() / 1000);
   if (payload.exp < now - JWT_VALIDATION_LEEWAY_SECS) {
-    throw new Error("Token expired");
+    throw new HttpError(401, "Token expired");
+  }
+
+  if (!payload.sub || typeof payload.sub !== "string") {
+    throw new HttpError(401, "Invalid token");
   }
 
   return payload;
@@ -94,6 +150,17 @@ export function base64UrlDecode(str) {
 // Generate ISO timestamp string
 function nowString() {
   return new Date().toISOString();
+}
+
+// Resolve the D1 binding regardless of naming style
+function getDatabase(env) {
+  return (
+    env["warden-db"] ||
+    env.warden_db ||
+    env.WARDEN_DB ||
+    env.DB ||
+    env.vault1
+  );
 }
 
 // Helper to get env var with fallback
@@ -178,291 +245,325 @@ async function enforceLimits(db, env, userId, newSize, excludeAttachmentId) {
   }
 }
 
-// Handle azure-upload with zero-copy streaming
-export async function handleAzureUpload(request, env, cipherId, attachmentId, token) {
-  // Get R2 bucket
-  const bucket = env.ATTACHMENTS_BUCKET;
-  if (!bucket) {
-    return new Response(JSON.stringify({ error: "Attachments are not enabled" }), {
-      status: 400,
-      headers: { "Content-Type": "application/json" },
-    });
-  }
-
-  // Get D1 database
-  const db = env.vault1;
-  if (!db) {
-    return new Response(JSON.stringify({ error: "Database not available" }), {
-      status: 500,
-      headers: { "Content-Type": "application/json" },
-    });
-  }
-
-  // Validate JWT token
-  let claims;
-  try {
-    const secret = env.JWT_SECRET?.toString?.() || env.JWT_SECRET;
-    if (!secret) {
-      throw new Error("JWT_SECRET not configured");
-    }
-    claims = await verifyJwt(token, secret);
-  } catch (err) {
-    return new Response(JSON.stringify({ error: `Invalid token: ${err.message}` }), {
-      status: 401,
-      headers: { "Content-Type": "application/json" },
-    });
-  }
-
-  // Validate token claims match the request
-  if (claims.cipher_id !== cipherId || claims.attachment_id !== attachmentId) {
-    return new Response(JSON.stringify({ error: "Invalid download token" }), {
-      status: 401,
-      headers: { "Content-Type": "application/json" },
-    });
-  }
-
-  const userId = claims.sub;
-
-  // Verify cipher belongs to user and is not deleted
-  const cipher = await db
-    .prepare("SELECT * FROM ciphers WHERE id = ?1 AND user_id = ?2")
-    .bind(cipherId, userId)
-    .first();
-
-  if (!cipher) {
-    return new Response(JSON.stringify({ error: "Cipher not found" }), {
-      status: 404,
-      headers: { "Content-Type": "application/json" },
-    });
-  }
-
-  if (cipher.organization_id) {
-    return new Response(JSON.stringify({ error: "Organization attachments are not supported" }), {
-      status: 400,
-      headers: { "Content-Type": "application/json" },
-    });
-  }
-
-  if (cipher.deleted_at) {
-    return new Response(
-      JSON.stringify({ error: "Cannot modify attachments for deleted cipher" }),
-      { status: 400, headers: { "Content-Type": "application/json" } }
+function validateSizeWithinDeclared(declaredSize, actualSize) {
+  const maxSize = declaredSize + SIZE_LEEWAY_BYTES;
+  const minSize = Math.max(0, declaredSize - SIZE_LEEWAY_BYTES);
+  if (actualSize < minSize || actualSize > maxSize) {
+    throw new Error(
+      `Attachment size mismatch (expected within [${minSize}, ${maxSize}], got ${actualSize})`
     );
   }
+}
 
-  // Fetch pending attachment record
-  const pending = await db
-    .prepare("SELECT * FROM attachments_pending WHERE id = ?1")
+function validateTokenClaimsMatch(claims, cipherId, attachmentId) {
+  if (claims.cipher_id !== cipherId || claims.attachment_id !== attachmentId) {
+    throw new HttpError(401, "Invalid token");
+  }
+}
+
+async function getUserCipher(db, cipherId, userId) {
+  return await db
+    .prepare(
+      "SELECT id, user_id, organization_id, deleted_at FROM ciphers WHERE id = ?1 AND user_id = ?2"
+    )
+    .bind(cipherId, userId)
+    .first();
+}
+
+async function getPendingAttachment(db, attachmentId) {
+  return await db
+    .prepare(
+      "SELECT id, cipher_id, file_name, file_size, akey, created_at, organization_id FROM attachments_pending WHERE id = ?1"
+    )
     .bind(attachmentId)
     .first();
+}
 
-  if (!pending) {
-    return new Response(JSON.stringify({ error: "Attachment not found or already uploaded" }), {
-      status: 404,
-      headers: { "Content-Type": "application/json" },
-    });
+async function getAttachmentRow(db, attachmentId) {
+  return await db
+    .prepare("SELECT id, cipher_id FROM attachments WHERE id = ?1")
+    .bind(attachmentId)
+    .first();
+}
+
+function parseSingleRange(rangeHeader, size) {
+  if (!rangeHeader) return null;
+  const value = rangeHeader.trim();
+  if (!value.startsWith("bytes=")) return null;
+
+  const spec = value.slice("bytes=".length);
+  // Multiple ranges not supported.
+  if (spec.includes(",")) {
+    throw new HttpError(416, "Invalid Range");
   }
 
-  if (pending.cipher_id !== cipherId) {
-    return new Response(JSON.stringify({ error: "Attachment does not belong to cipher" }), {
-      status: 400,
-      headers: { "Content-Type": "application/json" },
-    });
+  const [startStr, endStr] = spec.split("-");
+  if (startStr === "" && endStr === "") {
+    throw new HttpError(416, "Invalid Range");
   }
 
-  // Get Content-Length from request headers
-  const contentLengthHeader = request.headers.get("Content-Length");
-  if (!contentLengthHeader) {
-    return new Response(JSON.stringify({ error: "Missing Content-Length header" }), {
-      status: 400,
-      headers: { "Content-Type": "application/json" },
-    });
+  let start;
+  let end;
+
+  // Suffix range: bytes=-N
+  if (startStr === "") {
+    const suffixLength = parseInt(endStr, 10);
+    if (!Number.isFinite(suffixLength) || suffixLength <= 0) {
+      throw new HttpError(416, "Invalid Range");
+    }
+    if (suffixLength >= size) {
+      start = 0;
+    } else {
+      start = size - suffixLength;
+    }
+    end = size - 1;
+  } else {
+    start = parseInt(startStr, 10);
+    if (!Number.isFinite(start) || start < 0) {
+      throw new HttpError(416, "Invalid Range");
+    }
+
+    if (endStr === "") {
+      end = size - 1;
+    } else {
+      end = parseInt(endStr, 10);
+      if (!Number.isFinite(end) || end < 0) {
+        throw new HttpError(416, "Invalid Range");
+      }
+    }
   }
 
-  const contentLength = parseInt(contentLengthHeader, 10);
-  if (isNaN(contentLength) || contentLength <= 0) {
-    return new Response(JSON.stringify({ error: "Invalid Content-Length header" }), {
-      status: 400,
-      headers: { "Content-Type": "application/json" },
-    });
+  if (start >= size) {
+    throw new HttpError(416, "Range Not Satisfiable");
   }
+
+  if (end >= size) {
+    end = size - 1;
+  }
+
+  if (end < start) {
+    throw new HttpError(416, "Invalid Range");
+  }
+
+  return { start, end };
+}
+
+// Handle azure-upload with zero-copy streaming
+export async function handleAzureUpload(request, env, cipherId, attachmentId, token) {
+  try {
+    const bucket = requireBucket(env);
+    const db = requireDatabase(env);
+
+    const secret = env.JWT_SECRET?.toString?.() || env.JWT_SECRET;
+    const key = await getJwtHmacKey(secret);
+    const claims = await verifyJwt(token, key);
+    validateTokenClaimsMatch(claims, cipherId, attachmentId);
+
+    const userId = claims.sub;
+
+    const cipher = await getUserCipher(db, cipherId, userId);
+    if (!cipher) {
+      return jsonError(404, "Cipher not found");
+    }
+
+    if (cipher.organization_id) {
+      return jsonError(400, "Organization attachments are not supported");
+    }
+
+    if (cipher.deleted_at) {
+      return jsonError(400, "Cannot modify attachments for deleted cipher");
+    }
+
+    const pending = await getPendingAttachment(db, attachmentId);
+    if (!pending) {
+      return jsonError(404, "Attachment not found or already uploaded");
+    }
+
+    if (pending.cipher_id !== cipherId) {
+      return jsonError(400, "Attachment does not belong to cipher");
+    }
+
+  // Content-Length is not always present for browser uploads; treat it as
+  // optional and validate against declared size after upload.
+    const contentLengthHeader = request.headers.get("Content-Length");
+    const contentLength = contentLengthHeader
+      ? parseInt(contentLengthHeader, 10)
+      : null;
+    if (contentLengthHeader && (isNaN(contentLength) || contentLength <= 0)) {
+      return jsonError(400, "Invalid Content-Length header");
+    }
 
   // Enforce limits before upload
-  try {
-    await enforceLimits(db, env, userId, contentLength, attachmentId);
-  } catch (err) {
-    return new Response(JSON.stringify({ error: err.message }), {
-      status: 400,
-      headers: { "Content-Type": "application/json" },
-    });
-  }
+    try {
+      const declaredOrHeaderSize = contentLength ?? pending.file_size;
+      await enforceLimits(db, env, userId, declaredOrHeaderSize, attachmentId);
+    } catch (err) {
+      return jsonError(400, err?.message || "Invalid request");
+    }
 
   // Build R2 key
-  const r2Key = `${cipherId}/${attachmentId}`;
+    const r2Key = `${cipherId}/${attachmentId}`;
 
   // Prepare R2 put options
-  const putOptions = {};
-  const contentType = request.headers.get("Content-Type");
-  if (contentType) {
-    putOptions.httpMetadata = { contentType };
-  }
+    const putOptions = {};
+    const contentType = request.headers.get("Content-Type");
+    if (contentType) {
+      putOptions.httpMetadata = { contentType };
+    }
 
   // Upload to R2 directly using request.body (zero-copy streaming)
-  let r2Object;
-  try {
-    r2Object = await bucket.put(r2Key, request.body, putOptions);
-  } catch (err) {
-    // Try to clean up on failure
+    let r2Object;
     try {
-      await bucket.delete(r2Key);
+      r2Object = await bucket.put(r2Key, request.body, putOptions);
     } catch {
-      // Ignore cleanup errors
+      try {
+        await bucket.delete(r2Key);
+      } catch {
+        // Ignore cleanup errors
+      }
+      return jsonError(500, "Upload failed");
     }
-    return new Response(JSON.stringify({ error: `Upload failed: ${err.message}` }), {
-      status: 500,
-      headers: { "Content-Type": "application/json" },
-    });
-  }
 
-  const uploadedSize = r2Object.size;
+    const uploadedSize = r2Object.size;
 
-  // Verify uploaded size matches Content-Length
-  if (uploadedSize !== contentLength) {
+  // If Content-Length was provided, ensure it matches. Always validate within
+  // declared size leeway (matches Rust behavior).
     try {
-      await bucket.delete(r2Key);
-    } catch {
-      // Ignore cleanup errors
+      if (contentLength !== null && uploadedSize !== contentLength) {
+        throw new Error("Content-Length does not match uploaded size");
+      }
+      validateSizeWithinDeclared(pending.file_size, uploadedSize);
+    } catch (err) {
+      try {
+        await bucket.delete(r2Key);
+      } catch {
+        // Ignore cleanup errors
+      }
+      return jsonError(400, err?.message || "Invalid request");
     }
-    return new Response(JSON.stringify({ error: "Content-Length does not match uploaded size" }), {
-      status: 400,
-      headers: { "Content-Type": "application/json" },
-    });
-  }
 
   // Finalize upload: move pending -> attachments and touch revision timestamps
-  const now = nowString();
-  await db.batch([
-    db
-      .prepare(
-        "INSERT INTO attachments (id, cipher_id, file_name, file_size, akey, created_at, updated_at, organization_id) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)"
-      )
-      .bind(
-        attachmentId,
-        cipherId,
-        pending.file_name,
-        uploadedSize,
-        pending.akey,
-        pending.created_at || now,
-        now,
-        pending.organization_id || null
-      ),
-    db.prepare("DELETE FROM attachments_pending WHERE id = ?1").bind(attachmentId),
-    db.prepare("UPDATE ciphers SET updated_at = ?1 WHERE id = ?2").bind(now, cipherId),
-    db.prepare("UPDATE users SET updated_at = ?1 WHERE id = ?2").bind(now, userId),
-  ]);
+    const now = nowString();
+    try {
+      await db.batch([
+        db
+          .prepare(
+            "INSERT INTO attachments (id, cipher_id, file_name, file_size, akey, created_at, updated_at, organization_id) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)"
+          )
+          .bind(
+            attachmentId,
+            cipherId,
+            pending.file_name,
+            uploadedSize,
+            pending.akey,
+            pending.created_at || now,
+            now,
+            pending.organization_id || null
+          ),
+        db.prepare("DELETE FROM attachments_pending WHERE id = ?1").bind(attachmentId),
+        db
+          .prepare("UPDATE ciphers SET updated_at = ?1 WHERE id = ?2")
+          .bind(now, cipherId),
+        db.prepare("UPDATE users SET updated_at = ?1 WHERE id = ?2").bind(now, userId),
+      ]);
+    } catch {
+      try {
+        await bucket.delete(r2Key);
+      } catch {
+        // Ignore cleanup errors
+      }
+      return jsonError(500, "Finalize failed");
+    }
 
-  return new Response(null, { status: 201 });
+    return new Response(null, { status: 201 });
+  } catch (err) {
+    if (err instanceof HttpError) {
+      return jsonError(err.status, err.message);
+    }
+    return jsonError(500, "Internal error");
+  }
 }
 
 // Handle download with zero-copy streaming
 export async function handleDownload(request, env, cipherId, attachmentId, token) {
-  // Get R2 bucket
-  const bucket = env.ATTACHMENTS_BUCKET;
-  if (!bucket) {
-    return new Response(JSON.stringify({ error: "Attachments are not enabled" }), {
-      status: 400,
-      headers: { "Content-Type": "application/json" },
-    });
-  }
-
-  // Get D1 database
-  const db = env.vault1;
-  if (!db) {
-    return new Response(JSON.stringify({ error: "Database not available" }), {
-      status: 500,
-      headers: { "Content-Type": "application/json" },
-    });
-  }
-
-  // Validate JWT token
-  let claims;
   try {
+    const bucket = requireBucket(env);
+    const db = requireDatabase(env);
+
     const secret = env.JWT_SECRET?.toString?.() || env.JWT_SECRET;
-    if (!secret) {
-      throw new Error("JWT_SECRET not configured");
+    const key = await getJwtHmacKey(secret);
+    const claims = await verifyJwt(token, key);
+    validateTokenClaimsMatch(claims, cipherId, attachmentId);
+
+    const userId = claims.sub;
+
+    const cipher = await getUserCipher(db, cipherId, userId);
+    if (!cipher) {
+      return jsonError(404, "Cipher not found");
     }
-    claims = await verifyJwt(token, secret);
+
+    const attachment = await getAttachmentRow(db, attachmentId);
+    if (!attachment) {
+      return jsonError(404, "Attachment not found");
+    }
+
+    if (attachment.cipher_id !== cipherId) {
+      return jsonError(400, "Attachment does not belong to cipher");
+    }
+
+    const r2Key = `${cipherId}/${attachmentId}`;
+
+    // Fetch metadata first (needed for range handling and headers).
+    const headObject = await bucket.head(r2Key);
+    if (!headObject) {
+      return jsonError(404, "Attachment not found in storage");
+    }
+
+    const size = headObject.size;
+    const contentType = headObject.httpMetadata?.contentType || "application/octet-stream";
+
+    const headers = new Headers();
+    headers.set("Content-Type", contentType);
+    headers.set("Accept-Ranges", "bytes");
+
+    const rangeHeader = request.headers.get("Range");
+    let range;
+    try {
+      range = parseSingleRange(rangeHeader, size);
+    } catch (err) {
+      if (err instanceof HttpError && err.status === 416) {
+        headers.set("Content-Range", `bytes */${size}`);
+        return new Response(null, { status: 416, headers });
+      }
+      throw err;
+    }
+
+    if (!range) {
+      const r2Object = await bucket.get(r2Key);
+      if (!r2Object) {
+        return jsonError(404, "Attachment not found in storage");
+      }
+      headers.set("Content-Length", size.toString());
+      return new Response(r2Object.body, { status: 200, headers });
+    }
+
+    const { start, end } = range;
+    const length = end - start + 1;
+    const r2Object = await bucket.get(r2Key, {
+      range: { offset: start, length },
+    });
+
+    if (!r2Object) {
+      return jsonError(404, "Attachment not found in storage");
+    }
+
+    headers.set("Content-Range", `bytes ${start}-${end}/${size}`);
+    headers.set("Content-Length", length.toString());
+    return new Response(r2Object.body, { status: 206, headers });
   } catch (err) {
-    return new Response(JSON.stringify({ error: `Invalid token: ${err.message}` }), {
-      status: 401,
-      headers: { "Content-Type": "application/json" },
-    });
+    if (err instanceof HttpError) {
+      return jsonError(err.status, err.message);
+    }
+    return jsonError(500, "Internal error");
   }
-
-  // Validate token claims match the request
-  if (claims.cipher_id !== cipherId || claims.attachment_id !== attachmentId) {
-    return new Response(JSON.stringify({ error: "Invalid download token" }), {
-      status: 401,
-      headers: { "Content-Type": "application/json" },
-    });
-  }
-
-  const userId = claims.sub;
-
-  // Verify cipher belongs to user
-  const cipher = await db
-    .prepare("SELECT * FROM ciphers WHERE id = ?1 AND user_id = ?2")
-    .bind(cipherId, userId)
-    .first();
-
-  if (!cipher) {
-    return new Response(JSON.stringify({ error: "Cipher not found" }), {
-      status: 404,
-      headers: { "Content-Type": "application/json" },
-    });
-  }
-
-  // Fetch attachment record
-  const attachment = await db
-    .prepare("SELECT * FROM attachments WHERE id = ?1")
-    .bind(attachmentId)
-    .first();
-
-  if (!attachment) {
-    return new Response(JSON.stringify({ error: "Attachment not found" }), {
-      status: 404,
-      headers: { "Content-Type": "application/json" },
-    });
-  }
-
-  if (attachment.cipher_id !== cipherId) {
-    return new Response(JSON.stringify({ error: "Attachment does not belong to cipher" }), {
-      status: 400,
-      headers: { "Content-Type": "application/json" },
-    });
-  }
-
-  // Build R2 key
-  const r2Key = `${cipherId}/${attachmentId}`;
-
-  // Get object from R2
-  const r2Object = await bucket.get(r2Key);
-  if (!r2Object) {
-    return new Response(JSON.stringify({ error: "Attachment not found in storage" }), {
-      status: 404,
-      headers: { "Content-Type": "application/json" },
-    });
-  }
-
-  // Build response headers
-  const headers = new Headers();
-  const contentType = r2Object.httpMetadata?.contentType || "application/octet-stream";
-  headers.set("Content-Type", contentType);
-  headers.set("Content-Length", r2Object.size.toString());
-
-  // Return response with R2 object body directly - zero-copy streaming
-  return new Response(r2Object.body, {
-    status: 200,
-    headers,
-  });
 }

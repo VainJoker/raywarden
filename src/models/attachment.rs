@@ -262,11 +262,7 @@ impl AttachmentDB {
                     "Failed to fetch attachment".to_string(),
                 ))
             })?
-            .ok_or_else(|| {
-                AppError::Database(DatabaseError::QueryFailed(
-                    "Attachment not found".to_string(),
-                ))
-            })
+            .ok_or_else(|| AppError::not_found("Attachment"))
     }
 
     pub async fn fetch_pending_attachment(
@@ -283,11 +279,7 @@ impl AttachmentDB {
                     "Failed to fetch pending attachment".to_string(),
                 ))
             })?
-            .ok_or_else(|| {
-                AppError::Database(DatabaseError::QueryFailed(
-                    "Pending attachment not found".to_string(),
-                ))
-            })
+            .ok_or_else(|| AppError::not_found("Pending attachment"))
     }
 
     pub async fn load_attachment_map_json(
