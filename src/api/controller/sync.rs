@@ -1,9 +1,9 @@
 use axum::{
-    Json,
     extract::{
         Query,
         State,
     },
+    http::HeaderMap,
 };
 use serde::Deserialize;
 use serde_json::{
@@ -14,11 +14,16 @@ use serde_json::{
 use crate::{
     api::{
         AppState,
+        RawJson,
         service::claims::Claims,
     },
     errors::{
         AppError,
         AuthError,
+    },
+    infra::admin_notify::{
+        self,
+        Event,
     },
     models::{
         attachment::AttachmentDB,
@@ -32,6 +37,7 @@ use crate::{
         twofactor::TwoFactorDB,
         user::UserDB,
     },
+    send,
 };
 
 #[derive(Debug, Deserialize)]
@@ -46,10 +52,18 @@ pub struct SyncQuery {
 pub async fn get_sync_data(
     claims: Claims,
     State(state): State<AppState>,
+    headers: HeaderMap,
     Query(query): Query<SyncQuery>,
-) -> Result<Json<Value>, AppError> {
-    let user_id = claims.sub;
+) -> Result<RawJson, AppError> {
+    let user_id = claims.sub.clone();
     let db = state.get_db();
+    let show_ssh_keys = headers
+        .get("bitwarden-client-version")
+        .and_then(|value| value.to_str().ok())
+        .and_then(crate::api::service::auth::parse_client_version)
+        .is_some_and(|(version, prerelease)| {
+            !prerelease && version >= (2024, 12, 0)
+        });
 
     // Fetch profile
     let user = UserDB::fetch_by_id_with(
@@ -60,9 +74,17 @@ pub async fn get_sync_data(
     )
     .await?;
 
+    let source_snapshot =
+        crate::models::account_keys::AccountSnapshot::from_user(&user);
+    let source_revision = user.updated_at.clone();
     let two_factor_enabled =
         TwoFactorDB::two_factor_enabled(&db, &user_id).await?;
 
+    let user_key_id = user.user_key_id.clone();
+    let v2_upgrade_token = user
+        .v2_upgrade_token
+        .as_deref()
+        .and_then(|raw| serde_json::from_str::<Value>(raw).ok());
     let has_master_password = !user.master_password_hash.is_empty();
     let equivalent_domains = user.equivalent_domains.clone();
     let excluded_globals = user.excluded_globals.clone();
@@ -81,7 +103,8 @@ pub async fn get_sync_data(
             // https://github.com/bitwarden/android/blob/release/2025.12-rc41/network/src/main/kotlin/com/bitwarden/network/model/MasterPasswordUnlockDataJson.kt#L22-L26
             "masterKeyEncryptedUserKey": user.key,
             "masterKeyWrappedUserKey": user.key,
-            "salt": user.email
+            "salt": user.email,
+            "containedKeyId": user.user_key_id
         })
     } else {
         Value::Null
@@ -99,9 +122,10 @@ pub async fn get_sync_data(
     let ciphers_json = CipherDB::fetch_cipher_json_array_raw(
         &db,
         include_attachments,
-        "WHERE c.user_id = ?1",
-        &[user_id.clone().into()],
+        "WHERE c.user_id = ?1 AND (?2 = 1 OR c.type != 5)",
+        &[user_id.clone().into(), i32::from(show_ssh_keys).into()],
         "",
+        state.get_domain(),
     )
     .await?;
 
@@ -122,16 +146,19 @@ pub async fn get_sync_data(
 
     // Build response JSON via string concatenation (ciphers already raw JSON)
     let user_decryption_json = serde_json::to_string(&json!({
-        "masterPasswordUnlock": master_password_unlock
+        "masterPasswordUnlock": master_password_unlock, "userKeyId": user_key_id, "v2UpgradeToken": v2_upgrade_token
     }))
     .map_err(|err| {
         log::error!("Failed to serialize user decryption data: {err}");
         AppError::Internal
     })?;
 
+    let sends_json =
+        serde_json::to_string(&send::list_json(&db, &user_id).await?)
+            .map_err(|_| AppError::Internal)?;
     let response = if query.exclude_domains {
         format!(
-            r#"{{"profile":{profile_json},"folders":{folders_json},"collections":[],"policies":[],"ciphers":{ciphers_json},"sends":[],"userDecryption":{user_decryption_json},"object":"sync"}}"#
+            r#"{{"profile":{profile_json},"folders":{folders_json},"collections":[],"policies":[],"ciphers":{ciphers_json},"domains":null,"sends":{sends_json},"userDecryption":{user_decryption_json},"object":"sync"}}"#
         )
     } else {
         // Match vaultwarden sync semantics:
@@ -148,14 +175,26 @@ pub async fn get_sync_data(
             r#"{{"equivalentDomains":{equivalent_domains},"globalEquivalentDomains":{global_equivalent_domains},"object":"domains"}}"#
         );
         format!(
-            r#"{{"profile":{profile_json},"folders":{folders_json},"collections":[],"policies":[],"ciphers":{ciphers_json},"domains":{domains_json},"sends":[],"userDecryption":{user_decryption_json},"object":"sync"}}"#
+            r#"{{"profile":{profile_json},"folders":{folders_json},"collections":[],"policies":[],"ciphers":{ciphers_json},"domains":{domains_json},"sends":{sends_json},"userDecryption":{user_decryption_json},"object":"sync"}}"#
         )
     };
 
-    Ok(Json(json!(
-        serde_json::from_str::<Value>(&response).map_err(|err| {
-            log::error!("Failed to parse sync response JSON: {err}");
-            AppError::Internal
-        })?
-    )))
+    let current = UserDB::fetch_by_id_with(
+        &db,
+        &user_id,
+        "Failed to verify sync snapshot",
+        || AppError::Auth(AuthError::UserNotFound),
+    )
+    .await?;
+    if source_snapshot !=
+        crate::models::account_keys::AccountSnapshot::from_user(&current) ||
+        source_revision != current.updated_at
+    {
+        return Err(AppError::conflict(
+            "Account or vault changed during sync. Retry sync.",
+        ));
+    }
+    claims.validate_session(&db, "access").await?;
+    admin_notify::emit(&state.env, Event::Sync, &claims.sub).await;
+    Ok(RawJson(response))
 }

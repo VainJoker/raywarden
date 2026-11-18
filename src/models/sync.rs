@@ -1,4 +1,3 @@
-use chrono::SecondsFormat;
 use serde::Serialize;
 use serde_json::Value;
 
@@ -26,6 +25,8 @@ pub struct Profile {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub master_password_hint: Option<String>,
     pub security_stamp: String,
+    pub user_key_id: Option<String>,
+    pub account_keys: Value,
     pub object: String,
     pub premium_from_organization: bool,
     pub force_password_reset: bool,
@@ -48,12 +49,14 @@ pub struct Profile {
 
 impl Profile {
     pub fn from_user(user: UserDB, two_factor_enabled: bool) -> Self {
-        let creation_date =
-            chrono::DateTime::parse_from_rfc3339(&user.created_at)
-                .unwrap_or_default()
-                .to_rfc3339_opts(SecondsFormat::Micros, true);
+        let creation_date = crate::infra::time::format_micros(
+            crate::infra::time::parse(&user.created_at)
+                .unwrap_or(jiff::Timestamp::UNIX_EPOCH),
+        );
 
+        let account_keys = crate::models::account_keys::response(&user);
         Self {
+            account_keys,
             id: user.id,
             name: user.name,
             avatar_color: user.avatar_color,
@@ -64,10 +67,11 @@ impl Profile {
             kdf_parallelism: user.kdf_parallelism,
             master_password_hint: user.master_password_hint,
             security_stamp: user.security_stamp,
+            user_key_id: user.user_key_id,
             object: "profile".to_string(),
             premium_from_organization: false,
             force_password_reset: false,
-            email_verified: true,
+            email_verified: user.email_verified,
             two_factor_enabled,
             premium: true,
             uses_key_connector: false,

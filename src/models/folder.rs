@@ -15,7 +15,7 @@ use crate::{
         AppError,
         DatabaseError,
     },
-    infra::DB,
+    infra::db,
 };
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -58,32 +58,12 @@ impl FolderDB {
         db: &D1Database,
         user_id: &str,
     ) -> Result<Vec<Self>, AppError> {
-        db.prepare("SELECT * FROM folders WHERE user_id = ?1")
-            .bind(&[user_id.into()])
-            .map_err(|e| {
-                error!("Failed to bind query for listing folders: {e:?}");
-                AppError::Database(DatabaseError::QueryFailed(
-                    "Failed to bind query for listing folders".to_string(),
-                ))
-            })?
+        let result = db
+            .prepare("SELECT * FROM folders WHERE user_id = ?1")
+            .bind(&[user_id.into()])?
             .all()
-            .await
-            .map_err(|e| {
-                error!("Failed to execute query for listing folders: {e:?}");
-                AppError::Database(DatabaseError::QueryFailed(
-                    "Failed to execute query for listing folders".to_string(),
-                ))
-            })?
-            .results()
-            .map_err(|e| {
-                error!(
-                    "Failed to parse query results for listing folders: {e:?}"
-                );
-                AppError::Database(DatabaseError::QueryFailed(
-                    "Failed to parse query results for listing folders"
-                        .to_string(),
-                ))
-            })
+            .await?;
+        db::decode_results(&result)
     }
 
     pub async fn get_for_user(
@@ -189,7 +169,7 @@ impl FolderDB {
         db: &D1Database,
         folder: &Self,
     ) -> Result<(), AppError> {
-        DB::run_query(
+        db::run_query(
             async {
                 query!(
                     db,
@@ -244,14 +224,14 @@ impl FolderDB {
         }
 
         if batch_size == 0 {
-            DB::run_query(
+            db::run_query(
                 async { db.batch(statements).await.map(|_| ()) },
                 "Failed to create folder batch",
             )
             .await
         } else {
             for chunk in statements.chunks(batch_size) {
-                DB::run_query(
+                db::run_query(
                     async { db.batch(chunk.to_vec()).await.map(|_| ()) },
                     "Failed to create folder batch",
                 )
@@ -266,7 +246,7 @@ impl FolderDB {
         db: &D1Database,
         folder: &Self,
     ) -> Result<(), AppError> {
-        DB::run_query(
+        db::run_query(
             async {
                 query!(
                     db,
@@ -291,7 +271,7 @@ impl FolderDB {
         folder_id: &str,
         user_id: &str,
     ) -> Result<(), AppError> {
-        DB::run_query(
+        db::run_query(
             async {
                 query!(
                     db,
@@ -312,7 +292,7 @@ impl FolderDB {
         db: &D1Database,
         user_id: &str,
     ) -> Result<(), AppError> {
-        DB::run_query(
+        db::run_query(
             async {
                 query!(db, "DELETE FROM folders WHERE user_id = ?1", user_id)?
                     .run()

@@ -1,0 +1,36 @@
+name: Set up project tools
+description: Install pinned Node and just, with optional Rust toolchain and Cargo cache
+
+inputs:
+  rust:
+    description: Set up Rust and cache Cargo dependencies
+    default: "false"
+
+runs:
+  using: composite
+  steps:
+    - name: Set up pinned Node
+      uses: actions/setup-node@v4
+      with:
+        node-version-file: .node-version
+    - name: Read pinned just version
+      id: tools
+      shell: bash
+      run: node -e 'const p=require("./package.json"); require("node:fs").appendFileSync(process.env.GITHUB_OUTPUT, `just=${p.config.justVersion}\n`);'
+    - name: Install pinned just
+      uses: taiki-e/install-action@v2
+      with:
+        tool: just@${{ steps.tools.outputs.just }}
+    # The workflows use GitHub-hosted Ubuntu runners, which provide rustup.
+    - name: Set up pinned Rust
+      if: inputs.rust == 'true'
+      shell: bash
+      run: |
+        set -euo pipefail
+        export PATH="${CARGO_HOME:-$HOME/.cargo}/bin:$PATH"
+        echo "${CARGO_HOME:-$HOME/.cargo}/bin" >> "$GITHUB_PATH"
+        unset RUSTUP_TOOLCHAIN
+        rustup toolchain install --no-self-update
+    - name: Cache Cargo dependencies
+      if: inputs.rust == 'true'
+      uses: Swatinem/rust-cache@v2

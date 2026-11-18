@@ -1,10 +1,5 @@
-use axum::http::StatusCode;
-use bizerror::*;
-use serde_json::{
-    Map,
-    Value,
-    json,
-};
+use bizerror::BizError;
+use serde_json::Value;
 use thiserror::Error as ThisError;
 
 // ============================================================================
@@ -49,6 +44,21 @@ pub enum AppError {
     #[error("Invalid request: {message}")]
     BadRequest { message: String },
 
+    #[error("Conflict: {message}")]
+    Conflict { message: String },
+
+    #[error("Unprocessable entity: {message}")]
+    UnprocessableEntity { message: String },
+
+    #[error("Payload too large: {message}")]
+    PayloadTooLarge { message: String },
+
+    #[error("OAuth error {error}: {description}")]
+    OAuth {
+        error:       &'static str,
+        description: &'static str,
+    },
+
     #[error("Resource not found: {resource}")]
     NotFound { resource: String },
 
@@ -61,6 +71,9 @@ pub enum AppError {
     #[bizcode(3110)]
     #[error("Two factor authentication required")]
     TwoFactorRequired(Box<[i32]>),
+
+    #[error("Additional identity verification required")]
+    IdentityChallenge(Value),
 }
 
 #[derive(ThisError, BizError)]
@@ -68,6 +81,8 @@ pub enum AppError {
 pub enum ConfigError {
     #[error("Missing config: {0}")]
     Missing(String),
+    #[error("Invalid config: {0}")]
+    Invalid(String),
 }
 
 #[derive(ThisError, BizError)]
@@ -170,62 +185,9 @@ impl AppError {
         }
     }
 
-    pub fn twofactor_json(providers: &[i32]) -> Value {
-        let providers2: Map<String, Value> = providers
-            .iter()
-            .map(|p| (p.to_string(), Value::Null))
-            .collect();
-
-        json!({
-            "error": "invalid_grant",
-            "error_description": "Two factor required.",
-            "TwoFactorProviders": providers.iter().map(ToString::to_string).collect::<Vec<_>>(),
-            "TwoFactorProviders2": providers2,
-            "MasterPasswordPolicy": {
-                "Object": "masterPasswordPolicy"
-            }
-        })
-    }
-}
-
-/// HTTP status code mapping for different error types
-pub trait HttpStatusMapping {
-    fn http_status_code(&self) -> StatusCode;
-}
-
-impl HttpStatusMapping for AppError {
-    fn http_status_code(&self) -> StatusCode {
-        match self {
-            Self::Params(_) |
-            Self::BadRequest { .. } |
-            Self::TwoFactorRequired(_) => StatusCode::BAD_REQUEST,
-            Self::NotFound { .. } => StatusCode::NOT_FOUND,
-            Self::TooManyRequests { .. } => StatusCode::TOO_MANY_REQUESTS,
-            Self::Unauthorized { .. } | Self::Jwt(_) => {
-                StatusCode::UNAUTHORIZED
-            }
-            Self::Auth(auth_err) => auth_err.http_status_code(),
-            Self::Config(_) |
-            Self::Worker(_) |
-            Self::Database(_) |
-            Self::Crypto(_) |
-            Self::Internal => StatusCode::INTERNAL_SERVER_ERROR,
-        }
-    }
-}
-
-impl HttpStatusMapping for AuthError {
-    fn http_status_code(&self) -> StatusCode {
-        match self {
-            Self::InvalidCredentials(_) |
-            Self::InvalidPassword |
-            Self::MissingToken |
-            Self::InvalidTotp => StatusCode::UNAUTHORIZED,
-            Self::InsufficientPermissions | Self::AccountLocked => {
-                StatusCode::FORBIDDEN
-            }
-            Self::InvalidKDF(_) => StatusCode::BAD_REQUEST,
-            Self::UserNotFound => StatusCode::NOT_FOUND,
+    pub fn conflict(message: impl Into<String>) -> Self {
+        Self::Conflict {
+            message: message.into(),
         }
     }
 }

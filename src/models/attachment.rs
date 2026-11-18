@@ -10,6 +10,7 @@ use wasm_bindgen::JsValue;
 use worker::{
     Bucket,
     D1Database,
+    D1PreparedStatement,
     Env,
     query,
 };
@@ -19,7 +20,7 @@ use crate::{
         AppError,
         DatabaseError,
     },
-    infra::DB,
+    infra::db,
 };
 
 pub const ATTACHMENTS_BUCKET: &str = "ATTACHMENTS_BUCKET";
@@ -36,6 +37,8 @@ pub struct AttachmentDB {
     pub updated_at:      String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub organization_id: Option<String>,
+    #[serde(default)]
+    pub storage_key:     Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -55,8 +58,9 @@ pub struct AttachmentResponse {
 #[derive(Debug, Deserialize, Default)]
 #[serde(default)]
 pub struct AttachmentKeyRow {
-    pub cipher_id: String,
-    pub id:        String,
+    pub cipher_id:   String,
+    pub id:          String,
+    pub storage_key: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -69,7 +73,7 @@ impl AttachmentDB {
         db: &D1Database,
         pending: &Self,
     ) -> Result<(), AppError> {
-        DB::run_query(
+        db::run_query(
             async {
                 query!(
                     db,
@@ -99,7 +103,7 @@ impl AttachmentDB {
         attachment: &Self,
         now: &str,
     ) -> Result<(), AppError> {
-        DB::run_query(
+        db::run_query(
             async {
                 query!(
                     db,
@@ -128,7 +132,7 @@ impl AttachmentDB {
         db: &D1Database,
         attachment_id: &str,
     ) -> Result<(), AppError> {
-        DB::run_query(
+        db::run_query(
             async {
                 query!(
                     db,
@@ -144,6 +148,77 @@ impl AttachmentDB {
         .await
     }
 
+    /// Prepare publication; the caller supplies account/source assertions and
+    /// commits these statements with the sync cursor in the same transaction.
+    pub fn finalize_upload(
+        db: &D1Database,
+        attachment: &Self,
+        user_id: &str,
+        now: &str,
+    ) -> Result<Vec<D1PreparedStatement>, AppError> {
+        Ok(vec![
+            query!(
+                db,
+                "INSERT INTO attachments \
+                 (id,cipher_id,file_name,file_size,akey,created_at,updated_at,\
+                 organization_id,storage_key) \
+                 VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9)",
+                attachment.id,
+                attachment.cipher_id,
+                attachment.file_name,
+                attachment.file_size,
+                attachment.akey,
+                attachment.created_at,
+                now,
+                attachment.organization_id,
+                attachment.storage_key
+            )?,
+            query!(
+                db,
+                "DELETE FROM attachments_pending WHERE id=?1",
+                attachment.id
+            )?,
+            query!(
+                db,
+                "UPDATE ciphers SET updated_at=?1 WHERE id=?2 AND user_id=?3",
+                now,
+                attachment.cipher_id,
+                user_id
+            )?,
+        ])
+    }
+
+    /// Replace a committed file only after its captured row is asserted by
+    /// the bearer upload transaction. The storage trigger queues the old key.
+    pub fn replace_upload(
+        db: &D1Database,
+        attachment: &Self,
+        user_id: &str,
+        now: &str,
+    ) -> Result<Vec<D1PreparedStatement>, AppError> {
+        Ok(vec![
+            query!(
+                db,
+                "UPDATE attachments SET \
+                 file_size=?1,akey=?2,storage_key=?3,updated_at=?4 WHERE \
+                 id=?5 AND cipher_id=?6",
+                attachment.file_size,
+                attachment.akey,
+                attachment.storage_key,
+                now,
+                attachment.id,
+                attachment.cipher_id
+            )?,
+            query!(
+                db,
+                "UPDATE ciphers SET updated_at=?1 WHERE id=?2 AND user_id=?3",
+                now,
+                attachment.cipher_id,
+                user_id
+            )?,
+        ])
+    }
+
     pub async fn purge_pending_before(
         db: &D1Database,
         cutoff_exclusive: &str,
@@ -151,7 +226,7 @@ impl AttachmentDB {
         let pending_count = query!(
             db,
             "SELECT COUNT(*) as count FROM attachments_pending WHERE \
-             created_at < ?1",
+             julianday(created_at) < julianday(?1)",
             cutoff_exclusive
         )
         .map_err(|e| {
@@ -171,11 +246,12 @@ impl AttachmentDB {
         .map_or(0, |row| row.count);
 
         if pending_count > 0 {
-            DB::run_query(
+            db::run_query(
                 async {
                     query!(
                         db,
-                        "DELETE FROM attachments_pending WHERE created_at < ?1",
+                        "DELETE FROM attachments_pending WHERE \
+                         julianday(created_at) < julianday(?1)",
                         cutoff_exclusive
                     )?
                     .run()
@@ -194,7 +270,7 @@ impl AttachmentDB {
         db: &D1Database,
         attachment_id: &str,
     ) -> Result<(), AppError> {
-        DB::run_query(
+        db::run_query(
             async {
                 query!(
                     db,
@@ -211,7 +287,9 @@ impl AttachmentDB {
     }
 
     pub fn r2_key(&self) -> String {
-        format!("{}/{}", self.cipher_id, self.id)
+        self.storage_key
+            .clone()
+            .unwrap_or_else(|| format!("{}/{}", self.cipher_id, self.id))
     }
 
     pub fn to_response(&self, url: Option<String>) -> AttachmentResponse {
@@ -287,27 +365,15 @@ impl AttachmentDB {
         json_body: &str,
         ids_path: &str,
     ) -> Result<HashMap<String, Vec<AttachmentResponse>>, AppError> {
-        let attachments: Vec<Self> = db
+        let result = db
             .prepare(
                 "SELECT * FROM attachments WHERE cipher_id IN (SELECT value \
                  FROM json_each(?1, ?2))",
             )
             .bind(&[json_body.to_owned().into(), ids_path.to_owned().into()])?
             .all()
-            .await
-            .map_err(|e| {
-                log::error!("Failed to load attachments: {e}");
-                AppError::Database(DatabaseError::QueryFailed(
-                    "Failed to load attachments".to_string(),
-                ))
-            })?
-            .results()
-            .map_err(|e| {
-                log::error!("Failed to parse attachments: {e}");
-                AppError::Database(DatabaseError::QueryFailed(
-                    "Failed to parse attachments".to_string(),
-                ))
-            })?;
+            .await?;
+        let attachments: Vec<Self> = db::decode_results(&result)?;
 
         let mut map: HashMap<String, Vec<AttachmentResponse>> = HashMap::new();
 
@@ -382,46 +448,8 @@ impl AttachmentDB {
         Ok(total)
     }
 
-    pub(crate) async fn list_attachment_keys_for_soft_deleted_before(
-        db: &D1Database,
-        cutoff_exclusive: &str,
-    ) -> Result<Vec<String>, AppError> {
-        let rows: Vec<AttachmentKeyRow> = db
-            .prepare(
-                "SELECT a.cipher_id, a.id FROM attachments a JOIN ciphers c \
-                 ON a.cipher_id = c.id WHERE c.deleted_at IS NOT NULL AND \
-                 c.deleted_at < ?1",
-            )
-            .bind(&[cutoff_exclusive.into()])?
-            .all()
-            .await
-            .map_err(|e| {
-                log::error!(
-                    "Failed to query attachment keys for soft-deleted \
-                     ciphers: {e}"
-                );
-                AppError::Database(DatabaseError::QueryFailed(
-                    "Failed to query attachment keys for soft-deleted ciphers"
-                        .to_string(),
-                ))
-            })?
-            .results()
-            .map_err(|e| {
-                log::error!(
-                    "Failed to parse attachment keys for soft-deleted \
-                     ciphers: {e}"
-                );
-                AppError::Database(DatabaseError::QueryFailed(
-                    "Failed to parse attachment keys for soft-deleted ciphers"
-                        .to_string(),
-                ))
-            })?;
-
-        Ok(Self::map_rows_to_keys(rows))
-    }
-
     pub fn attachments_enabled(env: &Env) -> bool {
-        env.bucket(ATTACHMENTS_BUCKET).is_ok()
+        crate::infra::storage::Storage::enabled(env)
     }
 
     pub fn require_bucket(env: &Env) -> Result<Bucket, AppError> {
@@ -462,9 +490,13 @@ impl AttachmentDB {
         ids_path: &str,
         user_id: Option<&str>,
     ) -> Result<Vec<String>, AppError> {
-        let mut sql = "SELECT a.cipher_id, a.id FROM attachments a JOIN \
-                       ciphers c ON a.cipher_id = c.id WHERE c.id IN (SELECT \
-                       value FROM json_each(?1, ?2))"
+        let mut sql = "SELECT a.cipher_id, a.id, a.storage_key FROM
+                       (SELECT cipher_id, id, storage_key FROM attachments \
+                       UNION
+                        SELECT cipher_id, id, NULL AS storage_key FROM \
+                       attachments_pending) a
+                       JOIN ciphers c ON a.cipher_id = c.id WHERE c.id IN
+                       (SELECT value FROM json_each(?1, ?2))"
             .to_string();
         let mut params: Vec<worker::wasm_bindgen::JsValue> =
             vec![json_body.to_owned().into(), ids_path.to_owned().into()];
@@ -502,8 +534,11 @@ impl AttachmentDB {
     ) -> Result<Vec<String>, AppError> {
         let rows: Vec<AttachmentKeyRow> = db
             .prepare(
-                "SELECT a.cipher_id, a.id FROM attachments a JOIN ciphers c \
-                 ON a.cipher_id = c.id WHERE c.user_id = ?1",
+                "SELECT a.cipher_id, a.id, a.storage_key FROM
+                 (SELECT cipher_id, id, storage_key FROM attachments UNION
+                  SELECT cipher_id, id, NULL AS storage_key FROM \
+                 attachments_pending) a
+                 JOIN ciphers c ON a.cipher_id = c.id WHERE c.user_id = ?1",
             )
             .bind(&[user_id.into()])?
             .all()
@@ -527,7 +562,10 @@ impl AttachmentDB {
 
     fn map_rows_to_keys(rows: Vec<AttachmentKeyRow>) -> Vec<String> {
         rows.into_iter()
-            .map(|row| format!("{}/{}", row.cipher_id, row.id))
+            .map(|row| {
+                row.storage_key
+                    .unwrap_or_else(|| format!("{}/{}", row.cipher_id, row.id))
+            })
             .collect()
     }
 }

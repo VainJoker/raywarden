@@ -1,6 +1,6 @@
 [package]
 name = "raywarden"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 authors = ["Jasper Zhang <hanjie.zhang1228@gmail.com>"]
 
@@ -10,19 +10,17 @@ crate-type = ["cdylib"]
 [dependencies]
 
 # Worker & Web APIs
-worker = { version = "0.7", features = ["axum", "http", "d1"] }
-worker-macros = { version = "0.7", features = ['http'] }
+worker = { version = "0.9", features = ["axum", "http", "d1"] }
 wasm-bindgen = "0.2"
 js-sys = "0.3"
 wasm-bindgen-futures = "0.4"
 web-sys = { version = "0.3", features = ["Crypto", "CryptoKey", "SubtleCrypto", "WorkerGlobalScope", "Pbkdf2Params"] }
 console_error_panic_hook = "0.1.7"
-wasm-streams = "0.4"
 
 # Axum and Routing
 axum = { version = "0.8", default-features = false, features=["json", "macros", "form", "multipart", "query"] }
 tower-service = "0.3"
-tower-http = { version = "0.6", features = ["cors"] }
+tower-http = { version = "0.7", features = ["cors"] }
 bytes = "1"
 futures-util = { version = "0.3", default-features = false, features = ["alloc"] }
 
@@ -31,24 +29,28 @@ serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 
 # Crypto & Encoding
-base64 = "0.22"
+base64 = "0.23"
 base32 = "0.5"
 hex = "0.4"
-rand = { version = "0.9" }
-getrandom = { version = "0.3", features = ["wasm_js"] }
-constant_time_eq = "0.4"
-sha2 = "0.10"
-hmac = "0.12"
+getrandom = { version = "0.4", features = ["wasm_js"] }
+constant_time_eq = "0.6"
+sha2 = "0.11"
+hmac = "0.13"
+aes-gcm = "0.11"
+ciborium = "0.2"
+p256 = { version = "0.14", features = ["ecdsa"] }
+rsa = { version = "0.10", features = ["pkcs1v15"] }
+rmpv = "1.3"
+url = "2.5"
 
 # Utilities
-chrono = { version = "0.4", features = ["serde"] }
-uuid = { version = "1.6", features = ["v4", "serde", "rng-rand"] }
+jiff = { version = "1", default-features = false, features = ["std", "serde", "js"] }
+uuid = { version = "1.6", features = ["v4", "serde", "js"] }
 log = "0.4"
 thiserror = "2.0"
 bizerror = "0.1.3"
 console_log = "1.0.0"
 tracing = { version = "0.1", features = ["log"] }
-tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }
 glob-match = "0.2"
 
 [lints.rust]
@@ -84,4 +86,5 @@ implicit_clone = "warn"
 use_self = "warn"
 
 [profile.release]
-strip = true
+# Keep target_features metadata for wasm-bindgen; wasm-opt handles final sizing.
+strip = "debuginfo"

@@ -1,6 +1,7 @@
 use axum::{
     Router,
     routing::{
+        delete,
         get,
         post,
         put,
@@ -14,6 +15,14 @@ use crate::api::{
 
 pub fn devices_router() -> Router<AppState> {
     Router::new()
+        .route(
+            "/api/devices/identifier/{device_id}",
+            delete(devices::delete_device),
+        )
+        .route(
+            "/api/devices/identifier/{device_id}/delete",
+            post(devices::delete_device),
+        )
         .route("/api/devices", get(devices::get_devices))
         .route("/api/devices/knowndevice", get(devices::get_known_device))
         .route(

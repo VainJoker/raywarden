@@ -2,7 +2,6 @@ use axum::{
     Json,
     extract::State,
 };
-use chrono::Utc;
 use serde_json::{
     Value,
     json,
@@ -11,9 +10,14 @@ use serde_json::{
 use crate::{
     api::{
         AppState,
+        RawJson,
         service::claims::Claims,
     },
     errors::AppError,
+    infra::admin_notify::{
+        self,
+        Event,
+    },
     models::domains::{
         DomainsDB,
         EquivDomainData,
@@ -30,14 +34,13 @@ use crate::{
 /// - `equivalentDomains`: custom groups set by the user
 /// - `excludedGlobalEquivalentDomains`: which predefined groups are disabled
 ///
-/// This server persists only the per-user settings in `users`.
-/// The optional global dataset can be seeded into D1 (see README), and will
-/// then be included in responses without parsing the large JSON in the Worker.
+/// Per-user settings live in `users`. Global groups are fetched from
+/// Vaultwarden upstream when due and cached in D1; responses are built in SQL.
 #[worker::send]
 pub async fn get_domains(
     claims: Claims,
     State(state): State<AppState>,
-) -> Result<Json<Value>, AppError> {
+) -> Result<RawJson, AppError> {
     let db = state.get_db();
 
     let domains = DomainsDB::fetch_by_user_id(&db, &claims.sub).await?;
@@ -45,7 +48,7 @@ pub async fn get_domains(
     let excluded_globals = domains.excluded_globals;
 
     // Include ALL global groups and mark `excluded` (settings UI semantics).
-    // Falls back to [] if the dataset isn't seeded yet.
+    // An unavailable upstream leaves the last cached dataset (or []) usable.
     let global_equivalent_domains =
         EquivDomainData::global_equivalent_domains_json(
             &db,
@@ -57,7 +60,7 @@ pub async fn get_domains(
     let response = format!(
         r#"{{"equivalentDomains":{equivalent_domains},"globalEquivalentDomains":{global_equivalent_domains},"object":"domains"}}"#
     );
-    Ok(Json(json!(response)))
+    Ok(RawJson(response))
 }
 
 /// POST /api/settings/domains
@@ -87,7 +90,7 @@ pub async fn post_domains(
             AppError::Params("Invalid equivalent domains".to_string())
         })?;
 
-    let now = Utc::now().to_rfc3339();
+    let now = crate::infra::time::now_rfc3339();
     DomainsDB::update_for_user(
         &db,
         &claims.sub,
@@ -97,6 +100,8 @@ pub async fn post_domains(
     )
     .await?;
 
+    admin_notify::emit(&state.env, Event::AccountSettingsChanged, &claims.sub)
+        .await;
     Ok(Json(json!({})))
 }
 

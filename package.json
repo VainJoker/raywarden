@@ -1,0 +1,22 @@
+{
+  "name": "raywarden",
+  "version": "0.1.1",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=22.13.0",
+    "npm": ">=10"
+  },
+  "config": {
+    "justVersion": "1.59.0",
+    "llvmCovVersion": "0.6.21",
+    "workerBuildVersion": "0.9.0",
+    "webVaultVersion": "2026.7.0"
+  },
+  "scripts": {
+    "test": "node --test --test-isolation=none tests/*.test.mjs"
+  },
+  "devDependencies": {
+    "wrangler": "4.163.0"
+  }
+}

@@ -1,0 +1,104 @@
+name: Deploy to Cloudflare
+
+on:
+  workflow_call:
+  workflow_dispatch:
+    inputs:
+      run_id:
+        description: "Integration run ID from main (checks must have succeeded)"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  actions: read
+
+env:
+  CI: "true"
+
+jobs:
+  deploy:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    environment: production
+    # New checks may cancel older checks, but must never interrupt a D1 migration.
+    concurrency:
+      group: cloudflare-deploy-${{ github.repository }}
+      cancel-in-progress: false
+    steps:
+      - name: Resolve the validated Integration artifact
+        id: source
+        uses: actions/github-script@v8
+        env:
+          INTEGRATION_RUN_ID: ${{ inputs.run_id }}
+        with:
+          script: |
+            const requested = (process.env.INTEGRATION_RUN_ID ?? '').trim();
+            const runId = requested || String(context.runId);
+            let sha = context.sha;
+            // A reusable call already depends on Integration's check job.
+            // Its event may also be workflow_dispatch; only an input selects another run.
+            if (requested) {
+              if (!/^[1-9]\d*$/.test(runId)) throw new Error('Integration run ID must be a positive integer');
+              const { data: run } = await github.rest.actions.getWorkflowRun({ ...context.repo, run_id: runId });
+              const repository = `${context.repo.owner}/${context.repo.repo}`;
+              if (run.repository?.full_name !== repository || run.head_repository?.full_name !== repository ||
+                  run.path !== '.github/workflows/integration.yml' || run.head_branch !== 'main' ||
+                  !['push', 'workflow_dispatch'].includes(run.event) || !/^[0-9a-f]{40}$/.test(run.head_sha)) {
+                throw new Error('Source must be an Integration push or manual run from this repository main branch');
+              }
+              if (run.status !== 'completed') throw new Error('Wait for the source Integration run to finish');
+              const jobs = await github.paginate(github.rest.actions.listJobsForWorkflowRun, {
+                ...context.repo, run_id: runId, filter: 'all', per_page: 100,
+              });
+              const checks = jobs.filter(job => job.name === 'Linux Rust, JavaScript, SQL and Worker build');
+              if (checks.some(job => !Number.isInteger(job.run_attempt) || job.run_attempt < 1)) {
+                throw new Error('Cannot identify the Integration check attempt');
+              }
+              // A deploy-only rerun need not rerun check; a newer failed check must not fall back to an old success.
+              const check = checks.sort((a, b) => b.run_attempt - a.run_attempt)[0];
+              if (!check || check.head_sha !== run.head_sha || check.status !== 'completed' || check.conclusion !== 'success') {
+                throw new Error('The latest Integration check must have succeeded for the source commit');
+              }
+              sha = run.head_sha;
+            }
+            core.setOutput('sha', sha);
+            core.setOutput('run_id', runId);
+      - name: Check out source
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          ref: ${{ steps.source.outputs.sha }}
+          persist-credentials: false
+      - name: Download the validated release artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: raywarden-release-production-${{ steps.source.outputs.sha }}
+          path: .
+          github-token: ${{ github.token }}
+          repository: ${{ github.repository }}
+          run-id: ${{ steps.source.outputs.run_id }}
+      - name: Set up project tools
+        uses: ./.github/actions/setup
+      - name: Verify artifact commit, configuration, modules, assets and locks
+        env:
+          ARTIFACT_SOURCE_SHA: ${{ steps.source.outputs.sha }}
+        run: just artifact-check
+      - name: Install only the locked deployment CLI
+        run: just setup-deploy
+      - name: Verify resources, migrate D1 and upload compiled Worker
+        env:
+          ARTIFACT_SOURCE_SHA: ${{ steps.source.outputs.sha }}
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          ALLOWED_EMAILS: ${{ secrets.ALLOWED_EMAILS }}
+          OWNER_SETUP_TOKEN: ${{ secrets.OWNER_SETUP_TOKEN }}
+        run: |
+          just resources
+          just db-migrate production
+          just deploy-worker
+      - name: Verify the configured public health endpoint
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        run: just health

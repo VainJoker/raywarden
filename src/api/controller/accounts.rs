@@ -1,10 +1,16 @@
 use axum::{
     Json,
     extract::State,
-    http::HeaderMap,
+    http::{
+        HeaderMap,
+        HeaderValue,
+        header,
+    },
+    response::{
+        IntoResponse as _,
+        Response,
+    },
 };
-use chrono::Utc;
-use glob_match::glob_match;
 use serde_json::{
     Value,
     json,
@@ -24,26 +30,31 @@ use crate::{
                 validate_rotation_metadata,
             },
             rate,
-            user,
+            setup,
         },
     },
     errors::{
         AppError,
         AuthError,
     },
-    infra::cryptor::{
-        generate_salt,
-        hash_password_for_storage,
+    infra::{
+        admin_notify::{
+            self,
+            Event,
+        },
+        crypto::{
+            generate_salt,
+            hash_password_for_storage,
+        },
     },
     models::{
-        cipher::CipherDB,
-        folder::FolderDB,
         sync::Profile,
         twofactor::TwoFactorDB,
         user::{
             AvatarData,
             ChangeKdfRequest,
             ChangePasswordRequest,
+            KdfParams,
             PasswordOrOtpData,
             PreloginResponse,
             ProfileData,
@@ -70,7 +81,8 @@ pub async fn prelogin(
     let rate_limit_key = format!("prelogin:{ip}");
     rate::check_rate_limit(&state, rate_limit_key).await?;
 
-    let params = user::get_kdf_params_by_email(&state, email).await?;
+    let email = email.trim().to_lowercase();
+    let params = UserDB::kdf_params_by_email(&state.get_db(), &email).await?;
 
     Ok(Json(PreloginResponse {
         kdf:             params.kdf_type.unwrap_or(KDF_TYPE_PBKDF2),
@@ -79,6 +91,15 @@ pub async fn prelogin(
             .unwrap_or(DEFAULT_PBKDF2_ITERATIONS),
         kdf_memory:      params.kdf_memory,
         kdf_parallelism: params.kdf_parallelism,
+        kdf_settings:    KdfParams {
+            kdf_type:    params.kdf_type.unwrap_or(KDF_TYPE_PBKDF2),
+            iterations:  params
+                .kdf_iterations
+                .unwrap_or(DEFAULT_PBKDF2_ITERATIONS),
+            memory:      params.kdf_memory,
+            parallelism: params.kdf_parallelism,
+        },
+        salt:            email,
     }))
 }
 
@@ -87,23 +108,21 @@ pub async fn register(
     State(state): State<AppState>,
     headers: HeaderMap,
     Json(payload): Json<RegisterRequest>,
-) -> Result<Json<Value>, AppError> {
-    log::info!("Register request for email: {}", payload.email);
+) -> Result<Response, AppError> {
+    log::info!("Registration request received");
 
     let ip = rate::client_ip(&headers);
     let rate_limit_key = format!("register:{ip}");
     rate::check_rate_limit(&state, rate_limit_key).await?;
 
-    let allowed_emails = &state.config.allowed_emails;
-    if let Some(allowed_emails) = allowed_emails &&
-        !allowed_emails
-            .iter()
-            .any(|pattern| glob_match(pattern, &payload.email))
-    {
-        return Err(AppError::Auth(AuthError::InvalidCredentials(
-            "Email is not allowed".to_string(),
-        )));
-    }
+    let owner_email =
+        setup::authorize_registration(&state, &headers, &payload.email).await?;
+    crate::api::service::email::enforce_registration_verification(
+        &state,
+        &owner_email,
+        payload.email_verification_token.as_deref(),
+    )
+    .await?;
 
     ensure_supported_kdf(
         payload.kdf,
@@ -120,7 +139,7 @@ pub async fn register(
     )
     .await?;
 
-    let now = Utc::now().to_rfc3339();
+    let now = crate::infra::time::now_rfc3339();
 
     // Only store kdf_memory and kdf_parallelism for Argon2id, clear for PBKDF2
     let (kdf_memory, kdf_parallelism) = if payload.kdf == KDF_TYPE_ARGON2ID {
@@ -133,8 +152,11 @@ pub async fn register(
         id: Uuid::new_v4().to_string(),
         name: payload.name,
         avatar_color: None,
-        email: payload.email.to_lowercase(),
-        email_verified: false,
+        email: owner_email,
+        email_verified:
+            crate::api::service::email::registration_verification_required(
+                &state,
+            ),
         master_password_hash: hashed_password,
         master_password_hint: payload.master_password_hint,
         password_salt: Some(password_salt),
@@ -146,6 +168,13 @@ pub async fn register(
         kdf_memory,
         kdf_parallelism,
         security_stamp: Uuid::new_v4().to_string(),
+        user_key_id: payload.user_key_id,
+        signed_public_key: payload.account_keys.signed_public_key,
+        security_state: payload.account_keys.security_state,
+        security_version: payload.account_keys.security_version,
+        signature_key_pair: payload.account_keys.signature_key_pair,
+        v2_upgrade_token: None,
+        security_stamp_exceptions: None,
         equivalent_domains: "[]".to_string(),
         excluded_globals: "[]".to_string(),
         totp_recover: None,
@@ -153,14 +182,17 @@ pub async fn register(
         updated_at: now,
     };
 
-    user::insert_user(&state, &user).await?;
-
-    Ok(Json(json!({})))
-}
-
-#[worker::send]
-pub async fn send_verification_email() -> Result<Json<String>, AppError> {
-    Ok(Json("fixed-token-to-mock".to_string()))
+    let clear_cookie = HeaderValue::from_str(&setup::clear_cookie(&state)?)
+        .map_err(|_| AppError::Internal)?;
+    UserDB::insert(&state.get_db(), &user).await?;
+    let mut response = Json(json!({})).into_response();
+    response
+        .headers_mut()
+        .insert(header::SET_COOKIE, clear_cookie);
+    response
+        .headers_mut()
+        .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    Ok(response)
 }
 
 #[worker::send]
@@ -173,18 +205,34 @@ pub async fn revision_date(
     Ok(Json(revision_date))
 }
 
-/// GET /api/auth-requests/pending
-///
-/// Stub: always returns an empty list.
 #[worker::send]
-pub async fn get_auth_requests_pending(
-    _claims: Claims,
+pub async fn get_tasks(_claims: Claims) -> Json<Value> {
+    Json(json!({ "data": [], "object": "list", "continuationToken": null }))
+}
+
+#[worker::send]
+pub async fn verify_password(
+    claims: Claims,
+    State(state): State<AppState>,
+    Json(payload): Json<PasswordOrOtpData>,
 ) -> Result<Json<Value>, AppError> {
-    Ok(Json(json!({
-        "data": [],
-        "continuationToken": null,
-        "object": "list"
-    })))
+    rate::check_rate_limit(&state, format!("verify-password:{}", claims.sub))
+        .await?;
+    let hash = payload
+        .master_password_hash
+        .ok_or_else(|| AppError::bad_request("Missing master password hash"))?;
+    let db = state.get_db();
+    let user = UserDB::fetch_by_id_with(
+        &db,
+        &claims.sub,
+        "Failed to fetch user for password verification",
+        || AppError::Auth(AuthError::UserNotFound),
+    )
+    .await?;
+    if !user.verify_master_password(&hash).await?.is_valid() {
+        return Err(AuthError::InvalidPassword.into());
+    }
+    Ok(Json(json!({ "Object": "masterPasswordPolicy" })))
 }
 
 #[worker::send]
@@ -233,7 +281,7 @@ pub async fn post_profile(
         || AppError::Auth(AuthError::AccountLocked),
     )
     .await?;
-    let now = Utc::now().to_rfc3339();
+    let now = crate::infra::time::now_rfc3339();
 
     user.name = Some(payload.name);
     user.updated_at.clone_from(&now);
@@ -244,6 +292,8 @@ pub async fn post_profile(
         TwoFactorDB::two_factor_enabled(&db, user_id).await?;
     let profile = Profile::from_user(user, two_factor_enabled);
 
+    admin_notify::emit(&state.env, Event::AccountSettingsChanged, &claims.sub)
+        .await;
     Ok(Json(profile))
 }
 
@@ -282,7 +332,7 @@ pub async fn put_avatar(
         || AppError::Auth(AuthError::UserNotFound),
     )
     .await?;
-    let now = Utc::now().to_rfc3339();
+    let now = crate::infra::time::now_rfc3339();
 
     user.avatar_color = payload.avatar_color;
     user.updated_at.clone_from(&now);
@@ -293,6 +343,8 @@ pub async fn put_avatar(
         TwoFactorDB::two_factor_enabled(&db, user_id).await?;
     let profile = Profile::from_user(user, two_factor_enabled);
 
+    admin_notify::emit(&state.env, Event::AccountSettingsChanged, &claims.sub)
+        .await;
     Ok(Json(profile))
 }
 
@@ -305,43 +357,28 @@ pub async fn delete_account(
     let db = state.get_db();
     let user_id = &claims.sub;
 
-    // Get the user from the database
-    let user = UserDB::fetch_by_id_with(
-        &db,
-        user_id,
-        "Failed to fetch user for account deletion",
-        || AppError::NotFound {
-            resource: "User not found".to_string(),
-        },
+    crate::api::service::email::verify_password_or_otp(
+        &state, &claims, &payload,
     )
     .await?;
 
-    // Verify the master password hash
-    let provided_hash = payload.master_password_hash.ok_or_else(|| {
-        AppError::Params("Missing master password hash".to_string())
-    })?;
-
-    let verification = user.verify_master_password(&provided_hash).await?;
-
-    if !verification.is_valid() {
-        return Err(AppError::Auth(AuthError::InvalidPassword));
+    crate::api::service::notifications::publish_user_update(
+        &state.env,
+        user_id,
+        crate::api::service::notifications::UpdateType::LogOut,
+        &crate::infra::time::now_rfc3339(),
+        claims.device(),
+    )
+    .await;
+    crate::api::service::push::unregister_user(&state.env, user_id).await;
+    UserDB::delete_user(&db, user_id).await?;
+    if let Err(error) =
+        crate::infra::storage::cleanup::drain(&state.env, &db).await
+    {
+        log::warn!("Account deleted; object cleanup will retry: {error}");
     }
 
-    // if attachments::attachments_enabled(env.as_ref()) {
-    //     let bucket = attachments::require_bucket(env.as_ref())?;
-    //     let keys = attachments::list_attachment_keys_for_user(&db,
-    // user_id).await?;     attachments::delete_r2_objects(&bucket,
-    // &keys).await?; }
-
-    // Delete all user's ciphers
-    CipherDB::purge_user_ciphers(&db, user_id).await?;
-
-    // Delete all user's folders
-    FolderDB::purge_user_folders(&db, user_id).await?;
-
-    // Delete the user
-    UserDB::delete_user(&db, user_id).await?;
-
+    admin_notify::emit(&state.env, Event::AccountDeleted, user_id).await;
     Ok(Json(json!({})))
 }
 
@@ -382,186 +419,265 @@ pub async fn post_password(
             .await?;
 
     // Generate new security stamp and update timestamp
-    let new_security_stamp = Uuid::new_v4().to_string();
-    let now = Utc::now().to_rfc3339();
 
     // Update user record
-    UserDB::update_master_password(
-        &db,
-        user_id,
+    crate::api::service::account_keys::change_credentials(
+        &state,
+        &claims,
+        &user,
         &new_hashed_password,
         &new_salt,
         &payload.key,
-        &payload.master_password_hint,
-        &new_security_stamp,
-        &now,
+        user.kdf_type,
+        user.kdf_iterations,
+        user.kdf_memory,
+        user.kdf_parallelism,
+        payload.master_password_hint.as_deref(),
     )
     .await?;
 
+    admin_notify::emit(&state.env, Event::PasswordChange, &claims.sub).await;
     Ok(Json(json!({})))
 }
 
-/// POST /accounts/key-management/rotate-user-account-keys - Rotate user
-/// encryption keys
+/// Password change and account-key rotation use one guarded transaction.
 #[worker::send]
 pub async fn post_rotatekey(
     claims: Claims,
     State(state): State<AppState>,
     Json(payload): Json<RotateKeyRequest>,
 ) -> Result<Json<Value>, AppError> {
-    let db = state.get_db();
-    let user_id = &claims.sub;
-    let batch_size = state.config.import_batch_size as usize;
-
-    // Get the user from the database
     let user = UserDB::fetch_by_id_with(
-        &db,
-        user_id,
-        "Failed to fetch user for key rotation",
-        || AppError::NotFound {
-            resource: "User not found".to_string(),
-        },
+        &state.get_db(),
+        &claims.sub,
+        "Failed to read rotation owner",
+        || AuthError::UserNotFound.into(),
     )
     .await?;
-
-    // Verify the current master password
-    let verification = user
+    if !user
         .verify_master_password(&payload.old_master_key_authentication_hash)
-        .await?;
-
-    if !verification.is_valid() {
-        return Err(AppError::Auth(AuthError::InvalidPassword));
+        .await?
+        .is_valid()
+    {
+        return Err(AuthError::InvalidPassword.into());
     }
-
-    let unlock_data = &payload.account_unlock_data.master_password_unlock_data;
-
+    let unlock = &payload.account_unlock_data.master_password_unlock_data;
     validate_rotation_metadata(
         &user,
-        unlock_data,
+        unlock,
         &payload.account_keys.account_public_key,
     )?;
-
-    // Validate KDF parameters
     ensure_supported_kdf(
-        unlock_data.kdf_type,
-        unlock_data.kdf_iterations,
-        unlock_data.kdf_memory,
-        unlock_data.kdf_parallelism,
+        unlock.kdf_type,
+        unlock.kdf_iterations,
+        unlock.kdf_memory,
+        unlock.kdf_parallelism,
     )?;
-
-    // Validate data integrity using D1 batch operations
-    // Step 1: Ensure all personal ciphers have id (required for key rotation)
-    // Step 2: Count check - ensure request has exactly the same number of items
-    // as DB Step 3: EXCEPT check - ensure request has exactly the same IDs
-    // as DB
-    let personal_ciphers: Vec<_> = payload
-        .account_data
-        .ciphers
-        .iter()
-        .filter(|c| c.organization_id.is_none())
-        .cloned()
-        .collect();
-
-    let request_cipher_ids: Vec<String> = personal_ciphers
-        .iter()
-        .filter_map(|c| c.id.clone())
-        .collect();
-
-    // All personal ciphers must have an id for key rotation
-    if personal_ciphers.len() != request_cipher_ids.len() {
-        log::error!(
-            "All ciphers must have an id for key rotation: {:?} != {:?}",
-            personal_ciphers.len(),
-            request_cipher_ids.len()
-        );
-        return Err(AppError::Params(
-            "All ciphers must have an id for key rotation".to_string(),
+    if !payload
+        .account_unlock_data
+        .emergency_access_unlock_data
+        .is_empty() ||
+        !payload
+            .account_unlock_data
+            .organization_account_recovery_unlock_data
+            .is_empty() ||
+        !payload
+            .account_unlock_data
+            .device_key_unlock_data
+            .is_empty()
+    {
+        return Err(AppError::bad_request(
+            "Unsupported account recovery or trusted-device unlock data",
         ));
     }
-
-    // Filter out null folder IDs (Bitwarden client bug: https://github.com/bitwarden/clients/issues/8453)
-    let request_folder_ids: Vec<String> = payload
-        .account_data
-        .folders
-        .iter()
-        .filter_map(|f| f.id.clone())
-        .collect();
-
-    let cipher_ids_json =
-        serde_json::to_string(&request_cipher_ids).map_err(|e| {
-            log::error!("Error serializing cipher IDs for rotation: {e}");
-            AppError::Internal
-        })?;
-    let folder_ids_json =
-        serde_json::to_string(&request_folder_ids).map_err(|e| {
-            log::error!("Error serializing folder IDs for rotation: {e}");
-            AppError::Internal
-        })?;
-
-    UserDB::validate_rotation_state(
-        &db,
-        user_id,
-        &cipher_ids_json,
-        &folder_ids_json,
+    let keys = payload.account_keys.validate()?;
+    if keys.is_v2() && unlock.contained_key_id != payload.new_user_key_id {
+        return Err(AppError::bad_request(
+            "Contained key id must match the new user key id",
+        ));
+    }
+    let salt = generate_salt()?;
+    let hash = hash_password_for_storage(
+        &unlock.master_key_authentication_hash,
+        &salt,
     )
     .await?;
-
-    let now = Utc::now().to_rfc3339();
-
-    UserDB::rotate_folders(
-        &db,
-        user_id,
-        &payload.account_data.folders,
-        &now,
-        batch_size,
-    )
-    .await?;
-
-    UserDB::rotate_personal_ciphers(
-        &db,
-        user_id,
-        &personal_ciphers,
-        &now,
-        batch_size,
-    )
-    .await?;
-
-    // Generate new salt and hash the new password
-    let new_salt = generate_salt()?;
-    let new_hashed_password = hash_password_for_storage(
-        &unlock_data.master_key_authentication_hash,
-        &new_salt,
-    )
-    .await?;
-
-    // Generate new security stamp
-    let new_security_stamp = Uuid::new_v4().to_string();
-
-    // Only store kdf_memory and kdf_parallelism for Argon2id, clear for PBKDF2
-    let (kdf_memory, kdf_parallelism) =
-        if unlock_data.kdf_type == KDF_TYPE_ARGON2ID {
-            (unlock_data.kdf_memory, unlock_data.kdf_parallelism)
+    let memory = if unlock.kdf_type == KDF_TYPE_ARGON2ID {
+        unlock.kdf_memory
+    } else {
+        None
+    };
+    let parallelism = if unlock.kdf_type == KDF_TYPE_ARGON2ID {
+        unlock.kdf_parallelism
+    } else {
+        None
+    };
+    let new_key_id = payload.new_user_key_id.clone().or_else(|| {
+        if !keys.is_v2() {
+            user.user_key_id.clone()
         } else {
-            (None, None)
-        };
+            None
+        }
+    });
+    let input = crate::api::service::account_keys::RotationInput {
+        keys,
+        data: payload.account_data,
+        wrapped_user_key: unlock.master_key_encrypted_user_key.clone(),
+        old_user_key_id: payload.old_user_key_id.or_else(|| {
+            if !user.is_v2() {
+                user.user_key_id.clone()
+            } else {
+                None
+            }
+        }),
+        new_user_key_id: new_key_id,
+        upgrade: None,
+        passkeys: payload.account_unlock_data.passkey_unlock_data,
+        password: Some((
+            hash,
+            salt,
+            unlock.kdf_type,
+            unlock.kdf_iterations,
+            memory,
+            parallelism,
+            unlock.master_password_hint.clone(),
+        )),
+    };
+    crate::api::service::account_keys::rotate(&state, &claims, &user, input)
+        .await?;
+    Ok(Json(json!({})))
+}
 
-    UserDB::update_account_keys_after_rotation(
-        &db,
-        user_id,
-        &new_hashed_password,
-        &new_salt,
-        &unlock_data.master_key_encrypted_user_key,
-        &payload.account_keys.user_key_encrypted_account_private_key,
-        unlock_data.kdf_type,
-        unlock_data.kdf_iterations,
-        kdf_memory,
-        kdf_parallelism,
-        &new_security_stamp,
-        &now,
+#[worker::send]
+pub async fn post_rotate_user_keys(
+    claims: Claims,
+    State(state): State<AppState>,
+    Json(payload): Json<Value>,
+) -> Result<Json<Value>, AppError> {
+    let user = UserDB::fetch_by_id_with(
+        &state.get_db(),
+        &claims.sub,
+        "Failed to read rotation owner",
+        || AuthError::UserNotFound.into(),
     )
     .await?;
-
+    let method = &payload["unlockMethodData"];
+    if method["unlockMethod"] != 1 ||
+        method
+            .get("keyConnectorKeyWrappedUserKey")
+            .is_some_and(|v| !v.is_null())
+    {
+        return Err(AppError::bad_request(
+            "Only master password unlock is supported",
+        ));
+    }
+    let unlock: crate::models::user::UnlockData =
+        serde_json::from_value(method["masterPasswordUnlockData"].clone())
+            .map_err(|_| {
+                AppError::bad_request("MasterPasswordUnlockData is required")
+            })?;
+    if unlock.salt != user.email ||
+        unlock.kdf.kdf_type != user.kdf_type ||
+        unlock.kdf.iterations != user.kdf_iterations ||
+        unlock.kdf.memory != user.kdf_memory ||
+        unlock.kdf.parallelism != user.kdf_parallelism ||
+        user.master_password_hash.is_empty()
+    {
+        return Err(AppError::bad_request(
+            "Invalid master password unlock data",
+        ));
+    }
+    let state_keys = &payload["wrappedAccountCryptographicState"];
+    let pair = &state_keys["publicKeyEncryptionKeyPair"];
+    let keys:crate::models::account_keys::AccountKeysData=serde_json::from_value(json!({"userKeyEncryptedAccountPrivateKey":pair["wrappedPrivateKey"],"accountPublicKey":pair["publicKey"],"publicKeyEncryptionKeyPair":pair,"signatureKeyPair":state_keys["signatureKeyPair"],"securityState":state_keys["securityState"]})).map_err(|_|AppError::bad_request("Invalid V2 account keys"))?;
+    let keys = keys.validate()?;
+    if !keys.is_v2() {
+        return Err(AppError::bad_request("V2 account keys are required"));
+    }
+    let old = payload["oldUserKeyId"].as_str().map(str::to_string);
+    let new = payload["newUserKeyId"].as_str().map(str::to_string);
+    if unlock.contained_key_id != new {
+        return Err(AppError::bad_request(
+            "Contained key id must match the new user key id",
+        ));
+    }
+    let common = &payload["unlockData"];
+    for field in [
+        "emergencyAccessUnlockData",
+        "organizationAccountRecoveryUnlockData",
+        "deviceKeyUnlockData",
+    ] {
+        if common[field]
+            .as_array()
+            .is_some_and(|items| !items.is_empty())
+        {
+            return Err(AppError::bad_request("Unsupported unlock method"));
+        }
+    }
+    let data = serde_json::from_value(payload["accountData"].clone())
+        .map_err(|_| AppError::bad_request("Invalid account rotation data"))?;
+    let input = crate::api::service::account_keys::RotationInput {
+        keys,
+        data,
+        wrapped_user_key: unlock.master_key_wrapped_user_key,
+        old_user_key_id: old,
+        new_user_key_id: new,
+        upgrade: common
+            .get("v2UpgradeToken")
+            .filter(|v| !v.is_null())
+            .cloned(),
+        passkeys: common["passkeyUnlockData"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default(),
+        password: None,
+    };
+    crate::api::service::account_keys::rotate(&state, &claims, &user, input)
+        .await?;
     Ok(Json(json!({})))
+}
+
+#[worker::send]
+pub async fn get_key_rotation_data(
+    claims: Claims,
+    State(state): State<AppState>,
+) -> Result<Json<Value>, AppError> {
+    let keys = crate::models::webauthn::CredentialDB::list(
+        &state.get_db(),
+        &claims.sub,
+        "login",
+    )
+    .await?;
+    let passkeys=keys.into_iter().filter(|key|key.encrypted_user_key.as_ref().is_some_and(|s|!s.is_empty())&&key.encrypted_private_key.as_ref().is_some_and(|s|!s.is_empty())).map(|key|json!({"id":key.slot.to_string(),"encryptedPublicKey":key.encrypted_public_key,"encryptedUserKey":key.encrypted_user_key,"object":"passkeyKeyData"})).collect::<Vec<_>>();
+    Ok(Json(
+        json!({"organizationPasswordResetKeyData":[],"emergencyAccessKeyData":[],"trustedDeviceKeyData":[],"passkeyKeyData":passkeys,"object":"keyRotationData"}),
+    ))
+}
+
+#[worker::send]
+pub async fn get_account_public_keys(
+    _claims: Claims,
+    State(state): State<AppState>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+) -> Result<Json<Value>, AppError> {
+    let user = UserDB::fetch_by_id_with(
+        &state.get_db(),
+        &id,
+        "Failed to read public keys",
+        || AppError::not_found("User"),
+    )
+    .await?;
+    if user.public_key.is_empty() {
+        return Err(AppError::not_found("Public key"));
+    }
+    let signature = user
+        .signature_key_pair
+        .as_deref()
+        .and_then(|v| serde_json::from_str::<Value>(v).ok())
+        .filter(|_| user.is_v2());
+    Ok(Json(
+        json!({"publicKey":user.public_key,"signedPublicKey":user.signed_public_key,"verifyingKey":signature.as_ref().map(|v|v["verifyingKey"].clone()),"object":"publicKeys"}),
+    ))
 }
 
 /// POST /accounts/kdf - Change KDF settings (PBKDF2 <-> Argon2id)
@@ -649,8 +765,6 @@ pub async fn post_kdf(
             .await?;
 
     // Generate new security stamp
-    let new_security_stamp = Uuid::new_v4().to_string();
-    let now = Utc::now().to_rfc3339();
 
     // Determine kdf_memory and kdf_parallelism based on KDF type
     let (final_kdf_memory, final_kdf_parallelism) =
@@ -665,9 +779,10 @@ pub async fn post_kdf(
     let new_key = payload.get_new_key();
 
     // Update user record with new KDF settings and password
-    UserDB::update_kdf_settings(
-        &db,
-        user_id,
+    crate::api::service::account_keys::change_credentials(
+        &state,
+        &claims,
+        &user,
         &new_hashed_password,
         &new_salt,
         new_key,
@@ -675,10 +790,10 @@ pub async fn post_kdf(
         kdf_iterations,
         final_kdf_memory,
         final_kdf_parallelism,
-        &new_security_stamp,
-        &now,
+        user.master_password_hint.as_deref(),
     )
     .await?;
 
+    admin_notify::emit(&state.env, Event::KdfChange, &claims.sub).await;
     Ok(Json(json!({})))
 }

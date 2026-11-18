@@ -1,9 +1,11 @@
 use axum::{
     Router,
+    extract::DefaultBodyLimit,
     routing::{
         delete,
         get,
         post,
+        put,
     },
 };
 
@@ -20,11 +22,33 @@ pub fn attachment_router() -> Router<AppState> {
         )
         .route(
             "/api/ciphers/{id}/attachment",
-            post(attachments::upload_attachment_legacy),
+            post(attachments::upload_attachment_legacy)
+                .layer(DefaultBodyLimit::disable()),
         )
         .route(
             "/api/ciphers/{id}/attachment/{attachment_id}",
-            post(attachments::upload_attachment_v2_data),
+            post(attachments::upload_attachment_v2_data)
+                .layer(DefaultBodyLimit::disable()),
+        )
+        .route(
+            "/ciphers/{id}/attachment/{attachment_id}",
+            post(attachments::upload_attachment_v2_data)
+                .layer(DefaultBodyLimit::disable()),
+        )
+        .route(
+            "/api/ciphers/{id}/attachment/{attachment_id}/azure-upload",
+            put(attachments::upload_attachment_azure)
+                .layer(DefaultBodyLimit::disable()),
+        )
+        .route(
+            "/api/ciphers/{id}/attachment/{attachment_id}/download",
+            get(attachments::download_attachment)
+                .head(attachments::download_attachment),
+        )
+        .route(
+            "/attachments/{id}/{attachment_id}",
+            get(attachments::download_attachment)
+                .head(attachments::download_attachment),
         )
         .route(
             "/api/ciphers/{id}/attachment/{attachment_id}",

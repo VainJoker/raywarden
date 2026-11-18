@@ -1,0 +1,133 @@
+/** JWT persistence and API-key wrapping against compiled Rust and real SQLite. */
+export async function runJwtCompatibility({ fixture, check, accessToken, USER, CIPHER, FILE, sql }) {
+  const encoder = new TextEncoder();
+  const equal = (actual, expected, label = "value") => {
+    if (actual !== expected) throw new Error(`${label}: expected ${expected}, received ${actual}`);
+  };
+  const expectStatus = async (response, expected) => {
+    if (response.status !== expected) throw new Error(`Expected HTTP ${expected}, received ${response.status}: ${await response.text()}`);
+    return response;
+  };
+  const row = () => sql.exec("SELECT access_secret,refresh_secret FROM jwt_keys WHERE id='global'").toArray()[0];
+  const empty = () => sql.exec("DELETE FROM users; DELETE FROM jwt_keys;");
+  const bytes = value => Uint8Array.from(atob(value.replaceAll("-", "+").replaceAll("_", "/")), byte => byte.charCodeAt(0));
+  const base64 = value => btoa(String.fromCharCode(...value)).replaceAll("+", "-").replaceAll("/", "_").replace(/=+$/, "");
+  async function aesKey(secret, version) {
+    let raw;
+    if (version === "v2") {
+      const hmac = await crypto.subtle.importKey("raw", encoder.encode(secret), { name: "HMAC", hash: "SHA-256" }, false, ["sign"]);
+      raw = await crypto.subtle.sign("HMAC", hmac, encoder.encode("raywarden/api-key-encryption/v2"));
+    } else raw = await crypto.subtle.digest("SHA-256", encoder.encode(secret));
+    return crypto.subtle.importKey("raw", raw, "AES-GCM", false, ["encrypt", "decrypt"]);
+  }
+  const apiKey = async (f, rotate = false) => f.fetch(`/api/accounts/${rotate ? "rotate-api-key" : "api-key"}`, {
+    method: "POST", headers: { Authorization: `Bearer ${await accessToken()}`, "Content-Type": "application/json" },
+    body: JSON.stringify({ masterPasswordHash: "hash" }),
+  });
+
+  await check("stored JWT keys stay authoritative despite broken legacy bindings", async () => {
+    const f = fixture(), before = JSON.stringify(row());
+    Object.defineProperty(f.env, "JWT_SECRET", { get() { throw new Error("unreadable obsolete binding"); } });
+    f.env.JWT_REFRESH_SECRET = { malformed: true };
+    await expectStatus(await f.fetch("/api/alive"), 200);
+    equal(JSON.stringify(row()), before);
+  });
+
+  await check("invalid configured JWT lifetimes fail before serving authenticated APIs", async () => {
+    for (const duration of ["0", "-1", "not-seconds", "9223372036854775807", "18446744073709551615"]) {
+      const f = fixture(), before = JSON.stringify(row()); f.env.JWT_DURATION_SECONDS = duration;
+      await expectStatus(await f.fetch("/api/alive"), 500);
+      equal(JSON.stringify(row()), before);
+    }
+    const f = fixture(); f.env.JWT_DURATION_SECONDS = "1800";
+    await expectStatus(await f.fetch("/api/alive"), 200);
+  });
+
+  await check("concurrent empty-database initialization persists one random winner", async () => {
+    const f = fixture(); empty();
+    for (const response of await Promise.all([f.fetch("/api/alive"), f.fetch("/api/alive")])) await expectStatus(response, 200);
+    const keys = row();
+    equal(bytes(keys.access_secret).length, 64); equal(bytes(keys.refresh_secret).length, 64);
+    if (keys.access_secret === keys.refresh_secret) throw new Error("independent JWT keys collided");
+    equal(sql.exec("SELECT count(*) AS n FROM jwt_keys").one().n, 1);
+    await expectStatus(await f.fetch("/api/alive"), 200);
+    equal(JSON.stringify(row()), JSON.stringify(keys));
+  });
+
+  await check("a populated database cannot replace missing keys without explicit legacy import", async () => {
+    const f = fixture(); sql.exec("DELETE FROM jwt_keys;");
+    await expectStatus(await f.fetch("/api/alive"), 500);
+    equal(row(), undefined);
+    f.env.JWT_SECRET = " original access "; f.env.JWT_REFRESH_SECRET = " original refresh ";
+    await expectStatus(await f.fetch("/api/alive"), 200);
+    equal(row().access_secret, f.env.JWT_SECRET); equal(row().refresh_secret, f.env.JWT_REFRESH_SECRET);
+  });
+
+  await check("partial, empty and non-string legacy bindings fail without generating keys", async () => {
+    for (const bindings of [
+      { JWT_SECRET: "one" }, { JWT_REFRESH_SECRET: "one" },
+      { JWT_SECRET: "", JWT_REFRESH_SECRET: "two" },
+      { JWT_SECRET: "one", JWT_REFRESH_SECRET: " " },
+      { JWT_SECRET: {}, JWT_REFRESH_SECRET: {} },
+      { JWT_SECRET: null, JWT_REFRESH_SECRET: null },
+    ]) {
+      const f = fixture(); empty(); Object.assign(f.env, bindings);
+      const response = await f.fetch("/api/alive");
+      if (response.status < 400) throw new Error(`Invalid legacy bindings returned HTTP ${response.status}`);
+      equal(row(), undefined);
+    }
+  });
+
+  await check("a JWT-key read failure never initializes or overwrites keys", async () => {
+    const f = fixture(), before = JSON.stringify(row()), prepare = f.db.prepare.bind(f.db);
+    f.db.prepare = query => {
+      if (query.startsWith("SELECT access_secret, refresh_secret FROM jwt_keys")) return {
+        ...prepare(query), async first() { throw new Error("fixture D1 read failure"); },
+      };
+      return prepare(query);
+    };
+    await expectStatus(await f.fetch("/api/alive"), 500);
+    equal(JSON.stringify(row()), before);
+    if (f.db.queries.some(query => query.startsWith("INSERT OR IGNORE INTO jwt_keys"))) throw new Error("read error entered the initialization path");
+  });
+
+  await check("legacy exp-only attachment tokens retain 64-bit dates and cannot become user access tokens", async () => {
+    const f = fixture(), secret = row().access_secret;
+    const header = base64(encoder.encode('{"alg":"HS256","typ":"JWT"}'));
+    const body = base64(encoder.encode(JSON.stringify({ sub: USER, cipher_id: CIPHER, attachment_id: FILE, exp: 4294967595 })));
+    const key = await crypto.subtle.importKey("raw", encoder.encode(secret), { name: "HMAC", hash: "SHA-256" }, false, ["sign"]);
+    const signed = `${header}.${body}.${base64(new Uint8Array(await crypto.subtle.sign("HMAC", key, encoder.encode(`${header}.${body}`))))}`;
+    const download = `/api/ciphers/${CIPHER}/attachment/${FILE}/download?token=`;
+    const response = await expectStatus(await f.fetch(download + signed), 200);
+    equal((await response.arrayBuffer()).byteLength, 6);
+    await expectStatus(await f.fetch("/api/accounts/profile", { headers: { Authorization: `Bearer ${signed}` } }), 401);
+    await expectStatus(await f.fetch(download + await accessToken()), 401);
+  });
+
+  await check("legacy API-key ciphertext remains readable without rewriting its row", async () => {
+    const f = fixture(), secret = row().access_secret, value = "legacy-api-secret";
+    const nonce = new Uint8Array([0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]);
+    const encrypted = new Uint8Array(await crypto.subtle.encrypt({ name: "AES-GCM", iv: nonce, additionalData: encoder.encode(USER) }, await aesKey(secret, "legacy"), encoder.encode(value)));
+    const packed = new Uint8Array(nonce.length + encrypted.length); packed.set(nonce); packed.set(encrypted, nonce.length);
+    const ciphertext = base64(packed), hash = Array.from(new Uint8Array(await crypto.subtle.digest("SHA-256", encoder.encode(value))), byte => byte.toString(16).padStart(2, "0")).join("");
+    sql.exec("INSERT INTO user_api_keys(user_id,encrypted_key,key_hash,updated_at) VALUES(?,?,?,'legacy-time')", USER, ciphertext, hash);
+    const response = await (await expectStatus(await apiKey(f), 200)).json();
+    equal(response.apiKey, value); equal(response.revisionDate, "legacy-time");
+    equal(sql.exec("SELECT encrypted_key FROM user_api_keys WHERE user_id=?", USER).one().encrypted_key, ciphertext);
+  });
+
+  await check("new API-key ciphertext uses v2 domain separation and survives later requests", async () => {
+    const f = fixture(), secret = row().access_secret;
+    const first = await (await expectStatus(await apiKey(f), 200)).json();
+    const ciphertext = sql.exec("SELECT encrypted_key FROM user_api_keys WHERE user_id=?", USER).one().encrypted_key;
+    if (!ciphertext.startsWith("v2.")) throw new Error("new API key did not use v2 ciphertext");
+    const packed = bytes(ciphertext.slice(3));
+    const opened = await crypto.subtle.decrypt({ name: "AES-GCM", iv: packed.subarray(0, 12), additionalData: encoder.encode(USER) }, await aesKey(secret, "v2"), packed.subarray(12));
+    equal(new TextDecoder().decode(opened), first.apiKey);
+    const second = await (await expectStatus(await apiKey(f), 200)).json();
+    equal(second.apiKey, first.apiKey);
+    equal(sql.exec("SELECT encrypted_key FROM user_api_keys WHERE user_id=?", USER).one().encrypted_key, ciphertext);
+    const rotated = await (await expectStatus(await apiKey(f, true), 200)).json();
+    if (rotated.apiKey === first.apiKey) throw new Error("explicit API-key rotation preserved the old credential");
+  });
+}

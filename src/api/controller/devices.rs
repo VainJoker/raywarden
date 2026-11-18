@@ -1,6 +1,17 @@
 use axum::{
     Json,
-    extract::Path,
+    extract::{
+        Path,
+        State,
+    },
+    http::HeaderMap,
+};
+use base64::{
+    Engine as _,
+    engine::general_purpose::{
+        URL_SAFE,
+        URL_SAFE_NO_PAD,
+    },
 };
 use serde::Deserialize;
 use serde_json::{
@@ -8,111 +19,206 @@ use serde_json::{
     json,
 };
 
-use crate::errors::AppError;
+use crate::{
+    api::{
+        AppState,
+        service::{
+            claims::Claims,
+            push,
+            rate,
+        },
+    },
+    errors::AppError,
+    models::{
+        auth_request::AuthRequestDB,
+        device::DeviceDB,
+        user::UserDB,
+    },
+};
 
-/// GET /devices
-///
-/// Returns an empty list of devices.
-/// Device tracking is not implemented in this minimal Bitwarden-compatible
-/// server. This does not affect authentication since we use stateless JWT
-/// tokens. Clients will show "No devices currently logged in" in the device
-/// management settings.
 #[worker::send]
-pub async fn get_devices() -> Json<Value> {
-    Json(json!({
-        "data": [],
-        "continuationToken": null,
-        "object": "list"
-    }))
+pub async fn get_devices(
+    claims: Claims,
+    State(state): State<AppState>,
+) -> Result<Json<Value>, AppError> {
+    let db = state.get_db();
+    let devices = DeviceDB::list_for_user(&db, &claims.sub).await?;
+    let requests =
+        AuthRequestDB::list_pending_for_user(&db, &claims.sub).await?;
+    let data: Vec<Value> = devices.iter().map(|device| {
+        let mut value = device.to_json();
+        value["devicePendingAuthRequest"] = requests.iter().find(|request| request.request_device_identifier == device.identifier).map_or(Value::Null, |request| json!({ "id": request.id, "creationDate": request.creation_date }));
+        value
+    }).collect();
+    Ok(Json(
+        json!({ "data": data, "continuationToken": null, "object": "list" }),
+    ))
 }
 
-/// GET /devices/knowndevice
-///
-/// Checks if a device is known to the server.
-/// Always returns false since we don't track devices.
-/// This is used by clients to determine if a device has been previously used.
-/// X-Request-Email and X-Device-Identifier headers are expected but we ignore
-/// them.
 #[worker::send]
-pub async fn get_known_device() -> Json<bool> {
-    // Always return false - we don't track devices
-    Json(false)
+pub async fn get_known_device(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<bool>, AppError> {
+    rate::check_rate_limit(
+        &state,
+        format!("known-device:{}", rate::client_ip(&headers)),
+    )
+    .await?;
+    let encoded = headers
+        .get("x-request-email")
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default();
+    let identifier = headers
+        .get("x-device-identifier")
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default();
+    let email = decode_email(encoded)?;
+    if identifier.is_empty() {
+        return Ok(Json(false));
+    }
+    let db = state.get_db();
+    let user = UserDB::fetch_by_email_with(
+        &db,
+        &email,
+        "Failed to find known device user",
+        || AppError::not_found("User"),
+    )
+    .await;
+    match user {
+        Ok(user) => Ok(Json(
+            DeviceDB::find_for_user(&db, &user.id, identifier)
+                .await?
+                .is_some(),
+        )),
+        Err(AppError::NotFound { .. }) => Ok(Json(false)),
+        Err(error) => Err(error),
+    }
 }
 
-/// GET /`devices/identifier/{device_id`}
-///
-/// Returns information about a specific device.
-/// Since we don't track devices, we return a 404-like error.
-/// However, to avoid client errors, we return an empty device stub.
+fn decode_email(encoded: &str) -> Result<String, AppError> {
+    let bytes = URL_SAFE_NO_PAD
+        .decode(encoded)
+        .or_else(|_| URL_SAFE.decode(encoded))
+        .map_err(|_| AppError::bad_request("Invalid X-Request-Email header"))?;
+    String::from_utf8(bytes)
+        .map(|email| email.trim().to_lowercase())
+        .map_err(|_| AppError::bad_request("Invalid X-Request-Email header"))
+}
+
 #[worker::send]
 pub async fn get_device(
+    claims: Claims,
+    State(state): State<AppState>,
     Path(device_id): Path<String>,
 ) -> Result<Json<Value>, AppError> {
-    // Return a minimal device stub to prevent client errors
-    // The client may request device info after login
-    Ok(Json(json!({
-        "id": device_id,
-        "name": "Unknown Device",
-        "type": 0,
-        "identifier": device_id,
-        "creationDate": "2000-01-01T00:00:00.000Z",
-        "object": "device"
-    })))
+    let device =
+        DeviceDB::find_for_user(&state.get_db(), &claims.sub, &device_id)
+            .await?
+            .ok_or_else(|| AppError::not_found("Device"))?;
+    Ok(Json(device.to_json()))
 }
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PushToken {
-    #[allow(dead_code)]
     push_token: String,
 }
 
-/// POST /`devices/identifier/{device_id}/token`
-///
-/// Registers a push token for a device.
-/// We accept but ignore this since push notifications are not implemented.
+async fn set_token(
+    state: &AppState,
+    claims: &Claims,
+    device_id: &str,
+    token: Option<&str>,
+) -> Result<Json<Value>, AppError> {
+    if claims.device() != Some(device_id) {
+        return Err(AppError::bad_request(
+            "Can only update the authenticated device",
+        ));
+    }
+    if token.is_none() {
+        if let Err(error) =
+            push::unregister_device(&state.env, &claims.sub, device_id).await
+        {
+            log::warn!("Push device unregistration failed: {error}");
+        }
+    }
+    DeviceDB::set_push_token(&state.get_db(), &claims.sub, device_id, token)
+        .await?;
+    if token.is_some() {
+        push::register_device(&state.env, &claims.sub, device_id).await?;
+    }
+    Ok(Json(json!({})))
+}
+
 #[worker::send]
 pub async fn post_device_token(
-    Path(_device_id): Path<String>,
-    Json(_data): Json<PushToken>,
-) -> Json<Value> {
-    // Accept but ignore - push notifications not implemented
-    Json(json!({}))
+    claims: Claims,
+    State(state): State<AppState>,
+    Path(device_id): Path<String>,
+    Json(data): Json<PushToken>,
+) -> Result<Json<Value>, AppError> {
+    let token = data.push_token.trim();
+    if token.is_empty() || token.len() > 4096 {
+        return Err(AppError::bad_request("Invalid push token"));
+    }
+    set_token(&state, &claims, &device_id, Some(token)).await
 }
 
-/// PUT /`devices/identifier/{device_id}/token`
-///
-/// Updates a push token for a device.
-/// We accept but ignore this since push notifications are not implemented.
 #[worker::send]
 pub async fn put_device_token(
-    Path(_device_id): Path<String>,
-    Json(_data): Json<PushToken>,
-) -> Json<Value> {
-    // Accept but ignore - push notifications not implemented
-    Json(json!({}))
+    claims: Claims,
+    state: State<AppState>,
+    path: Path<String>,
+    payload: Json<PushToken>,
+) -> Result<Json<Value>, AppError> {
+    post_device_token(claims, state, path, payload).await
 }
 
-/// PUT /devices/identifier/{device_id}/clear-token
-///
-/// Clears the push token for a device.
-/// We accept but ignore this since push notifications are not implemented.
 #[worker::send]
 pub async fn put_clear_device_token(
-    Path(_device_id): Path<String>,
-) -> Json<Value> {
-    // Accept but ignore - push notifications not implemented
-    Json(json!({}))
+    claims: Claims,
+    State(state): State<AppState>,
+    Path(device_id): Path<String>,
+) -> Result<Json<Value>, AppError> {
+    set_token(&state, &claims, &device_id, None).await
 }
 
-/// POST /devices/identifier/{device_id}/clear-token
-///
-/// Clears the push token for a device.
-/// We accept but ignore this since push notifications are not implemented.
 #[worker::send]
 pub async fn post_clear_device_token(
-    Path(_device_id): Path<String>,
-) -> Json<Value> {
-    // Accept but ignore - push notifications not implemented
-    Json(json!({}))
+    claims: Claims,
+    state: State<AppState>,
+    path: Path<String>,
+) -> Result<Json<Value>, AppError> {
+    put_clear_device_token(claims, state, path).await
+}
+
+#[worker::send]
+pub async fn delete_device(
+    claims: Claims,
+    State(state): State<AppState>,
+    Path(device_id): Path<String>,
+) -> Result<Json<Value>, AppError> {
+    if let Err(error) =
+        push::unregister_device(&state.env, &claims.sub, &device_id).await
+    {
+        log::warn!("Push device unregistration failed: {error}");
+    }
+    DeviceDB::delete_for_user(&state.get_db(), &claims.sub, &device_id).await?;
+    Ok(Json(json!({})))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn known_device_accepts_padded_and_unpadded_email() {
+        for engine in [URL_SAFE, URL_SAFE_NO_PAD] {
+            assert_eq!(
+                decode_email(&engine.encode(" User@Example.com ")).unwrap(),
+                "user@example.com"
+            );
+        }
+        assert!(decode_email("%bad").is_err());
+    }
 }

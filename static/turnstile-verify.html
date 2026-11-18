@@ -1,0 +1,17 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Verify access to Send</title>
+<style>body{font-family:system-ui,sans-serif;background:#f4f6fa;color:#15243b;display:grid;place-items:center;min-height:100vh;margin:0}main{max-width:420px;background:white;padding:2rem;border-radius:1rem;box-shadow:0 8px 30px #15243b18}p{line-height:1.5}#error{color:#a21725}</style></head>
+<body><main><h1>Verify access to Send</h1><p>Complete this check to continue to the encrypted Send.</p><div id="challenge"></div><p id="error" role="alert"></p></main>
+<script>
+// Keep the return URL (which can contain the Send decryption key) in the
+// fragment. It is never included in an HTTP request to this page.
+const params=new URLSearchParams(location.search);
+let requested='/';
+try{requested=decodeURIComponent(location.hash.slice(1))||'/';}catch{}
+let target='/';
+try{const url=new URL(requested,location.origin);if(url.origin===location.origin)target=url.href;}catch{}
+history.replaceState(null,'',location.pathname+location.search);
+function render(){turnstile.render('#challenge',{sitekey:'__RAYWARDEN_TURNSTILE_SITE_KEY__',action:'send-access',callback:async function(token){
+ try{const response=await fetch('/api/send-verify',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({token,sendId:params.get('sendId')||''})});if(!response.ok)throw new Error('Verification failed. Please try again.');location.assign(target);}catch(error){document.querySelector('#error').textContent=error.message;turnstile.reset();}
+}})}
+</script><script src="https://challenges.cloudflare.com/turnstile/v0/api.js?onload=render&amp;render=explicit" async defer></script></body></html>

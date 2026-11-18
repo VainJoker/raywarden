@@ -1,0 +1,131 @@
+//! Web Vault presentation preferences. These never authorize an API operation.
+use worker::Env;
+
+use crate::infra::config::{
+    env_bool,
+    env_text,
+};
+
+pub(crate) fn suppress_onboarding(env: &Env) -> bool {
+    env_bool(env, "CLIENT_SUPPRESS_ONBOARDING", false)
+}
+
+pub(crate) fn stylesheet(env: &Env, registration_disabled: bool) -> String {
+    let signup_disabled =
+        env_bool(env, "VW_CSS_SIGNUP_DISABLED", registration_disabled);
+    let sends_allowed = env_bool(env, "VW_CSS_SENDS_ALLOWED", true);
+    let hints_allowed = env_bool(env, "VW_CSS_PASSWORD_HINTS_ALLOWED", true);
+    let sso_enabled = env_bool(env, "VW_CSS_SSO_ENABLED", false);
+    let sso_only = env_bool(env, "VW_CSS_SSO_ONLY", false);
+    let passkey_2fa = env_bool(env, "VW_CSS_PASSKEY_2FA_SUPPORTED", true);
+    let passkey_login = env_bool(
+        env,
+        "VW_CSS_PASSKEY_LOGIN_ENABLED",
+        env_bool(env, "PASSKEY_LOGIN_ENABLED", true),
+    );
+    let remember_disabled =
+        env_bool(env, "VW_CSS_REMEMBER_2FA_DISABLED", false);
+    let mail_enabled = env_bool(
+        env,
+        "VW_CSS_MAIL_ENABLED",
+        env_text(env, "MAIL_WEBHOOK_URL").is_some(),
+    );
+    let mail_2fa = env_bool(env, "VW_CSS_MAIL_2FA_ENABLED", true);
+    let yubico_enabled = env_bool(env, "VW_CSS_YUBICO_ENABLED", false);
+    let duo_enabled = env_bool(env, "VW_CSS_DUO_ENABLED", false);
+    let emergency_allowed =
+        env_bool(env, "VW_CSS_EMERGENCY_ACCESS_ALLOWED", false);
+    let user_css = if env_bool(env, "VW_CSS_LOAD_USER_CSS", true) {
+        env_text(env, "VW_CSS_USER")
+    } else {
+        None
+    };
+
+    let rules = [
+        (!sso_enabled, ".vw-sso-login, .vw-email-sso"),
+        (sso_enabled, ".vw-email-continue, .vw-continue-login"),
+        (!sso_enabled || sso_only, ".vw-or-text, .vw-other-login"),
+        (
+            signup_disabled,
+            "a[routerlink=\"/signup\"], a[href*=\"/signup\"]",
+        ),
+        (!sends_allowed, "bit-nav-item[route=\"sends\"]"),
+        (!hints_allowed, "a[routerlink=\"/hint\"], .vw-password-hint"),
+        (!passkey_2fa, ".providers-2fa-7"),
+        (
+            !passkey_login,
+            ".vw-passkey-login, app-login-via-webauthn, \
+             app-webauthn-login-settings",
+        ),
+        (
+            remember_disabled,
+            "app-two-factor-auth > form > bit-form-control",
+        ),
+        (!mail_enabled || !mail_2fa, ".providers-2fa-1"),
+        (!yubico_enabled, ".providers-2fa-3"),
+        (!duo_enabled, ".providers-2fa-2"),
+        (
+            !emergency_allowed,
+            "bit-nav-item[route=\"settings/emergency-access\"]",
+        ),
+    ];
+    render_stylesheet(
+        rules
+            .into_iter()
+            .filter_map(|(hide, selectors)| hide.then_some(selectors)),
+        user_css.as_deref(),
+    )
+}
+
+fn render_stylesheet<'a>(
+    hidden: impl IntoIterator<Item = &'a str>,
+    user_css: Option<&str>,
+) -> String {
+    let mut css =
+        include_str!("../../../static/overrides/vaultwarden.css").to_string();
+    for selectors in hidden {
+        css.push('\n');
+        css.push_str(selectors);
+        css.push_str(" { display:none !important; }\n");
+    }
+    if let Some(custom) = user_css {
+        css.push('\n');
+        css.push_str(custom);
+    }
+    css
+}
+
+#[cfg(test)]
+mod tests {
+    use super::render_stylesheet;
+
+    #[test]
+    fn configurable_features_have_no_unconditional_base_hiding() {
+        let css = render_stylesheet([], None);
+        for configurable in [
+            ".vw-sso-login",
+            ".vw-email-sso",
+            ".vw-or-text",
+            ".vw-other-login",
+            ".providers-2fa-1",
+            ".providers-2fa-2",
+            ".providers-2fa-3",
+            ".providers-2fa-7",
+            ".vw-passkey-login",
+            "settings/emergency-access",
+        ] {
+            assert!(!css.contains(configurable), "{configurable}");
+        }
+        assert!(css.contains("settings/subscription"));
+        assert!(css.contains("../images/icon-white.svg"));
+    }
+
+    #[test]
+    fn custom_css_follows_generated_rules_and_is_optional() {
+        let custom = ".providers-2fa-2 { display:block !important; }";
+        let css = render_stylesheet([".providers-2fa-2"], Some(custom));
+        assert!(css.ends_with(custom));
+        assert!(css.contains(".providers-2fa-2 { display:none !important; }"));
+        assert!(!render_stylesheet([], None).contains(custom));
+    }
+}

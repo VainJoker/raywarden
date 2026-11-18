@@ -1,7 +1,4 @@
-use std::{
-    collections::HashSet,
-    sync::Arc,
-};
+use std::collections::HashSet;
 
 use axum::{
     extract::FromRequestParts,
@@ -14,7 +11,6 @@ use serde::{
     Deserialize,
     Serialize,
 };
-use worker::Env;
 
 use crate::{
     api::AppState,
@@ -22,9 +18,13 @@ use crate::{
         AppError,
         AuthError,
     },
-    infra::{
+    infra::jwt::{
         ValidationOptions,
         decode,
+    },
+    models::device::{
+        DeviceDB,
+        SessionSnapshot,
     },
 };
 
@@ -49,10 +49,16 @@ pub struct ClaimsExtensions {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Claims {
     // Required standard claims
-    pub sub: String, // User ID
-    pub exp: i64,    // Expiration time (Unix timestamp)
-    pub nbf: i64,    // Not before time (Unix timestamp)
-    pub iat: i64,    // Issued at time (Unix timestamp)
+    pub sub:           String, // User ID
+    pub exp:           i64,    // Expiration time (Unix timestamp)
+    pub nbf:           i64,    // Not before time (Unix timestamp)
+    pub iat:           i64,    // Issued at time (Unix timestamp)
+    #[serde(default)]
+    pub sstamp:        String,
+    #[serde(default)]
+    pub session_token: String,
+    #[serde(default)]
+    pub token_use:     String,
 
     // Application-specific claims
     #[serde(flatten)]
@@ -74,13 +80,18 @@ impl Claims {
         device: Option<String>,
         duration_seconds: i64,
     ) -> Self {
-        let now = chrono::Utc::now().timestamp();
+        let now = crate::infra::time::now_seconds();
         Self {
-            sub:        user_id,
-            exp:        now + duration_seconds,
-            nbf:        now,
-            iat:        now,
-            extensions: ClaimsExtensions {
+            sub:           user_id,
+            // Runtime configuration validates durations before issuance. Keep
+            // this constructor safe for any other caller as well.
+            exp:           now.checked_add(duration_seconds).unwrap_or(now),
+            nbf:           now,
+            iat:           now,
+            sstamp:        String::new(),
+            session_token: String::new(),
+            token_use:     String::new(),
+            extensions:    ClaimsExtensions {
                 premium: Some(premium),
                 name: Some(name),
                 email: Some(email),
@@ -119,106 +130,148 @@ impl Claims {
     }
 }
 
-/// `AuthUser` extractor - provides (`user_id`, email) tuple
-pub struct AuthUser(pub String, pub String);
+fn bearer_token(parts: &Parts) -> Result<&str, AppError> {
+    parts
+        .headers
+        .get(header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.strip_prefix("Bearer "))
+        .filter(|value| !value.is_empty())
+        .ok_or(AppError::Auth(AuthError::MissingToken))
+}
 
-// ============================================================================
-// Axum Extractors
-// ============================================================================
+impl Claims {
+    pub fn validate_purpose(&self, purpose: &str) -> Result<(), AppError> {
+        if self.token_use != purpose ||
+            self.sstamp.is_empty() ||
+            self.session_token.is_empty() ||
+            self.device().is_none_or(str::is_empty)
+        {
+            return Err(AppError::Auth(AuthError::InvalidCredentials(
+                "Invalid session token".to_string(),
+            )));
+        }
+        Ok(())
+    }
 
-impl FromRequestParts<Arc<Env>> for Claims {
-    type Rejection = AppError;
+    pub fn session_snapshot(&self) -> Result<SessionSnapshot<'_>, AppError> {
+        self.validate_purpose("access")?;
+        Ok(SessionSnapshot {
+            user_id:        &self.sub,
+            security_stamp: &self.sstamp,
+            device_id:      self.device().unwrap_or_default(),
+            session_token:  &self.session_token,
+        })
+    }
 
-    async fn from_request_parts(
-        parts: &mut Parts,
-        state: &Arc<Env>,
-    ) -> Result<Self, Self::Rejection> {
-        // Extract the token from the authorization header
-        let token = parts
-            .headers
-            .get(header::AUTHORIZATION)
-            .and_then(|auth_header| auth_header.to_str().ok())
-            .and_then(|auth_value| {
-                auth_value
-                    .strip_prefix("Bearer ")
-                    .map(std::borrow::ToOwned::to_owned)
-            })
-            .ok_or_else(|| AppError::Auth(AuthError::MissingToken))?;
-
-        let secret = state.secret("JWT_SECRET")?;
-        let secret_bytes = secret.to_string();
-
-        // Decode and validate the token (synchronous - no Send issues)
-        // Use secret bytes directly to minimize memory exposure
-        let token_data = decode::<Self>(
-            &token,
-            secret_bytes.as_bytes(),
-            &ValidationOptions::default(),
+    pub async fn validate_session(
+        &self,
+        db: &worker::D1Database,
+        purpose: &str,
+    ) -> Result<(), AppError> {
+        self.validate_purpose(purpose)?;
+        DeviceDB::validate_session(
+            db,
+            &self.sub,
+            self.device().unwrap_or_default(),
+            &self.session_token,
+            &self.sstamp,
         )
-        .map_err(AppError::from)?;
-
-        Ok(token_data.claims)
+        .await
     }
 }
 
-impl FromRequestParts<Arc<Env>> for AuthUser {
-    type Rejection = AppError;
-
-    async fn from_request_parts(
-        parts: &mut Parts,
-        state: &Arc<Env>,
-    ) -> Result<Self, Self::Rejection> {
-        let claims = Claims::from_request_parts(parts, state).await?;
-        let email = claims.email().unwrap_or("").to_string();
-        Ok(Self(claims.sub, email))
-    }
-}
-
-// Also allow extracting Claims/AuthUser when the application state is
-// `AppState`. This mirrors the Arc<Env> implementations above but reads the Env
-// from AppState.
 impl FromRequestParts<AppState> for Claims {
     type Rejection = AppError;
 
+    #[worker::send]
     async fn from_request_parts(
         parts: &mut Parts,
         state: &AppState,
     ) -> Result<Self, Self::Rejection> {
-        // Extract the token from the authorization header
-        let token = parts
-            .headers
-            .get(header::AUTHORIZATION)
-            .and_then(|auth_header| auth_header.to_str().ok())
-            .and_then(|auth_value| {
-                auth_value
-                    .strip_prefix("Bearer ")
-                    .map(std::borrow::ToOwned::to_owned)
-            })
-            .ok_or_else(|| AppError::Auth(AuthError::MissingToken))?;
-
-        let secret = state.config.jwt_secret.clone();
-        let secret_bytes = secret.clone();
-
-        let token_data = decode::<Self>(
-            &token,
-            secret_bytes.as_bytes(),
+        let claims = decode::<Self>(
+            bearer_token(parts)?,
+            state.config.jwt_secret.as_bytes(),
             &ValidationOptions::default(),
-        )
-        .map_err(AppError::from)?;
-
-        Ok(token_data.claims)
+        )?
+        .claims;
+        claims.validate_session(&state.get_db(), "access").await?;
+        Ok(claims)
     }
 }
 
-impl FromRequestParts<AppState> for AuthUser {
-    type Rejection = AppError;
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-    async fn from_request_parts(
-        parts: &mut Parts,
-        state: &AppState,
-    ) -> Result<Self, Self::Rejection> {
-        let claims = Claims::from_request_parts(parts, state).await?;
-        let email = claims.email().unwrap_or("").to_string();
-        Ok(Self(claims.sub, email))
+    #[test]
+    fn an_overflowing_duration_cannot_wrap_or_panic_during_token_issuance() {
+        let claims = Claims::new(
+            "user".into(),
+            "user@example.com".into(),
+            "User".into(),
+            false,
+            false,
+            HashSet::new(),
+            Some("device".into()),
+            i64::MAX,
+        );
+        assert_eq!(claims.exp, claims.iat);
+    }
+
+    #[test]
+    fn tokens_are_bound_to_purpose_and_session() {
+        let mut claims = Claims::new(
+            "user".into(),
+            "user@example.com".into(),
+            "User".into(),
+            true,
+            false,
+            HashSet::new(),
+            Some("device".into()),
+            3600,
+        );
+        assert!(claims.validate_purpose("access").is_err());
+        claims.sstamp = "stamp".into();
+        claims.session_token = "nonce".into();
+        claims.token_use = "access".into();
+        assert!(claims.validate_purpose("access").is_ok());
+        assert!(claims.validate_purpose("refresh").is_err());
+        claims.token_use = "send.access".into();
+        assert!(claims.validate_purpose("access").is_err());
+    }
+
+    #[test]
+    fn session_snapshot_preserves_bindings_and_requires_complete_access_claims()
+    {
+        let mut claims = Claims::new(
+            "user".into(),
+            "user@example.com".into(),
+            "User".into(),
+            false,
+            false,
+            HashSet::new(),
+            Some("device".into()),
+            3600,
+        );
+        assert!(claims.session_snapshot().is_err());
+        claims.token_use = "access".into();
+        claims.sstamp = "stamp".into();
+        claims.session_token = "nonce".into();
+        let session = claims.session_snapshot().unwrap();
+        assert_eq!(session.user_id, "user");
+        assert_eq!(session.security_stamp, "stamp");
+        assert_eq!(session.device_id, "device");
+        assert_eq!(session.session_token, "nonce");
+        for missing in 0..4 {
+            let mut invalid = claims.clone();
+            match missing {
+                0 => invalid.token_use = "refresh".into(),
+                1 => invalid.sstamp.clear(),
+                2 => invalid.session_token.clear(),
+                _ => invalid.extensions.device = None,
+            }
+            assert!(invalid.session_snapshot().is_err());
+        }
     }
 }

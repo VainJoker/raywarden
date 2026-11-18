@@ -1,7 +1,4 @@
-use chrono::{
-    Duration,
-    Utc,
-};
+use jiff::SignedDuration;
 use serde::{
     Deserialize,
     Serialize,
@@ -14,8 +11,11 @@ use crate::{
         AppError,
         DatabaseError,
     },
-    infra::DB,
-    models::serde_helpers::bool_from_int,
+    infra::db,
+    models::{
+        device::SessionSnapshot,
+        serde_helpers::bool_from_int,
+    },
 };
 
 /// Remember token expiration in days
@@ -117,15 +117,17 @@ impl TwoFactorDB {
         })
     }
 
-    /// Whether the user has 2FA enabled.
-    ///
-    /// For now, we intentionally only treat Authenticator (TOTP) as a real 2FA
-    /// provider. Remember-device tokens are never considered a 2FA method
-    /// by themselves.
+    /// Keep the existing login policy, including unknown legacy providers.
+    /// Remember-device tokens and internal records do not require a challenge.
+    pub const fn requires_login_challenge(&self) -> bool {
+        self.enabled &&
+            self.atype != TwoFactorType::Remember as i32 &&
+            self.atype < 1000
+    }
+
+    /// Whether the same providers used during login require a second factor.
     pub fn is_twofactor_enabled(twofactors: &[Self]) -> bool {
-        twofactors.iter().any(|tf| {
-            tf.enabled && tf.atype == TwoFactorType::Authenticator as i32
-        })
+        twofactors.iter().any(Self::requires_login_challenge)
     }
 
     pub async fn two_factor_enabled(
@@ -183,7 +185,7 @@ impl TwoFactorDB {
         let mut binds = vec![user_id.to_string().into()];
         binds.extend(types.iter().copied().map(Into::into));
 
-        DB::run_query(
+        db::run_query(
             async { db.prepare(sql).bind(&binds)?.run().await.map(|_| ()) },
             "Failed to delete twofactor entries",
         )
@@ -202,7 +204,7 @@ impl TwoFactorDB {
         db: &worker::D1Database,
         tf: &Self,
     ) -> Result<(), AppError> {
-        DB::run_query(
+        db::run_query(
             async {
                 query!(
                     db,
@@ -229,21 +231,135 @@ impl TwoFactorDB {
         uuid: &str,
         last_used: i64,
     ) -> Result<(), AppError> {
-        DB::run_query(
-            async {
+        let result = query!(
+            db,
+            "UPDATE twofactor SET last_used = ?1 WHERE uuid = ?2 AND enabled \
+             = 1 AND last_used < ?1",
+            last_used,
+            uuid
+        )?
+        .run()
+        .await?;
+        if result.meta()?.and_then(|meta| meta.changes).unwrap_or(0) != 1 {
+            return Err(crate::errors::AuthError::InvalidTotp.into());
+        }
+        Ok(())
+    }
+
+    pub async fn replace_authenticator(
+        db: &worker::D1Database,
+        session: &SessionSnapshot<'_>,
+        previous: Option<&Self>,
+        value: &Self,
+    ) -> Result<(), AppError> {
+        let previous = previous
+            .map(serde_json::to_string)
+            .transpose()
+            .map_err(|_| AppError::Internal)?;
+        let statements = vec![
+            query!(
+                db,
+                "INSERT INTO \
+                 twofactor(uuid,user_uuid,atype,enabled,data,last_used) \
+                 SELECT ?1,?2,0,?3,?4,?5 WHERE EXISTS (SELECT 1 FROM users u \
+                 JOIN devices d ON d.user_id=u.id WHERE u.id=?2 AND \
+                 u.security_stamp=?7 AND d.identifier=?8 AND \
+                 d.session_token=?9) AND ((?6 IS NULL AND NOT EXISTS (SELECT \
+                 1 FROM twofactor WHERE user_uuid=?2 AND atype=0)) OR EXISTS \
+                 (SELECT 1 FROM twofactor WHERE user_uuid=?2 AND atype=0 AND \
+                 uuid=json_extract(?6,'$.uuid') AND \
+                 data=json_extract(?6,'$.data') AND \
+                 enabled=json_extract(?6,'$.enabled') AND \
+                 last_used=json_extract(?6,'$.last_used'))) ON \
+                 CONFLICT(user_uuid,atype) DO UPDATE SET \
+                 uuid=excluded.uuid,enabled=excluded.enabled, \
+                 data=excluded.data,last_used=excluded.last_used",
+                value.uuid,
+                session.user_id,
+                i32::from(value.enabled),
+                value.data,
+                value.last_used,
+                previous,
+                session.security_stamp,
+                session.device_id,
+                session.session_token
+            )?,
+            db.prepare(
+                "SELECT CASE WHEN changes()=1 THEN 1 ELSE json_extract('[]', \
+                 'RAY_TOTP_WRITE_CONFLICT') END",
+            ),
+            query!(
+                db,
+                "DELETE FROM twofactor WHERE user_uuid=?1 AND atype=5 AND \
+                 EXISTS (SELECT 1 FROM twofactor WHERE uuid=?2)",
+                session.user_id,
+                value.uuid
+            )?,
+        ];
+        let result = db.batch(statements).await.map_err(totp_write_error)?;
+        if result
+            .first()
+            .and_then(|r| r.meta().ok().flatten())
+            .and_then(|m| m.changes)
+            .unwrap_or(0) !=
+            1
+        {
+            return Err(AppError::conflict(
+                "Authenticator configuration changed; retry",
+            ));
+        }
+        Ok(())
+    }
+
+    pub async fn delete_authenticator_snapshot(
+        db: &worker::D1Database,
+        session: &SessionSnapshot<'_>,
+        previous: &Self,
+    ) -> Result<(), AppError> {
+        let result = db
+            .batch(vec![
                 query!(
                     db,
-                    "UPDATE twofactor SET last_used = ?1 WHERE uuid = ?2",
-                    last_used,
-                    uuid
-                )?
-                .run()
-                .await
-                .map(|_| ())
-            },
-            "Failed to update twofactor last_used",
-        )
-        .await
+                    "DELETE FROM twofactor WHERE uuid=?1 AND user_uuid=?2 AND \
+                     atype=0 AND data=?3 AND enabled=?4 AND last_used=?5 AND \
+                     EXISTS (SELECT 1 FROM users u JOIN devices d ON \
+                     d.user_id=u.id WHERE u.id=?2 AND u.security_stamp=?6 AND \
+                     d.identifier=?7 AND d.session_token=?8)",
+                    previous.uuid,
+                    session.user_id,
+                    previous.data,
+                    i32::from(previous.enabled),
+                    previous.last_used,
+                    session.security_stamp,
+                    session.device_id,
+                    session.session_token
+                )?,
+                db.prepare(
+                    "SELECT CASE WHEN changes()=1 THEN 1 ELSE \
+                     json_extract('[]', 'RAY_TOTP_WRITE_CONFLICT') END",
+                ),
+                query!(
+                    db,
+                    "DELETE FROM twofactor WHERE user_uuid=?1 AND atype=5 AND \
+                     NOT EXISTS (SELECT 1 FROM twofactor WHERE user_uuid=?1 \
+                     AND atype=0)",
+                    session.user_id
+                )?,
+            ])
+            .await
+            .map_err(totp_write_error)?;
+        if result
+            .first()
+            .and_then(|r| r.meta().ok().flatten())
+            .and_then(|m| m.changes)
+            .unwrap_or(0) !=
+            1
+        {
+            return Err(AppError::conflict(
+                "Authenticator configuration changed; retry",
+            ));
+        }
+        Ok(())
     }
 
     pub async fn update_data(
@@ -251,7 +367,7 @@ impl TwoFactorDB {
         uuid: &str,
         data: &str,
     ) -> Result<(), AppError> {
-        DB::run_query(
+        db::run_query(
             async {
                 query!(
                     db,
@@ -272,7 +388,7 @@ impl TwoFactorDB {
         db: &worker::D1Database,
         user_id: &str,
     ) -> Result<(), AppError> {
-        DB::run_query(
+        db::run_query(
             async {
                 query!(
                     db,
@@ -293,7 +409,7 @@ impl TwoFactorDB {
         user_id: &str,
         json_data: &str,
     ) -> Result<(), AppError> {
-        DB::run_query(
+        db::run_query(
             async {
                 query!(
                     db,
@@ -316,24 +432,34 @@ impl TwoFactorDB {
     }
 }
 
+fn totp_write_error(error: worker::Error) -> AppError {
+    if error.to_string().contains("RAY_TOTP_WRITE_CONFLICT") {
+        AppError::conflict("Authenticator configuration changed; retry")
+    } else {
+        error.into()
+    }
+}
+
 /// POST /api/two-factor/authenticator - Enable TOTP
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct EnableAuthenticatorData {
-    pub key:                  String,
-    pub token:                String,
-    pub master_password_hash: Option<String>,
-    pub otp:                  Option<String>,
+    pub key:                     String,
+    pub token:                   String,
+    pub master_password_hash:    Option<String>,
+    pub otp:                     Option<String>,
+    pub user_verification_token: Option<String>,
 }
 
 /// POST /api/two-factor/disable - Disable a 2FA method
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DisableTwoFactorData {
-    pub master_password_hash: Option<String>,
-    pub otp:                  Option<String>,
+    pub master_password_hash:    Option<String>,
+    pub otp:                     Option<String>,
+    pub user_verification_token: Option<String>,
     #[serde(rename = "type")]
-    pub r#type:               i32,
+    pub r#type:                  i32,
 }
 
 /// POST /api/two-factor/get-recover - Get recovery code
@@ -349,11 +475,12 @@ pub struct RecoverTwoFactor {
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DisableAuthenticatorData {
-    pub key:                  String,
-    pub master_password_hash: Option<String>,
-    pub otp:                  Option<String>,
+    pub key:                     String,
+    pub master_password_hash:    Option<String>,
+    pub otp:                     Option<String>,
+    pub user_verification_token: Option<String>,
     #[serde(rename = "type")]
-    pub r#type:               i32,
+    pub r#type:                  i32,
 }
 
 // ============================================================================
@@ -387,24 +514,26 @@ impl RememberTokenData {
 
     /// Remove expired tokens (older than 30 days)
     pub fn remove_expired(&mut self) {
-        let now = Utc::now().timestamp();
+        let now = crate::infra::time::now_seconds();
         let expiration_seconds =
-            Duration::days(REMEMBER_TOKEN_EXPIRATION_DAYS).num_seconds();
+            SignedDuration::from_secs(REMEMBER_TOKEN_EXPIRATION_DAYS * 86_400)
+                .as_secs();
         self.tokens
-            .retain(|t| now - t.created_at < expiration_seconds);
+            .retain(|t| now.saturating_sub(t.created_at) < expiration_seconds);
     }
 
     /// Validate a token for a specific device
     /// Returns true if valid and not expired
     pub fn validate(&self, device_id: &str, token: &str) -> bool {
-        let now = Utc::now().timestamp();
+        let now = crate::infra::time::now_seconds();
         let expiration_seconds =
-            Duration::days(REMEMBER_TOKEN_EXPIRATION_DAYS).num_seconds();
+            SignedDuration::from_secs(REMEMBER_TOKEN_EXPIRATION_DAYS * 86_400)
+                .as_secs();
 
         self.tokens.iter().any(|t| {
             t.device_id == device_id &&
                 t.token == token &&
-                now - t.created_at < expiration_seconds
+                now.saturating_sub(t.created_at) < expiration_seconds
         })
     }
 
@@ -418,7 +547,55 @@ impl RememberTokenData {
         self.tokens.push(RememberTokenEntry {
             device_id,
             token,
-            created_at: Utc::now().timestamp(),
+            created_at: crate::infra::time::now_seconds(),
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::TwoFactorDB;
+
+    #[test]
+    fn challenge_classification_matches_login_for_supported_and_legacy_factors()
+    {
+        for (atype, enabled, expected) in [
+            (0, true, true),
+            (1, true, true),
+            (7, true, true),
+            (0, false, false),
+            (1, false, false),
+            (7, false, false),
+            (5, true, false),
+            (1000, true, false),
+            (1005, true, false),
+            // Unknown and unsupported legacy factors still trigger the same
+            // login challenge; this predicate must not bypass their handling.
+            (2, true, true),
+            (8, true, true),
+            (42, true, true),
+            (999, true, true),
+            (-1, true, true),
+        ] {
+            let factor = TwoFactorDB {
+                uuid: "factor".into(),
+                user_uuid: "owner".into(),
+                atype,
+                enabled,
+                data: "{}".into(),
+                last_used: 0,
+            };
+            assert_eq!(
+                factor.requires_login_challenge(),
+                expected,
+                "type {atype}, enabled {enabled}"
+            );
+            assert_eq!(
+                TwoFactorDB::is_twofactor_enabled(std::slice::from_ref(
+                    &factor
+                )),
+                expected
+            );
+        }
     }
 }

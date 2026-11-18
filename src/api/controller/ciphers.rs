@@ -5,22 +5,49 @@ use axum::{
         State,
     },
 };
-use chrono::{
-    DateTime,
-    Utc,
+use serde::Deserialize;
+use serde_json::{
+    Value,
+    json,
 };
-use serde_json::Value;
 use uuid::Uuid;
+use wasm_bindgen::JsValue;
+use worker::{
+    D1Database,
+    D1PreparedStatement,
+};
 
 use crate::{
     api::{
         AppState,
-        controller::attachments,
-        service::claims::Claims,
+        RawJson,
+        service::{
+            attachments,
+            cipher_mutation::{
+                self,
+                cipher_snapshot_guard,
+                folder_guard,
+            },
+            ciphers::{
+                Mutation,
+                collect_attachment_key_updates,
+                mutate_selected,
+                notify_cipher,
+            },
+            claims::Claims,
+            notifications::{
+                self,
+                UpdateType,
+            },
+        },
     },
     errors::{
         AppError,
-        AuthError,
+        AppResult,
+    },
+    infra::admin_notify::{
+        self,
+        Event,
     },
     models::{
         attachment::AttachmentDB,
@@ -31,585 +58,507 @@ use crate::{
             CipherRequestData,
             CreateCipherRequest,
             PartialCipherData,
+            client_revision_is_stale,
+            normalize_optional_rfc3339,
         },
         folder::FolderDB,
-        user::{
-            PasswordOrOtpData,
-            UserDB,
-        },
+        user::PasswordOrOtpData,
     },
 };
 
-// A wrapper for raw JSON strings that implements `IntoResponse`.
-// Use this to return pre-built JSON without re-parsing/re-serializing.
-// pub struct RawJson(pub String);
+fn optional(value: Option<&str>) -> JsValue {
+    value.map_or(JsValue::NULL, JsValue::from_str)
+}
 
-// impl IntoResponse for RawJson {
-//     fn into_response(self) -> Response {
-//         ([(header::CONTENT_TYPE, "application/json")],
-// self.0).into_response()     }
-// }
+async fn payload_guards(
+    db: &D1Database,
+    claims: &Claims,
+    payload: &CipherRequestData,
+) -> AppResult<Vec<D1PreparedStatement>> {
+    let key_guard = cipher_mutation::account_key_guard(db, claims).await?;
+    payload.validate_for_personal_vault(&claims.sub)?;
+    let key_id: Option<String> = if payload.encrypted_by_key_id.is_some() {
+        db.prepare("SELECT user_key_id FROM users WHERE id=?1")
+            .bind(&[claims.sub.clone().into()])?
+            .first(Some("user_key_id"))
+            .await?
+    } else {
+        None
+    };
+    payload.validate_encryption_context(&claims.sub, key_id.as_deref())?;
+    if let Some(folder) = &payload.folder_id {
+        FolderDB::ensure_for_user(db, folder, &claims.sub).await?;
+    }
+    Ok(vec![
+        key_guard,
+        folder_guard(db, &claims.sub, payload.folder_id.as_deref())?,
+        cipher_mutation::guard(
+            db,
+            "?2 IS NULL OR EXISTS(SELECT 1 FROM users WHERE id=?1 AND \
+             (user_key_id IS NULL OR user_key_id=?2))",
+            &[
+                claims.sub.clone().into(),
+                optional(payload.encrypted_by_key_id.as_deref()),
+            ],
+        )?,
+    ])
+}
+
+async fn save_cipher(
+    claims: Claims,
+    state: AppState,
+    id: Option<String>,
+    payload: CipherRequestData,
+) -> AppResult<Json<Cipher>> {
+    let db = state.get_db();
+    let mut guards = payload_guards(&db, &claims, &payload).await?;
+    let existing = if let Some(id) = &id {
+        Some(CipherDB::fetch_for_user(&db, id, &claims.sub).await?)
+    } else {
+        None
+    };
+    if let Some(existing) = &existing {
+        if client_revision_is_stale(
+            &existing.updated_at,
+            payload.last_known_revision_date.as_deref(),
+        ) {
+            return Err(AppError::bad_request(
+                "The client copy of this cipher is out of date. Resync the \
+                 client and try again.",
+            ));
+        }
+        guards.push(cipher_snapshot_guard(&db, existing)?);
+    }
+    let now = crate::infra::time::now_rfc3339();
+    let data = serde_json::to_value(CipherData::from_request(&payload))
+        .map_err(|_| AppError::Internal)?;
+    let encoded =
+        serde_json::to_string(&data).map_err(|_| AppError::Internal)?;
+    if encoded.len() > 2_000_000 {
+        return Err(AppError::PayloadTooLarge {
+            message: "Cipher data exceeds the D1 size limit".into(),
+        });
+    }
+    let archived_at = match payload.archived_date.as_deref() {
+        None => None,
+        Some(value) => normalize_optional_rfc3339(Some(value)).or_else(|| {
+            existing.as_ref().and_then(|row| row.archived_at.clone())
+        }),
+    };
+    let mut cipher = Cipher {
+        id: id.unwrap_or_else(|| Uuid::new_v4().to_string()),
+        user_id: Some(claims.sub.clone()),
+        organization_id: None,
+        r#type: payload.r#type,
+        data,
+        favorite: payload.favorite.unwrap_or_else(|| {
+            existing.as_ref().is_some_and(|row| row.favorite != 0)
+        }),
+        folder_id: payload.folder_id.clone(),
+        deleted_at: existing.as_ref().and_then(|row| row.deleted_at.clone()),
+        archived_at,
+        created_at: existing
+            .as_ref()
+            .map_or_else(|| now.clone(), |row| row.created_at.clone()),
+        updated_at: now.clone(),
+        object: "cipherDetails".into(),
+        organization_use_totp: false,
+        edit: true,
+        view_password: true,
+        collection_ids: None,
+        attachments: None,
+    };
+    let write = if existing.is_some() {
+        db.prepare(
+            "UPDATE ciphers SET \
+             type=?1,data=?2,favorite=?3,folder_id=?4,archived_at=?5,\
+             updated_at=?6 WHERE id=?7 AND user_id=?8",
+        )
+        .bind(&[
+            cipher.r#type.into(),
+            encoded.into(),
+            cipher.favorite.into(),
+            optional(cipher.folder_id.as_deref()),
+            optional(cipher.archived_at.as_deref()),
+            now.clone().into(),
+            cipher.id.clone().into(),
+            claims.sub.clone().into(),
+        ])?
+    } else {
+        db.prepare(
+            "INSERT INTO \
+             ciphers(id,user_id,organization_id,type,data,favorite,folder_id,\
+             archived_at,created_at,updated_at) \
+             VALUES(?1,?2,NULL,?3,?4,?5,?6,?7,?8,?8)",
+        )
+        .bind(&[
+            cipher.id.clone().into(),
+            claims.sub.clone().into(),
+            cipher.r#type.into(),
+            encoded.into(),
+            cipher.favorite.into(),
+            optional(cipher.folder_id.as_deref()),
+            optional(cipher.archived_at.as_deref()),
+            now.clone().into(),
+        ])?
+    };
+    let mut writes = vec![write];
+    let mut applied_attachments = Vec::new();
+    if existing.is_some() {
+        let (attachment_writes, applied) = collect_attachment_key_updates(
+            &db,
+            &cipher.id,
+            &claims.sub,
+            &payload,
+            &now,
+        )
+        .await?;
+        writes.extend(attachment_writes);
+        applied_attachments = applied;
+    }
+    attachments::hydrate_cipher_attachments(&db, &state.env, &mut cipher)
+        .await?;
+    if let Some(list) = &mut cipher.attachments {
+        for attachment in list {
+            if !applied_attachments.contains(&attachment.id) {
+                continue;
+            }
+            if let Some(update) = payload
+                .attachments2
+                .as_ref()
+                .and_then(|m| m.get(&attachment.id))
+            {
+                attachment.file_name = update.file_name.clone();
+                attachment.key = Some(update.key.clone());
+            }
+        }
+    }
+    let revision =
+        cipher_mutation::commit(&db, &claims, guards, writes).await?;
+    notify_cipher(
+        &state,
+        &claims,
+        if existing.is_some() {
+            UpdateType::SyncCipherUpdate
+        } else {
+            UpdateType::SyncCipherCreate
+        },
+        &cipher.id,
+        &revision,
+    )
+    .await;
+    admin_notify::emit(
+        &state.env,
+        if existing.is_some() {
+            Event::CipherUpdate
+        } else {
+            Event::CipherCreate
+        },
+        &claims.sub,
+    )
+    .await;
+    Ok(Json(cipher))
+}
 
 #[worker::send]
 pub async fn create_cipher(
     claims: Claims,
     State(state): State<AppState>,
     Json(payload): Json<CreateCipherRequest>,
-) -> Result<Json<Cipher>, AppError> {
-    let db = state.get_db();
-    let now = Utc::now();
-    let now = now.format("%Y-%m-%dT%H:%M:%S%.3fZ").to_string();
-    let cipher_data_req = payload.cipher;
-
-    let cipher_data = CipherData {
-        name:        cipher_data_req.name,
-        notes:       cipher_data_req.notes,
-        type_fields: cipher_data_req.type_fields,
-    };
-
-    let data_value = serde_json::to_value(&cipher_data).map_err(|e| {
-        log::error!("Failed to serialize cipher data: {e}");
-        AppError::Internal
-    })?;
-
-    let mut cipher = Cipher {
-        id:                    Uuid::new_v4().to_string(),
-        user_id:               Some(claims.sub.clone()),
-        organization_id:       cipher_data_req.organization_id.clone(),
-        r#type:                cipher_data_req.r#type,
-        data:                  data_value,
-        favorite:              cipher_data_req.favorite.unwrap_or(false),
-        folder_id:             cipher_data_req.folder_id.clone(),
-        deleted_at:            None,
-        created_at:            now.clone(),
-        updated_at:            now.clone(),
-        object:                "cipher".to_string(),
-        organization_use_totp: false,
-        edit:                  true,
-        view_password:         true,
-        collection_ids:        if payload.collection_ids.is_empty() {
-            None
-        } else {
-            Some(payload.collection_ids)
-        },
-        attachments:           None,
-    };
-
-    let data = serde_json::to_string(&cipher.data).map_err(|e| {
-        log::error!("Failed to serialize cipher data JSON: {e}");
-        AppError::Internal
-    })?;
-
-    CipherDB::insert_cipher(&db, &cipher, &data).await?;
-
-    attachments::hydrate_cipher_attachments(&db, &state.env, &mut cipher)
-        .await?;
-    UserDB::touch_user_updated_at(&db, &claims.sub).await?;
-
-    Ok(Json(cipher))
+) -> AppResult<Json<Cipher>> {
+    if !payload.collection_ids.is_empty() {
+        return Err(AppError::bad_request("Collections are not supported"));
+    }
+    save_cipher(claims, state, None, payload.cipher).await
 }
-
+#[worker::send]
+pub async fn create_cipher_simple(
+    claims: Claims,
+    State(state): State<AppState>,
+    Json(payload): Json<CipherRequestData>,
+) -> AppResult<Json<Cipher>> {
+    save_cipher(claims, state, None, payload).await
+}
 #[worker::send]
 pub async fn update_cipher(
     claims: Claims,
     State(state): State<AppState>,
     Path(id): Path<String>,
     Json(payload): Json<CipherRequestData>,
-) -> Result<Json<Cipher>, AppError> {
-    let db = state.get_db();
-    let now = Utc::now();
-    let now = now.format("%Y-%m-%dT%H:%M:%S%.3fZ").to_string();
-
-    let existing_cipher =
-        CipherDB::fetch_for_user(&db, &id, &claims.sub).await?;
-
-    // Validate folder ownership if provided
-    if let Some(ref folder_id) = payload.folder_id {
-        FolderDB::ensure_for_user(&db, folder_id, &claims.sub).await?;
-    }
-
-    // Reject updates based on stale client data when the last known revision is
-    // provided
-    if let Some(dt) = payload.last_known_revision_date.as_deref() {
-        match DateTime::parse_from_rfc3339(dt) {
-            Ok(client_dt) => {
-                match DateTime::parse_from_rfc3339(&existing_cipher.updated_at)
-                {
-                    Ok(server_dt) => {
-                        if server_dt
-                            .signed_duration_since(client_dt)
-                            .num_seconds() >
-                            1
-                        {
-                            return Err(AppError::Params(
-                                "The client copy of this cipher is out of \
-                                 date. Resync the client and try again."
-                                    .to_string(),
-                            ));
-                        }
-                    }
-                    Err(err) => log::warn!(
-                        "Error parsing server revisionDate '{}' for cipher \
-                         {}: {err}",
-                        existing_cipher.updated_at,
-                        existing_cipher.id,
-                    ),
-                }
-            }
-            Err(err) => {
-                log::warn!("Error parsing lastKnownRevisionDate '{dt}': {err}");
-            }
-        }
-    }
-
-    let cipher_data_req = payload;
-
-    let cipher_data = CipherData {
-        name:        cipher_data_req.name,
-        notes:       cipher_data_req.notes,
-        type_fields: cipher_data_req.type_fields,
-    };
-
-    let data_value = serde_json::to_value(&cipher_data).map_err(|e| {
-        log::error!("Failed to serialize cipher data: {e}");
-        AppError::Internal
-    })?;
-
-    let mut cipher = Cipher {
-        id:                    id.clone(),
-        user_id:               Some(claims.sub.clone()),
-        organization_id:       cipher_data_req.organization_id.clone(),
-        r#type:                cipher_data_req.r#type,
-        data:                  data_value,
-        favorite:              cipher_data_req.favorite.unwrap_or(false),
-        folder_id:             cipher_data_req.folder_id.clone(),
-        deleted_at:            None,
-        created_at:            existing_cipher.created_at,
-        updated_at:            now.clone(),
-        object:                "cipher".to_string(),
-        organization_use_totp: false,
-        edit:                  true,
-        view_password:         true,
-        collection_ids:        None,
-        attachments:           None,
-    };
-
-    let data = serde_json::to_string(&cipher.data).map_err(|e| {
-        log::error!("Failed to serialize cipher data JSON: {e}");
-        AppError::Internal
-    })?;
-
-    CipherDB::update_cipher(&db, &cipher, &data, &id, &claims.sub).await?;
-
-    attachments::hydrate_cipher_attachments(&db, &state.env, &mut cipher)
-        .await?;
-    UserDB::touch_user_updated_at(&db, &claims.sub).await?;
-
-    Ok(Json(cipher))
+) -> AppResult<Json<Cipher>> {
+    save_cipher(claims, state, Some(id), payload).await
 }
 
-/// GET /api/ciphers - list all non-trashed ciphers for current user
 #[worker::send]
 pub async fn list_ciphers(
     claims: Claims,
     State(state): State<AppState>,
-) -> Result<Json<Value>, AppError> {
-    let db = state.get_db();
-    let include_attachments = AttachmentDB::attachments_enabled(&state.env);
-    let ciphers_json = CipherDB::fetch_cipher_json_array_raw(
-        &db,
-        include_attachments,
-        "WHERE c.user_id = ?1 AND c.deleted_at IS NULL",
-        &[claims.sub.clone().into()],
+) -> AppResult<RawJson> {
+    let data = CipherDB::fetch_cipher_json_array_raw(
+        &state.get_db(),
+        AttachmentDB::attachments_enabled(&state.env),
+        "WHERE c.user_id=?1",
+        &[claims.sub.into()],
         "ORDER BY c.updated_at DESC",
+        state.get_domain(),
     )
     .await?;
-
-    // Build response JSON via string concatenation (no parsing!)
-    let response = format!(
-        r#"{{"data":{ciphers_json},"object":"list","continuationToken":null}}"#
-    );
-
-    Ok(Json(serde_json::from_str(&response).map_err(|err| {
-        log::error!("Failed to parse cipher list JSON: {err}");
-        AppError::Internal
-    })?))
+    Ok(RawJson(format!(
+        r#"{{"data":{data},"object":"list","continuationToken":null}}"#
+    )))
 }
-
-/// GET /api/ciphers/{id}
 #[worker::send]
 pub async fn get_cipher(
     claims: Claims,
     State(state): State<AppState>,
     Path(id): Path<String>,
-) -> Result<Json<Cipher>, AppError> {
+) -> AppResult<Json<Cipher>> {
     let db = state.get_db();
-    let cipher = CipherDB::fetch_for_user(&db, &id, &claims.sub).await?;
-    let mut cipher: Cipher = cipher.into();
-
+    let mut cipher = CipherDB::fetch_for_user(&db, &id, &claims.sub)
+        .await?
+        .into_api()?;
     attachments::hydrate_cipher_attachments(&db, &state.env, &mut cipher)
         .await?;
-
     Ok(Json(cipher))
 }
-
-/// GET /api/ciphers/{id}/details
 #[worker::send]
 pub async fn get_cipher_details(
     claims: Claims,
-    State(state): State<AppState>,
-    Path(id): Path<String>,
-) -> Result<Json<Cipher>, AppError> {
-    get_cipher(claims, State(state), Path(id)).await
+    state: State<AppState>,
+    id: Path<String>,
+) -> AppResult<Json<Cipher>> {
+    get_cipher(claims, state, id).await
 }
 
-/// PUT/POST /api/ciphers/{id}/partial
 #[worker::send]
 pub async fn update_cipher_partial(
     claims: Claims,
     State(state): State<AppState>,
     Path(id): Path<String>,
     Json(payload): Json<PartialCipherData>,
-) -> Result<Json<Cipher>, AppError> {
+) -> AppResult<Json<Cipher>> {
     let db = state.get_db();
-    let user_id = &claims.sub;
-
-    // Validate folder ownership if provided
-    if let Some(ref folder_id) = payload.folder_id {
-        FolderDB::ensure_for_user(&db, folder_id, user_id).await?;
+    let old = CipherDB::fetch_for_user(&db, &id, &claims.sub).await?;
+    if let Some(folder) = &payload.folder_id {
+        FolderDB::ensure_for_user(&db, folder, &claims.sub).await?;
     }
-
-    // Ensure cipher exists and belongs to user
-    CipherDB::fetch_for_user(&db, &id, user_id).await?;
-
-    let now = Utc::now().format("%Y-%m-%dT%H:%M:%S%.3fZ").to_string();
-
-    CipherDB::update_cipher_partial(
-        &db,
-        payload.folder_id,
-        payload.favorite,
-        &now,
-        &id,
-        user_id,
-    )
-    .await?;
-
-    UserDB::touch_user_updated_at(&db, user_id).await?;
-
-    let cipher = CipherDB::fetch_for_user(&db, &id, user_id).await?;
-    let mut cipher: Cipher = cipher.into();
-
+    let now = crate::infra::time::now_rfc3339();
+    let guards = vec![
+        cipher_snapshot_guard(&db, &old)?,
+        folder_guard(&db, &claims.sub, payload.folder_id.as_deref())?,
+    ];
+    let write = db
+        .prepare(
+            "UPDATE ciphers SET folder_id=?1,favorite=?2,updated_at=?3 WHERE \
+             id=?4 AND user_id=?5",
+        )
+        .bind(&[
+            optional(payload.folder_id.as_deref()),
+            payload.favorite.into(),
+            now.clone().into(),
+            id.into(),
+            claims.sub.clone().into(),
+        ])?;
+    let mut cipher: Cipher = old.into_api()?;
+    cipher.folder_id = payload.folder_id;
+    cipher.favorite = payload.favorite;
+    cipher.updated_at = now;
     attachments::hydrate_cipher_attachments(&db, &state.env, &mut cipher)
         .await?;
-
+    let revision =
+        cipher_mutation::commit(&db, &claims, guards, vec![write]).await?;
+    notify_cipher(
+        &state,
+        &claims,
+        UpdateType::SyncCipherUpdate,
+        &cipher.id,
+        &revision,
+    )
+    .await;
+    admin_notify::emit(&state.env, Event::CipherUpdate, &claims.sub).await;
     Ok(Json(cipher))
 }
 
-/// Soft delete a single cipher (PUT /api/ciphers/{id}/delete)
-/// Sets `deleted_at` to current timestamp
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct Selection {
+    ids:       Vec<String>,
+    folder_id: Option<String>,
+}
+fn selection(body: &str) -> AppResult<Selection> {
+    serde_json::from_str(body)
+        .map_err(|_| AppError::bad_request("Invalid cipher selection"))
+}
+
 #[worker::send]
 pub async fn soft_delete_cipher(
     claims: Claims,
     State(state): State<AppState>,
     Path(id): Path<String>,
-) -> Result<Json<()>, AppError> {
-    let db = state.get_db();
-    let now = Utc::now().format("%Y-%m-%dT%H:%M:%S%.3fZ").to_string();
-
-    CipherDB::soft_delete_cipher(&db, &id, &claims.sub, &now).await?;
-
-    UserDB::touch_user_updated_at(&db, &claims.sub).await?;
-
+) -> AppResult<Json<()>> {
+    mutate_selected(
+        &claims,
+        &state,
+        vec![id],
+        Mutation::SoftDelete,
+        None,
+        false,
+    )
+    .await?;
     Ok(Json(()))
 }
-
-/// Soft delete multiple ciphers (PUT /api/ciphers/delete)
-/// Accepts raw JSON body and uses `json_each` with path to extract ids
-/// directly. Expected JSON:
-/// ```json
-/// {"ids": ["cipher_id1", "cipher_id2"]}
-/// ```
 #[worker::send]
 pub async fn soft_delete_ciphers_bulk(
     claims: Claims,
     State(state): State<AppState>,
     body: String,
-) -> Result<Json<()>, AppError> {
-    let db = state.get_db();
-    let now = Utc::now().format("%Y-%m-%dT%H:%M:%S%.3fZ").to_string();
-
-    CipherDB::soft_delete_ciphers_bulk(&db, &claims.sub, &body, &now).await?;
-
-    UserDB::touch_user_updated_at(&db, &claims.sub).await?;
-
+) -> AppResult<Json<()>> {
+    mutate_selected(
+        &claims,
+        &state,
+        selection(&body)?.ids,
+        Mutation::SoftDelete,
+        None,
+        true,
+    )
+    .await?;
     Ok(Json(()))
 }
-
-/// Hard delete a single cipher (DELETE /api/ciphers/{id} or POST
-/// /api/ciphers/{id}/delete) Permanently removes the cipher from database
 #[worker::send]
 pub async fn hard_delete_cipher(
     claims: Claims,
     State(state): State<AppState>,
     Path(id): Path<String>,
-) -> Result<Json<()>, AppError> {
-    let db = state.get_db();
-
-    if AttachmentDB::attachments_enabled(&state.env) {
-        let bucket = AttachmentDB::require_bucket(&state.env)?;
-        let id_json = serde_json::to_string(&[&id]).map_err(|e| {
-            log::error!("Failed to serialize cipher id list: {e}");
-            AppError::Internal
-        })?;
-        let keys = AttachmentDB::list_attachment_keys_for_cipher_ids_json(
-            &db,
-            &id_json,
-            "$",
-            Some(&claims.sub),
-        )
-        .await?;
-        AttachmentDB::delete_r2_objects(&bucket, &keys).await?;
-    }
-
-    CipherDB::hard_delete_cipher(&db, &id, &claims.sub).await?;
-
-    UserDB::touch_user_updated_at(&db, &claims.sub).await?;
-
+) -> AppResult<Json<()>> {
+    mutate_selected(
+        &claims,
+        &state,
+        vec![id],
+        Mutation::HardDelete,
+        None,
+        false,
+    )
+    .await?;
     Ok(Json(()))
 }
-
-/// Hard delete multiple ciphers (DELETE /api/ciphers or POST
-/// /api/ciphers/delete) Accepts raw JSON body and uses `json_each` with path to
-/// extract ids directly. Expected JSON:
-/// ```json
-/// {"ids": ["cipher_id1", "cipher_id2"]}
-/// ```
 #[worker::send]
 pub async fn hard_delete_ciphers_bulk(
     claims: Claims,
     State(state): State<AppState>,
     body: String,
-) -> Result<Json<()>, AppError> {
-    let db = state.get_db();
-
-    if AttachmentDB::attachments_enabled(&state.env) {
-        let bucket = AttachmentDB::require_bucket(&state.env)?;
-        let keys = AttachmentDB::list_attachment_keys_for_cipher_ids_json(
-            &db,
-            &body,
-            "$.ids",
-            Some(&claims.sub),
-        )
-        .await?;
-        AttachmentDB::delete_r2_objects(&bucket, &keys).await?;
-    }
-
-    CipherDB::hard_delete_ciphers_bulk(&db, &claims.sub, &body).await?;
-
-    UserDB::touch_user_updated_at(&db, &claims.sub).await?;
-
+) -> AppResult<Json<()>> {
+    mutate_selected(
+        &claims,
+        &state,
+        selection(&body)?.ids,
+        Mutation::HardDelete,
+        None,
+        true,
+    )
+    .await?;
     Ok(Json(()))
 }
-
-/// Restore a single cipher (PUT /api/ciphers/{id}/restore)
-/// Clears the `deleted_at` timestamp
 #[worker::send]
 pub async fn restore_cipher(
     claims: Claims,
     State(state): State<AppState>,
     Path(id): Path<String>,
-) -> Result<Json<Cipher>, AppError> {
-    let db = state.get_db();
-    let now = Utc::now().format("%Y-%m-%dT%H:%M:%S%.3fZ").to_string();
-
-    let cipher_db =
-        CipherDB::restore_cipher(&db, &id, &claims.sub, &now).await?;
-
-    let mut cipher: Cipher = cipher_db.into();
-    attachments::hydrate_cipher_attachments(&db, &state.env, &mut cipher)
-        .await?;
-
-    UserDB::touch_user_updated_at(&db, &claims.sub).await?;
-
+) -> AppResult<Json<Cipher>> {
+    let cipher = mutate_selected(
+        &claims,
+        &state,
+        vec![id],
+        Mutation::Restore,
+        None,
+        false,
+    )
+    .await?
+    .into_iter()
+    .next()
+    .ok_or(AppError::Internal)?;
     Ok(Json(cipher))
 }
-
-/// Restore multiple ciphers (PUT /api/ciphers/restore)
-/// Accepts raw JSON body and uses `json_each` with path to extract ids
-/// directly. Expected JSON:
-/// ```json
-/// {"ids": ["cipher_id1", "cipher_id2"]}
-/// ```
 #[worker::send]
 pub async fn restore_ciphers_bulk(
     claims: Claims,
     State(state): State<AppState>,
     body: String,
-) -> Result<Json<Value>, AppError> {
-    let db = state.get_db();
-    let now = Utc::now().format("%Y-%m-%dT%H:%M:%S%.3fZ").to_string();
-
-    CipherDB::restore_ciphers_bulk(&db, &claims.sub, &body, &now).await?;
-
-    let include_attachments = AttachmentDB::attachments_enabled(&state.env);
-    let ciphers_json = CipherDB::fetch_cipher_json_array_raw(
-        &db,
-        include_attachments,
-        "WHERE c.user_id = ?1 AND c.id IN (SELECT value FROM json_each(?2, \
-         '$.ids'))",
-        &[claims.sub.clone().into(), body.clone().into()],
-        "",
+) -> AppResult<Json<Value>> {
+    let rows = mutate_selected(
+        &claims,
+        &state,
+        selection(&body)?.ids,
+        Mutation::Restore,
+        None,
+        true,
     )
     .await?;
-
-    UserDB::touch_user_updated_at(&db, &claims.sub).await?;
-
-    // Build response JSON via string concatenation (no parsing!)
-    let response = format!(
-        r#"{{"data":{ciphers_json},"object":"list","continuationToken":null}}"#
-    );
-
-    Ok(Json(serde_json::from_str(&response).map_err(|err| {
-        log::error!("Failed to parse restored cipher list JSON: {err}");
-        AppError::Internal
-    })?))
+    Ok(Json(
+        json!({"data":rows,"object":"list","continuationToken":null}),
+    ))
 }
-
-/// Handler for POST /api/ciphers
-/// Accepts flat JSON structure (camelCase) as sent by Bitwarden clients
-/// when creating a cipher without collection assignments.
-#[worker::send]
-pub async fn create_cipher_simple(
-    claims: Claims,
-    State(state): State<AppState>,
-    Json(payload): Json<CipherRequestData>,
-) -> Result<Json<Cipher>, AppError> {
-    let db = state.get_db();
-    let now = Utc::now();
-    let now = now.format("%Y-%m-%dT%H:%M:%S%.3fZ").to_string();
-
-    let cipher_data = CipherData {
-        name:        payload.name,
-        notes:       payload.notes,
-        type_fields: payload.type_fields,
-    };
-
-    let data_value = serde_json::to_value(&cipher_data).map_err(|e| {
-        log::error!("Failed to serialize cipher data: {e}");
-        AppError::Internal
-    })?;
-
-    let mut cipher = Cipher {
-        id:                    Uuid::new_v4().to_string(),
-        user_id:               Some(claims.sub.clone()),
-        organization_id:       payload.organization_id.clone(),
-        r#type:                payload.r#type,
-        data:                  data_value,
-        favorite:              payload.favorite.unwrap_or(false),
-        folder_id:             payload.folder_id.clone(),
-        deleted_at:            None,
-        created_at:            now.clone(),
-        updated_at:            now.clone(),
-        object:                "cipher".to_string(),
-        organization_use_totp: false,
-        edit:                  true,
-        view_password:         true,
-        collection_ids:        None,
-        attachments:           None,
-    };
-
-    let data = serde_json::to_string(&cipher.data).map_err(|e| {
-        log::error!("Failed to serialize cipher data JSON: {e}");
-        AppError::Internal
-    })?;
-
-    CipherDB::insert_cipher(&db, &cipher, &data).await?;
-
-    attachments::hydrate_cipher_attachments(&db, &state.env, &mut cipher)
-        .await?;
-    UserDB::touch_user_updated_at(&db, &claims.sub).await?;
-
-    Ok(Json(cipher))
-}
-
-/// Move selected ciphers to a folder (POST/PUT /api/ciphers/move)
-/// Accepts raw JSON body and uses `json_extract/json_each` to extract values
-/// directly. Expected JSON: {"folderId": "optional-folder-id-or-null", "ids":
-/// ["`cipher_id1`", ...]} The folderId is optional and treated as null if not
-/// provided in vaultwarden. D1/SQLite's `json_extract` returns SQL NULL for
-/// non-existent paths, which is identical to the behavior in vaultwarden.
 #[worker::send]
 pub async fn move_cipher_selected(
     claims: Claims,
     State(state): State<AppState>,
     body: String,
-) -> Result<Json<()>, AppError> {
-    let db = state.get_db();
-    let user_id = &claims.sub;
-    let now = Utc::now().format("%Y-%m-%dT%H:%M:%S%.3fZ").to_string();
-
-    // Validate folder exists and belongs to user (if folder_id is provided)
-    // Uses json_extract to get folderId from request body
-    FolderDB::ensure_json_folder_exists(&db, &body, user_id).await?;
-
-    // Update folder_id for all ciphers that belong to the user and are in the
-    // ids list Uses json_extract for folderId and json_each for ids array
-    CipherDB::move_selected(&db, user_id, &body, &now).await?;
-
-    // Update user's revision date
-    UserDB::touch_user_updated_at(&db, user_id).await?;
-
+) -> AppResult<Json<()>> {
+    let selection = selection(&body)?;
+    mutate_selected(
+        &claims,
+        &state,
+        selection.ids,
+        Mutation::Move,
+        selection.folder_id,
+        true,
+    )
+    .await?;
     Ok(Json(()))
 }
 
-/// Purge the user's vault - delete all ciphers and folders
-/// POST /api/ciphers/purge
-///
-/// This is a destructive operation that requires password verification.
-/// In vaultwarden, this endpoint also supports purging organization vaults,
-/// but this simplified version only supports personal vault purge.
 #[worker::send]
 pub async fn purge_vault(
     claims: Claims,
     State(state): State<AppState>,
     Json(payload): Json<PasswordOrOtpData>,
-) -> Result<Json<()>, AppError> {
-    let db = state.get_db();
-    let user_id = &claims.sub;
-
-    // Get the user from the database
-    let user = UserDB::fetch_by_id_with(
-        &db,
-        user_id,
-        "Failed to fetch user for vault purge",
-        || AppError::Auth(AuthError::UserNotFound),
+) -> AppResult<Json<()>> {
+    crate::api::service::email::verify_password_or_otp(
+        &state, &claims, &payload,
     )
     .await?;
-
-    // Validate password (OTP not supported in this simplified version)
-    let provided_hash = payload.master_password_hash.ok_or_else(|| {
-        AppError::Params("Missing master password hash".to_string())
-    })?;
-
-    let verification = user.verify_master_password(&provided_hash).await?;
-
-    if !verification.is_valid() {
-        return Err(AppError::Auth(AuthError::InvalidPassword));
+    let db = state.get_db();
+    let revision: String = db
+        .prepare("SELECT updated_at FROM users WHERE id=?1")
+        .bind(&[claims.sub.clone().into()])?
+        .first(Some("updated_at"))
+        .await?
+        .ok_or(AppError::Internal)?;
+    let guard = cipher_mutation::guard(
+        &db,
+        "EXISTS(SELECT 1 FROM users WHERE id=?1 AND updated_at IS ?2)",
+        &[claims.sub.clone().into(), revision.into()],
+    )?;
+    let writes = vec![
+        db.prepare("DELETE FROM ciphers WHERE user_id=?1")
+            .bind(&[claims.sub.clone().into()])?,
+        db.prepare("DELETE FROM folders WHERE user_id=?1")
+            .bind(&[claims.sub.clone().into()])?,
+    ];
+    let revision =
+        cipher_mutation::commit(&db, &claims, vec![guard], writes).await?;
+    notifications::publish_user_update(
+        &state.env,
+        &claims.sub,
+        UpdateType::SyncVault,
+        &revision,
+        claims.device(),
+    )
+    .await;
+    admin_notify::emit(&state.env, Event::CipherDelete, &claims.sub).await;
+    if let Err(error) =
+        crate::infra::storage::cleanup::drain(&state.env, &db).await
+    {
+        log::warn!("File cleanup deferred: {error}");
     }
-
-    if AttachmentDB::attachments_enabled(&state.env) {
-        let bucket = AttachmentDB::require_bucket(&state.env)?;
-        let keys =
-            AttachmentDB::list_attachment_keys_for_user(&db, user_id).await?;
-        AttachmentDB::delete_r2_objects(&bucket, &keys).await?;
-    }
-
-    // Delete all user's ciphers (both active and soft-deleted)
-    CipherDB::purge_user_ciphers(&db, user_id).await?;
-    FolderDB::purge_user_folders(&db, user_id).await?;
-
-    // Update user's revision date to trigger client sync
-    UserDB::touch_user_updated_at(&db, user_id).await?;
-
     Ok(Json(()))
 }

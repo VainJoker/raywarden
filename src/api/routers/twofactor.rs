@@ -15,6 +15,10 @@ use crate::api::{
 
 pub fn twofactor_router() -> Router<AppState> {
     Router::new()
+        .route(
+            "/api/two-factor/get-device-verification-settings",
+            get(twofactor::device_verification_settings),
+        )
         .route("/api/two-factor", get(twofactor::get_twofactor))
         .route(
             "/api/two-factor/get-authenticator",

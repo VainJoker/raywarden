@@ -2,10 +2,6 @@ use axum::{
     Json,
     extract::State,
 };
-use chrono::{
-    SecondsFormat,
-    Utc,
-};
 use serde::Deserialize;
 use serde_json::{
     Value,
@@ -18,13 +14,23 @@ use crate::{
     models::meta::MetaDB,
 };
 
+pub const SERVER_VERSION: &str = "2026.6.0";
+
+/// Compatibility discovery for capabilities outside the personal-vault scope.
+#[worker::send]
+pub async fn empty_personal_list(
+    _claims: crate::api::service::claims::Claims,
+) -> Json<Value> {
+    Json(json!({"data": [], "object": "list", "continuationToken": null}))
+}
+
 /// GET /api/now
 ///
 /// Mirrors vaultwarden's `/api/now`: returns current UTC timestamp as an
 /// RFC3339 string.
 #[worker::send]
 pub async fn now() -> Json<String> {
-    Json(Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true))
+    Json(crate::infra::time::now_rfc3339())
 }
 
 /// GET /api/alive
@@ -47,7 +53,7 @@ pub async fn alive(
 #[worker::send]
 pub async fn version() -> Json<&'static str> {
     // Keep this in sync with `src/handlers/config.rs`'s `version`.
-    Json("2025.12.0")
+    Json(SERVER_VERSION)
 }
 
 #[derive(Debug, Deserialize)]
@@ -56,14 +62,38 @@ pub struct HibpBreachQuery {
     pub username: String,
 }
 
-/// GET /api/hibp/breach?username=...
-///
-/// Vaultwarden can proxy `HaveIBeenPwned` if configured. This minimal server
-/// doesn't. We return an empty array to indicate "no breach data" without
-/// surfacing an error in clients.
+/// Proxy HIBP only when configured; no fabricated breach records.
 #[worker::send]
 pub async fn hibp_breach(
-    _query: axum::extract::Query<HibpBreachQuery>,
-) -> Json<Value> {
-    Json(json!([]))
+    claims: crate::api::service::claims::Claims,
+    State(state): State<AppState>,
+    axum::extract::Query(query): axum::extract::Query<HibpBreachQuery>,
+) -> Result<Json<Value>, AppError> {
+    crate::api::service::rate::check_rate_limit(
+        &state,
+        format!("hibp:{}", claims.sub),
+    )
+    .await?;
+    let secret = crate::infra::config::env_text(&state.env, "HIBP_API_KEY")
+        .ok_or_else(|| {
+            AppError::bad_request("HIBP_API_KEY is not configured")
+        })?;
+    let mut url =
+        url::Url::parse("https://haveibeenpwned.com/api/v3/breachedaccount/")
+            .map_err(|_| AppError::Internal)?;
+    url.path_segments_mut()
+        .map_err(|_| AppError::Internal)?
+        .push(&query.username);
+    url.set_query(Some("truncateResponse=false&includeUnverified=false"));
+    let mut request = worker::Request::new(url.as_str(), worker::Method::Get)?;
+    request.headers_mut()?.set("hibp-api-key", &secret)?;
+    request.headers_mut()?.set("user-agent", "raywarden")?;
+    let mut response = worker::Fetch::Request(request).send().await?;
+    if response.status_code() == 404 {
+        return Ok(Json(json!([])));
+    }
+    if response.status_code() != 200 {
+        return Err(AppError::bad_request("HIBP service is unavailable"));
+    }
+    Ok(Json(response.json().await?))
 }
