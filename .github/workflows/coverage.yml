@@ -36,7 +36,7 @@ jobs:
       - name: Collect host Rust library coverage
         run: just coverage
       - name: Upload LCOV report
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: rust-library-coverage
           path: coverage/lcov.info

@@ -160,16 +160,26 @@ curl -sS -o /dev/null -w 'Unauthenticated sync: HTTP %{http_code}\n' "$vault_url
 
 若 check 成功、部署阶段失败，修正权限或 Secrets 后可进入 **Actions → Deploy to Cloudflare → Run workflow**：选择来源分支，填写原 Integration URL `/actions/runs/<run_id>` 中的数字。来源必须是同仓库、同一所选分支、已完成且最新 check 成功的 Integration；整个运行因 deploy 失败而显示失败也可重试。产物保留 14 天，过期需重新运行 Integration。配置或源码变动则重新构建，不能拿旧产物搭配新配置上传。
 
-### 手动部署 feat 分支
+### 在 feat 分支请求部署
 
-`main` 保持自动部署；`feat` 与 `feat/**` 推送只检查和生成产物，部署需要显式手动触发：
+默认分支尚无工作流时，使用提交标记：`main` 保持自动部署；`feat` 与 `feat/**` 的普通 push 只检查，**这次 push 的最后一个提交消息以 `[deploy]` 开头**时，Integration 检查成功后调用同一 commit 的 `cloudflare.yaml`，部署本次产物。相对路径复用工作流取调用者的同一 commit，因此这条路径可直接从 feat 分支运行。[GitHub 复用规则](https://docs.github.com/en/actions/how-tos/reuse-automations/reuse-workflows)
 
-1. 提交并推送 workflow 改动，确保默认分支已有带 `workflow_dispatch` 的工作流，待运行的 feat 分支也包含本次修改。GitHub 的 **Run workflow → Branch** 下拉用于选择执行分支。[GitHub 手动运行说明](https://docs.github.com/en/actions/how-tos/manage-workflow-runs/manually-run-a-workflow)
-2. 推送例如 `feat/rust-worker-expansion`，等待该分支的 Integration check 成功；也可手动运行 Integration 并选择此分支。复制这次 Integration URL 中的 run ID。
-3. 打开 **Actions → Deploy to Cloudflare → Run workflow**，在 **Branch** 选择同一个 `feat/rust-worker-expansion`，输入上一步的 `run_id` 并运行。
-4. 如果 `production` 环境的 Deployment branches/tags 只允许 main，在仓库 **Settings → Environments → production** 中把该 feat 分支加入允许列表；已有环境审批规则仍然生效。[环境部署分支规则](https://docs.github.com/en/actions/how-tos/deploy/configure-and-manage-deployments/manage-environments)
+1. 将本次 workflow 改动提交到 feat 分支，部署请求使用例如 `[deploy] test feat deployment` 作为提交消息，再推送。
+2. 打开 **Actions → Integration → 本次 feat 运行**，等待 check 完成，随后在运行详情中查看 **Deploy to Cloudflare** 作业。这里查看的是 Integration 调用的部署作业。
+3. 若代码已经提交，可在当前 feat 分支用空提交发起一次新请求：
 
-选择 feat 只是改变代码与产物来源，目标仍是 `wrangler.jsonc` 中的生产 Worker、D1 和 R2，不会自动创建预览环境。跨分支共用同一个部署并发锁，迁移不会因另一次部署被取消。手动来源仍固定到所填 Integration 的 commit；分支后来有新提交不会替换已选产物。
+```bash
+git commit --allow-empty -m "[deploy] test feat deployment"
+git push origin HEAD
+```
+
+空提交会为新的 SHA 执行完整 CI。标记匹配不区分大小写，但须从消息第一个字符开始；多个提交一起推送时，以最后一个提交为准。保持 CI 启用，不同时使用 `[skip ci]` 等跳过标记。检查或产物上传失败时不会进入部署；部署失败可在该次 Integration 运行中重试失败的作业。
+
+若 `production` 环境的 Deployment branches/tags 只允许 main，在仓库 **Settings → Environments → production** 中把对应 feat 分支加入允许列表；已有审批规则继续生效。[环境部署分支规则](https://docs.github.com/en/actions/how-tos/deploy/configure-and-manage-deployments/manage-environments)
+
+默认分支将来包含 `workflow_dispatch` 工作流后，仍可使用按钮入口：先取得同分支已完成且 check 成功的 Integration run ID，再进入 **Actions → Deploy to Cloudflare → Run workflow**，Branch 选择同一 feat 分支并填写 `run_id`。[GitHub 手动运行说明](https://docs.github.com/en/actions/how-tos/manage-workflow-runs/manually-run-a-workflow)
+
+两种入口都使用 `wrangler.jsonc` 中的生产 Worker、D1 和 R2。所有分支共用部署并发锁；每次检出并校验指定 Integration 的 commit 与产物，分支后来有新提交不会替换已选产物。
 
 已有迁移会跳过，但手动重试仍可能执行新的待执行迁移、上传 Worker 并检查健康，**不会回滚数据库**。发布旧 Worker 版本同样不等于恢复旧 D1 结构。
 

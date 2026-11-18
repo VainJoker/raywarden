@@ -60,9 +60,9 @@ just dev
 
 自定义域名可选，当前配置省略 routes 并启用 workers.dev。先在 Cloudflare Dashboard 配置账户的 workers.dev 子域名；部署工具只读查询它，再与 Worker 名组合成访问地址。若配置一个明确的 custom-domain 路由，则优先使用该地址。部署、运行时 URL 和健康检查使用同一入口，无须 GitHub `DOMAIN` Secret。
 
-三份工作流分别承担 Integration 检查与构建、Coverage 覆盖率，以及 Cloudflare 产物部署。PR 只检查和构建；main 推送或手动运行 main 的 Integration 时，完整检查和构建成功后自动调用 `cloudflare.yaml` 部署本次产物。
+三份工作流分别承担 Integration 检查与构建、Coverage 覆盖率，以及 Cloudflare 产物部署。PR 只检查和构建；main 推送或手动运行 main 的 Integration 时，完整检查和构建成功后自动调用 `cloudflare.yaml` 部署本次产物。 feat 分支可以用以 `[deploy]` 开头的提交请求部署；检查通过后复用同一次 Integration 产物，不要求默认分支先有手动按钮。普通 feat 提交只执行检查。
 
-复用已有产物时，先确保默认分支已有工作流，再到 Actions → Deploy to Cloudflare → Run workflow，选择 main、feat 或 feat/* 分支，并在必填的 `run_id` 中输入同一分支 Integration URL `/actions/runs/<run_id>` 的数字。只接受同仓库同分支由推送或手动触发、已经结束且最新 check 成功的 Integration；整体因部署失败而失败的运行也可重试。feat 推送只检查，手动部署仍使用现有生产资源。产物保留14天；手动部署精确检出来源commit并校验摘要，不重新编译，也不回滚数据库。详见[feat手动部署步骤](docs/deployment.md#手动部署-feat-分支)。
+复用已有产物时，先确保默认分支已有工作流，再到 Actions → Deploy to Cloudflare → Run workflow，选择 main、feat 或 feat/* 分支，并在必填的 `run_id` 中输入同一分支 Integration URL `/actions/runs/<run_id>` 的数字。只接受同仓库同分支由推送或手动触发、已经结束且最新 check 成功的 Integration；整体因部署失败而失败的运行也可重试。普通 feat 推送只检查；带 `[deploy]` 前缀的推送与手动入口都使用现有生产资源。产物保留14天；手动部署精确检出来源commit并校验摘要，不重新编译，也不回滚数据库。详见[feat部署步骤](docs/deployment.md#在-feat-分支请求部署)。
 
 结构快照来自全部 10 份迁移，共 19 表、38 个显式 DDL 对象。纯 Rust 运行路径的测试、构建与环境验证结果见 [执行记录](docs/implementation-plan.md#8-执行记录)；脚本和前端仍有独立 Node 测试。
 

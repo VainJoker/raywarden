@@ -18,7 +18,7 @@ env:
 
 jobs:
   deploy:
-    if: github.ref == 'refs/heads/main' || (github.event_name == 'workflow_dispatch' && inputs.run_id != '' && (github.ref == 'refs/heads/feat' || startsWith(github.ref, 'refs/heads/feat/')))
+    if: github.ref == 'refs/heads/main' || ((github.ref == 'refs/heads/feat' || startsWith(github.ref, 'refs/heads/feat/')) && ((github.event_name == 'workflow_dispatch' && inputs.run_id != '') || (github.event_name == 'push' && startsWith(github.event.head_commit.message, '[deploy]'))))
     runs-on: ubuntu-latest
     timeout-minutes: 30
     environment: production
@@ -38,12 +38,15 @@ jobs:
             const branch = context.ref?.startsWith('refs/heads/') ? context.ref.slice('refs/heads/'.length) : '';
             const feature = branch === 'feat' || branch.startsWith('feat/');
             if (branch !== 'main' && !feature) throw new Error('Deployment branch must be main, feat or feat/*');
-            if (feature && (context.eventName !== 'workflow_dispatch' || !requested)) {
-              throw new Error('Feature deployment requires manual dispatch and an Integration run ID');
+            const markedPush = context.eventName === 'push' &&
+              String(context.payload?.head_commit?.message ?? '').toLowerCase().startsWith('[deploy]');
+            if (feature && !((context.eventName === 'workflow_dispatch' && requested) || (!requested && markedPush))) {
+              throw new Error('Feature deployment requires a [deploy] push or manual dispatch with an Integration run ID');
             }
             const runId = requested || String(context.runId);
             let sha = context.sha;
             // A reusable call already depends on Integration's check job.
+            // A [deploy] push uses that same checked commit and run artifact.
             // Its event may also be workflow_dispatch; only an input selects another run.
             if (requested) {
               if (!/^[1-9]\d*$/.test(runId)) throw new Error('Integration run ID must be a positive integer');
@@ -77,7 +80,7 @@ jobs:
           ref: ${{ steps.source.outputs.sha }}
           persist-credentials: false
       - name: Download the validated release artifact
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v7
         with:
           name: raywarden-release-production-${{ steps.source.outputs.sha }}
           path: .

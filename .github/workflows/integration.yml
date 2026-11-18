@@ -2,7 +2,7 @@ name: Integration
 
 on:
   push:
-    branches: [main, 'feat/**']
+    branches: [main, feat, 'feat/**']
   pull_request:
   workflow_dispatch:
 
@@ -43,7 +43,7 @@ jobs:
       - name: Record artifact source, configuration and file digests
         run: just artifact
       - name: Upload validated release artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: raywarden-release-production-${{ github.sha }}
           overwrite: true
@@ -60,7 +60,8 @@ jobs:
   deploy:
     name: Deploy to Cloudflare
     needs: check
-    if: github.ref == 'refs/heads/main' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
+    # Feature deployment is explicitly requested by the pushed tip commit.
+    if: (github.ref == 'refs/heads/main' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch')) || (github.event_name == 'push' && (github.ref == 'refs/heads/feat' || startsWith(github.ref, 'refs/heads/feat/')) && startsWith(github.event.head_commit.message, '[deploy]'))
     permissions:
       contents: read
       actions: read
