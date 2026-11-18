@@ -5,7 +5,7 @@ on:
   workflow_dispatch:
     inputs:
       run_id:
-        description: "Integration run ID from main (checks must have succeeded)"
+        description: "Integration run ID from the selected branch (checks must have succeeded)"
         required: true
         type: string
 
@@ -18,7 +18,7 @@ env:
 
 jobs:
   deploy:
-    if: github.ref == 'refs/heads/main'
+    if: github.ref == 'refs/heads/main' || (github.event_name == 'workflow_dispatch' && inputs.run_id != '' && (github.ref == 'refs/heads/feat' || startsWith(github.ref, 'refs/heads/feat/')))
     runs-on: ubuntu-latest
     timeout-minutes: 30
     environment: production
@@ -35,6 +35,12 @@ jobs:
         with:
           script: |
             const requested = (process.env.INTEGRATION_RUN_ID ?? '').trim();
+            const branch = context.ref?.startsWith('refs/heads/') ? context.ref.slice('refs/heads/'.length) : '';
+            const feature = branch === 'feat' || branch.startsWith('feat/');
+            if (branch !== 'main' && !feature) throw new Error('Deployment branch must be main, feat or feat/*');
+            if (feature && (context.eventName !== 'workflow_dispatch' || !requested)) {
+              throw new Error('Feature deployment requires manual dispatch and an Integration run ID');
+            }
             const runId = requested || String(context.runId);
             let sha = context.sha;
             // A reusable call already depends on Integration's check job.
@@ -44,9 +50,9 @@ jobs:
               const { data: run } = await github.rest.actions.getWorkflowRun({ ...context.repo, run_id: runId });
               const repository = `${context.repo.owner}/${context.repo.repo}`;
               if (run.repository?.full_name !== repository || run.head_repository?.full_name !== repository ||
-                  run.path !== '.github/workflows/integration.yml' || run.head_branch !== 'main' ||
+                  run.path !== '.github/workflows/integration.yml' || run.head_branch !== branch ||
                   !['push', 'workflow_dispatch'].includes(run.event) || !/^[0-9a-f]{40}$/.test(run.head_sha)) {
-                throw new Error('Source must be an Integration push or manual run from this repository main branch');
+                throw new Error('Source must be an Integration push or manual run from this repository and the selected branch');
               }
               if (run.status !== 'completed') throw new Error('Wait for the source Integration run to finish');
               const jobs = await github.paginate(github.rest.actions.listJobsForWorkflowRun, {

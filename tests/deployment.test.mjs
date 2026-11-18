@@ -22,7 +22,7 @@ function fixture(t, transform = (value) => value) {
 const response = (result, status = 200) => new Response(JSON.stringify({ success: status < 400, result }), { status });
 
 // Execute the actual inline resolver; the GitHub client is the only substitute.
-function sourceFixture({ input = "123", source = {}, jobs } = {}) {
+function sourceFixture({ input = "123", source = {}, jobs, ref = "refs/heads/main", eventName = "workflow_dispatch" } = {}) {
   const workflow = readFileSync(resolve(PROJECT_ROOT, ".github/workflows/cloudflare.yaml"), "utf8");
   const script = workflow.match(/^          script: \|\n((?:            [^\n]*\n|\n)+)/m)?.[1];
   assert.ok(script, "Missing inline deployment source resolver");
@@ -52,7 +52,7 @@ function sourceFixture({ input = "123", source = {}, jobs } = {}) {
   };
   const context = {
     repo: { owner: "example", repo: "raywarden" }, sha: "b".repeat(40), runId: 900,
-    eventName: "workflow_dispatch", workflow: "Integration",
+    ref, eventName, workflow: "Integration",
   };
   const core = { setOutput(name, value) { outputs[name] = String(value); } };
   return {
@@ -81,7 +81,7 @@ test("manual deployment selects the source commit and permits retry after a fail
   }
 });
 
-test("manual deployment rejects foreign, PR, non-main, unfinished and malformed sources before selecting an artifact", async () => {
+test("manual deployment rejects foreign, PR, mismatched branch, unfinished and malformed sources before selecting an artifact", async () => {
   for (const source of [
     { repository: { full_name: "other/raywarden" } }, { head_repository: { full_name: "fork/raywarden" } },
     { head_repository: null }, { path: ".github/workflows/coverage.yml" }, { head_branch: "feature" },
@@ -92,6 +92,29 @@ test("manual deployment rejects foreign, PR, non-main, unfinished and malformed 
     await assert.rejects(f.resolve(), /Source must|Wait for/);
     assert.deepEqual(f.outputs, {});
     assert.equal(f.calls.length, 1);
+  }
+});
+
+test("manual feature deployment selects only validated artifacts from the selected feature branch", async () => {
+  for (const branch of ["feat", "feat/rust-worker-expansion", "feat/nested/work"]) {
+    const f = sourceFixture({ ref: `refs/heads/${branch}`, source: { head_branch: branch } });
+    await f.resolve();
+    assert.deepEqual(f.outputs, { sha: "a".repeat(40), run_id: "123" });
+    for (const head_branch of ["main", "feat/another-branch"]) {
+      const wrong = sourceFixture({ ref: `refs/heads/${branch}`, source: { head_branch } });
+      await assert.rejects(wrong.resolve(), /selected branch/);
+      assert.deepEqual(wrong.outputs, {});
+    }
+  }
+  for (const ref of ["refs/heads/feature", "refs/heads/feat-other", "refs/tags/main", "refs/pull/1/merge"]) {
+    const f = sourceFixture({ ref });
+    await assert.rejects(f.resolve(), /Deployment branch/);
+    assert.deepEqual(f.calls, []);
+  }
+  for (const options of [{ input: "" }, { input: "   " }, { eventName: "push" }, { eventName: "pull_request" }]) {
+    const f = sourceFixture({ ref: "refs/heads/feat/test", ...options });
+    await assert.rejects(f.resolve(), /requires manual dispatch/);
+    assert.deepEqual(f.calls, []);
   }
 });
 
@@ -371,6 +394,9 @@ test("integration gates same-run deployment on successful checks and keeps cover
     ["refs/heads/main", "pull_request", false],
     ["refs/heads/feature", "push", false],
     ["refs/heads/feature", "workflow_dispatch", false],
+    ["refs/heads/feat", "push", false],
+    ["refs/heads/feat/rust-worker-expansion", "push", false],
+    ["refs/heads/feat/rust-worker-expansion", "workflow_dispatch", false],
     ["refs/pull/1/merge", "pull_request", false],
   ]) assert.equal(mayDeploy({ ref, event_name }), expected, `${event_name} on ${ref}`);
   assert.match(check, /concurrency:\n      group: ci-.*\n      cancel-in-progress: true/);
@@ -386,9 +412,19 @@ test("integration gates same-run deployment on successful checks and keeps cover
   assert.match(deploy, /INTEGRATION_RUN_ID: \$\{\{ inputs\.run_id \}\}/);
   const deploymentCondition = deploy.match(/^    if: (.+)$/m)?.[1];
   assert.ok(deploymentCondition);
-  const mayRunDeployment = new Function("github", `return (${deploymentCondition});`);
+  const mayRunDeployment = new Function("github", "inputs", "startsWith", `return (${deploymentCondition});`);
   assert.equal(mayRunDeployment({ ref: "refs/heads/main" }), true);
-  assert.equal(mayRunDeployment({ ref: "refs/heads/feature" }), false);
+  const startsWith = (value, prefix) => value.startsWith(prefix);
+  for (const [ref, event_name, run_id, expected] of [
+    ["refs/heads/feat", "workflow_dispatch", "123", true],
+    ["refs/heads/feat/rust-worker-expansion", "workflow_dispatch", "123", true],
+    ["refs/heads/feat/test", "push", "123", false],
+    ["refs/heads/feat/test", "pull_request", "123", false],
+    ["refs/heads/feat/test", "workflow_dispatch", "", false],
+    ["refs/heads/feature", "workflow_dispatch", "123", false],
+    ["refs/heads/feat-other", "workflow_dispatch", "123", false],
+    ["refs/tags/feat/test", "workflow_dispatch", "123", false],
+  ]) assert.equal(mayRunDeployment({ ref, event_name }, { run_id }, startsWith), expected, `${event_name} on ${ref}`);
   assert.ok(deploy.indexOf("id: source") < deploy.indexOf("- name: Check out source"));
   assert.match(deploy, /just db-migrate production/);
   assert.doesNotMatch(deploy, /TARGET_ENV|inputs\.environment|outputs\.environment/);

@@ -78,6 +78,7 @@ coverage-setup:
     cargo install cargo-llvm-cov --version "=$(node -p "require('./package.json').config.llvmCovVersion")" --locked --root .tools
 
 coverage:
+    mkdir -p coverage
     cargo llvm-cov --lib --locked --lcov --output-path coverage/lcov.info
 
 doctor:

@@ -62,7 +62,7 @@ just dev
 
 三份工作流分别承担 Integration 检查与构建、Coverage 覆盖率，以及 Cloudflare 产物部署。PR 只检查和构建；main 推送或手动运行 main 的 Integration 时，完整检查和构建成功后自动调用 `cloudflare.yaml` 部署本次产物。
 
-复用已有产物时，先将工作流文件推入 main，再到 Actions → Deploy to Cloudflare → Run workflow，选择 main，并在必填的 `run_id` 中输入 Integration 运行 URL `/actions/runs/<run_id>` 里的数字。只接受同仓库 main 上由推送或手动触发、已经结束且最新 check 执行成功的 Integration；整体因部署失败而失败的运行也可重试。产物保留 14 天，过期需重新运行 Integration。手动部署精确检出产物对应的提交并校验摘要，不重新编译；仍会迁移生产 D1、上传并检查健康接口，不回滚数据库。详见[部署工作流](docs/deployment.md#部署环境与工作流)。
+复用已有产物时，先确保默认分支已有工作流，再到 Actions → Deploy to Cloudflare → Run workflow，选择 main、feat 或 feat/* 分支，并在必填的 `run_id` 中输入同一分支 Integration URL `/actions/runs/<run_id>` 的数字。只接受同仓库同分支由推送或手动触发、已经结束且最新 check 成功的 Integration；整体因部署失败而失败的运行也可重试。feat 推送只检查，手动部署仍使用现有生产资源。产物保留14天；手动部署精确检出来源commit并校验摘要，不重新编译，也不回滚数据库。详见[feat手动部署步骤](docs/deployment.md#手动部署-feat-分支)。
 
 结构快照来自全部 10 份迁移，共 19 表、38 个显式 DDL 对象。纯 Rust 运行路径的测试、构建与环境验证结果见 [执行记录](docs/implementation-plan.md#8-执行记录)；脚本和前端仍有独立 Node 测试。
 
