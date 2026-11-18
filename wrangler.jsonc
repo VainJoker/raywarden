@@ -89,7 +89,7 @@
     {
       "binding": "warden-db",
       "database_name": "warden-db",
-      "database_id": "6bb5ee22-69d1-4f71-a9c2-8ff1187b988e",
+      "database_id": "619ed8d2-2e40-4e96-a4e6-619cbe6c9447",
       "migrations_dir": "sql/migrations"
     }
   ],
