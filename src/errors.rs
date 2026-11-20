@@ -2,6 +2,11 @@ use bizerror::BizError;
 use serde_json::Value;
 use thiserror::Error as ThisError;
 
+mod database;
+mod domain;
+pub(crate) mod protocol;
+mod response;
+
 // ============================================================================
 // Public Result Alias
 // ============================================================================
@@ -65,15 +70,23 @@ pub enum AppError {
     #[error("Rate limit exceeded")]
     TooManyRequests { message: String },
 
+    #[error("Service temporarily unavailable")]
+    ServiceUnavailable,
+
     #[error("Internal server error")]
     Internal,
 
-    #[bizcode(3110)]
-    #[error("Two factor authentication required")]
-    TwoFactorRequired(Box<[i32]>),
-
     #[error("Additional identity verification required")]
     IdentityChallenge(Value),
+
+    #[error("{0}")]
+    Upstream(String),
+
+    // Share the existing Internal response code for failures with private
+    // details.
+    #[bizcode(13)]
+    #[error("Internal server error: {0}")]
+    InternalFailure(String),
 }
 
 #[derive(ThisError, BizError)]
@@ -114,7 +127,7 @@ pub enum AuthError {
     InvalidPassword,
 
     #[error("Invalid KDF parameters : {0}")]
-    InvalidKDF(String),
+    InvalidKdf(String),
 
     #[error("Invalid TOTP code")]
     InvalidTotp,
@@ -123,16 +136,16 @@ pub enum AuthError {
 #[derive(ThisError, BizError)]
 #[bizconfig(auto_start = 4000, auto_increment = 1)]
 pub enum CryptoError {
-    #[error("PBKDF2 key derivation failed")]
-    Pbkdf2Failed,
-    #[error("HMAC computation failed")]
-    HmacFailed,
-    #[error("Random value generation failed")]
-    RandomGenerationFailed,
-    #[error("Hashing operation failed")]
-    HashFailed,
-    #[error("Key derivation failed")]
-    KeyDerivationFailed,
+    #[error("PBKDF2 key derivation failed: {0}")]
+    Pbkdf2Failed(&'static str),
+    #[error("HMAC computation failed: {0}")]
+    HmacFailed(&'static str),
+    #[error("Random value generation failed: {0}")]
+    RandomGenerationFailed(&'static str),
+    #[error("Hashing operation failed: {0}")]
+    HashFailed(&'static str),
+    #[error("Key derivation failed: {0}")]
+    KeyDerivationFailed(&'static str),
     #[error("Invalid Base32 encoding")]
     InvalidBase32,
 }
@@ -173,15 +186,40 @@ pub enum JwtError {
 }
 
 impl AppError {
-    pub fn bad_request(msg: impl Into<String>) -> Self {
+    pub(crate) fn internal_error<E>(_: E) -> Self {
+        Self::Internal
+    }
+
+    pub(crate) fn internal_with_context(
+        target: &str,
+        context: &str,
+        error: impl std::fmt::Display,
+    ) -> Self {
+        log::error!(target: target, "{context}: {error}");
+        Self::Internal
+    }
+
+    pub(crate) fn kv_error(error: impl std::fmt::Display) -> Self {
+        worker_failure(format!("KV operation failed: {error}")).into()
+    }
+
+    pub(crate) fn upload_stream_error(error: impl std::fmt::Display) -> Self {
+        Self::bad_request(format!("Upload stream failed: {error}"))
+    }
+
+    pub(crate) fn upstream_error(error: impl std::fmt::Display) -> Self {
+        Self::Upstream(error.to_string())
+    }
+
+    pub fn bad_request(message: impl Into<String>) -> Self {
         Self::BadRequest {
-            message: msg.into(),
+            message: message.into(),
         }
     }
 
-    pub fn not_found(res: impl Into<String>) -> Self {
+    pub fn not_found(resource: impl Into<String>) -> Self {
         Self::NotFound {
-            resource: res.into(),
+            resource: resource.into(),
         }
     }
 
@@ -193,7 +231,11 @@ impl AppError {
 }
 
 impl From<AppError> for worker::Error {
-    fn from(err: AppError) -> Self {
-        Self::RustError(err.to_string())
+    fn from(error: AppError) -> Self {
+        worker_failure(error.to_string())
     }
+}
+
+pub(crate) fn worker_failure(message: impl Into<String>) -> worker::Error {
+    worker::Error::RustError(message.into())
 }

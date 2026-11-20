@@ -1,11 +1,11 @@
 import assert from "node:assert/strict";
-import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import test from "node:test";
 import {
   parseJsonc, PROJECT_ROOT, readTargetConfig,
-  CloudflareApi, verifyResources, resolveAccountId, checkHealth, parseDeployArgs, main as deployMain,
+  CloudflareApi, verifyResources, resolveAccountId, checkHealth, main as deployMain,
 } from "../scripts/deploy.mjs";
 
 const account = "a".repeat(32);
@@ -13,167 +13,21 @@ const uuid = "11111111-1111-4111-8111-111111111111";
 function fixture(t, transform = (value) => value) {
   const dir = mkdtempSync(join(tmpdir(), "raywarden-deployment-test-"));
   t.after(() => rmSync(dir, { recursive: true, force: true }));
-  const binding = { binding: "warden-db", database_name: "configured-database", database_id: uuid, migrations_dir: "sql/migrations" };
-  const config = transform({ name: "configured-worker", secrets: { required: ["DOMAIN"] }, routes: [{ pattern: "vault.example.test", custom_domain: true }], d1_databases: [binding], r2_buckets: [{ binding: "ATTACHMENTS_BUCKET", bucket_name: "configured-files" }] });
+  const binding = { binding: "DB", database_name: "configured-database", database_id: uuid, migrations_dir: "sql/migrations" };
+  const config = transform({
+    name: "configured-worker", secrets: { required: ["DOMAIN", "KEY_ENCRYPTION_KEY"] }, routes: [{ pattern: "vault.example.test", custom_domain: true }],
+    observability: { redact_query_string: true, logs: { enabled: true, invocation_logs: false } },
+    d1_databases: [binding], r2_buckets: [{ binding: "ATTACHMENTS_BUCKET", bucket_name: "configured-files" }],
+    ratelimits: [
+      { name: "LOGIN_RATE_LIMITER", namespace_id: "3101", simple: { limit: 5, period: 60 } },
+      { name: "SEND_ACCESS_RATE_LIMITER", namespace_id: "3103", simple: { limit: 15, period: 60 } },
+    ],
+  });
   const configPath = join(dir, "wrangler.jsonc");
   writeFileSync(configPath, JSON.stringify(config));
   return { dir, configPath, config };
 }
 const response = (result, status = 200) => new Response(JSON.stringify({ success: status < 400, result }), { status });
-
-// Execute the actual inline resolver; the GitHub client is the only substitute.
-function sourceFixture({ input = "123", source = {}, jobs, ref = "refs/heads/main", eventName = "workflow_dispatch", message = "" } = {}) {
-  const workflow = readFileSync(resolve(PROJECT_ROOT, ".github/workflows/cloudflare.yaml"), "utf8");
-  const script = workflow.match(/^          script: \|\n((?:            [^\n]*\n|\n)+)/m)?.[1];
-  assert.ok(script, "Missing inline deployment source resolver");
-  const execute = new (async () => {}).constructor("github", "context", "core", "process", script.replace(/^            /gm, ""));
-  const sha = "a".repeat(40);
-  const run = {
-    repository: { full_name: "example/raywarden" }, head_repository: { full_name: "example/raywarden" },
-    path: ".github/workflows/integration.yml", head_branch: "main", event: "push", head_sha: sha,
-    status: "completed", conclusion: "failure", run_attempt: 2, ...source,
-  };
-  const check = {
-    name: "Linux Rust, JavaScript, SQL and Worker build", head_sha: sha,
-    status: "completed", conclusion: "success", run_attempt: 1,
-  };
-  const calls = [], outputs = {};
-  const actions = {
-    async getWorkflowRun(options) { calls.push(["run", options]); return { data: run }; },
-    listJobsForWorkflowRun() { throw new Error("Jobs must be paginated"); },
-  };
-  const github = {
-    rest: { actions },
-    async paginate(method, options) {
-      assert.equal(method, actions.listJobsForWorkflowRun);
-      calls.push(["jobs", options]);
-      return jobs ?? [check, { name: "Deploy to Cloudflare", conclusion: "failure", run_attempt: 2 }];
-    },
-  };
-  const context = {
-    repo: { owner: "example", repo: "raywarden" }, sha: "b".repeat(40), runId: 900,
-    ref, eventName, workflow: "Integration", payload: { head_commit: { message } },
-  };
-  const core = { setOutput(name, value) { outputs[name] = String(value); } };
-  return {
-    calls, outputs, check, github, context,
-    resolve: () => execute(github, context, core, { env: { INTEGRATION_RUN_ID: input } }),
-  };
-}
-
-test("reusable deployment keeps its own run even when Integration was manually triggered", async () => {
-  const f = sourceFixture({ input: "" });
-  await f.resolve();
-  assert.deepEqual(f.calls, []);
-  assert.deepEqual(f.outputs, { sha: f.context.sha, run_id: String(f.context.runId) });
-});
-
-test("manual deployment selects the source commit and permits retry after a failed deployment", async () => {
-  for (const event of ["push", "workflow_dispatch"]) {
-    const f = sourceFixture({ input: " 123 ", source: { event } });
-    await f.resolve();
-    assert.deepEqual(f.outputs, { sha: "a".repeat(40), run_id: "123" });
-    assert.notEqual(f.outputs.sha, f.context.sha);
-    assert.deepEqual(f.calls, [
-      ["run", { owner: "example", repo: "raywarden", run_id: "123" }],
-      ["jobs", { owner: "example", repo: "raywarden", run_id: "123", filter: "all", per_page: 100 }],
-    ]);
-  }
-});
-
-test("manual deployment rejects foreign, PR, mismatched branch, unfinished and malformed sources before selecting an artifact", async () => {
-  for (const source of [
-    { repository: { full_name: "other/raywarden" } }, { head_repository: { full_name: "fork/raywarden" } },
-    { head_repository: null }, { path: ".github/workflows/coverage.yml" }, { head_branch: "feature" },
-    { event: "pull_request" }, { event: "workflow_run" }, { status: "in_progress" }, { status: "queued" },
-    { head_sha: "main" },
-  ]) {
-    const f = sourceFixture({ source });
-    await assert.rejects(f.resolve(), /Source must|Wait for/);
-    assert.deepEqual(f.outputs, {});
-    assert.equal(f.calls.length, 1);
-  }
-});
-
-test("manual feature deployment selects only validated artifacts from the selected feature branch", async () => {
-  for (const branch of ["feat", "feat/rust-worker-expansion", "feat/nested/work"]) {
-    const f = sourceFixture({ ref: `refs/heads/${branch}`, source: { head_branch: branch } });
-    await f.resolve();
-    assert.deepEqual(f.outputs, { sha: "a".repeat(40), run_id: "123" });
-    for (const head_branch of ["main", "feat/another-branch"]) {
-      const wrong = sourceFixture({ ref: `refs/heads/${branch}`, source: { head_branch } });
-      await assert.rejects(wrong.resolve(), /selected branch/);
-      assert.deepEqual(wrong.outputs, {});
-    }
-  }
-  for (const ref of ["refs/heads/feature", "refs/heads/feat-other", "refs/tags/main", "refs/pull/1/merge"]) {
-    const f = sourceFixture({ ref });
-    await assert.rejects(f.resolve(), /Deployment branch/);
-    assert.deepEqual(f.calls, []);
-  }
-  for (const options of [{ input: "" }, { input: "   " }, { eventName: "push" }, { eventName: "pull_request" }]) {
-    const f = sourceFixture({ ref: "refs/heads/feat/test", ...options });
-    await assert.rejects(f.resolve(), /Feature deployment requires/);
-    assert.deepEqual(f.calls, []);
-  }
-});
-
-test("marked feature pushes reuse the successful caller run and exact commit without a manual run ID", async () => {
-  for (const branch of ["feat", "feat/rust-worker-expansion"]) {
-    for (const message of ["[deploy] test feature", "[DEPLOY] test feature"]) {
-      const f = sourceFixture({ input: "", ref: `refs/heads/${branch}`, eventName: "push", message });
-      await f.resolve();
-      assert.deepEqual(f.calls, []);
-      assert.deepEqual(f.outputs, { sha: f.context.sha, run_id: String(f.context.runId) });
-    }
-  }
-  for (const message of ["", "ordinary change", "docs: explain [deploy]", " [deploy] leading space", "[deployment] other marker"]) {
-    const f = sourceFixture({ input: "", ref: "refs/heads/feat/test", eventName: "push", message });
-    await assert.rejects(f.resolve(), /Feature deployment requires/);
-    assert.deepEqual(f.outputs, {});
-    assert.deepEqual(f.calls, []);
-  }
-  for (const eventName of ["pull_request", "workflow_dispatch"]) {
-    const f = sourceFixture({ input: "", ref: "refs/heads/feat/test", eventName, message: "[deploy] test" });
-    await assert.rejects(f.resolve(), /Feature deployment requires/);
-  }
-});
-
-test("manual deployment requires the latest check success and cannot fall back to a previous successful attempt", async () => {
-  const { check } = sourceFixture();
-  for (const jobs of [
-    [], [{ ...check, name: "unrelated job" }], [{ ...check, head_sha: "c".repeat(40) }],
-    [{ ...check, run_attempt: undefined }], [{ ...check, run_attempt: 0 }],
-    [check, { ...check, run_attempt: 2, conclusion: "failure" }],
-    [check, { ...check, run_attempt: 2, conclusion: "cancelled" }],
-    [check, { ...check, run_attempt: 2, status: "in_progress", conclusion: null }],
-    [{ ...check, conclusion: "skipped" }],
-  ]) {
-    const f = sourceFixture({ jobs });
-    await assert.rejects(f.resolve(), /Cannot identify|latest Integration check/);
-    assert.deepEqual(f.outputs, {});
-  }
-  const f = sourceFixture({ jobs: [{ ...check, run_attempt: 2 }, { ...check, conclusion: "failure" }] });
-  await f.resolve();
-  assert.equal(f.outputs.sha, check.head_sha);
-});
-
-test("malformed run IDs and GitHub API failures never select an artifact", async () => {
-  for (const input of ["0", "-1", "1e3", "123\n456", "$(command)"]) {
-    const f = sourceFixture({ input });
-    await assert.rejects(f.resolve(), /positive integer/);
-    assert.deepEqual(f.calls, []);
-    assert.deepEqual(f.outputs, {});
-  }
-  for (const stage of ["run", "jobs"]) {
-    const f = sourceFixture();
-    const fail = async () => { throw new Error("GitHub unavailable"); };
-    if (stage === "run") f.github.rest.actions.getWorkflowRun = fail;
-    else f.github.paginate = fail;
-    await assert.rejects(f.resolve(), /GitHub unavailable/);
-    assert.deepEqual(f.outputs, {});
-  }
-});
 
 test("JSONC parsing preserves URLs, escaped quotes, comment-like strings and comma text", () => {
   const source = String.raw`{ // comment
@@ -183,14 +37,6 @@ test("JSONC parsing preserves URLs, escaped quotes, comment-like strings and com
   assert.throws(() => parseJsonc('{"x":1/*unclosed'), /Unterminated/);
   assert.throws(() => parseJsonc('{"x":1 "y":2}'));
 });
-
-test("remote commands are production-only and reject environment selection", () => {
-  assert.deepEqual(parseDeployArgs(["config"]), { command: "config" });
-  for (const args of [["config", "--env"], ["config", "--env", "production"], ["worker", "--env", "dev"]]) {
-    assert.throws(() => parseDeployArgs(args), /Unknown/);
-  }
-});
-
 
 test("deployment health origin comes from a unique explicit route without a DOMAIN value", (t) => {
   const { configPath, config } = fixture(t);
@@ -238,8 +84,11 @@ test("deployment rejects ambiguous routes, wildcards, schemes and non-hostname h
 
 test("deployment CLI ignores WRANGLER_CONFIG and selects the fixed production config", async (t) => {
   const alternate = fixture(t);
-  const target = await deployMain(["config"], { WRANGLER_CONFIG: alternate.configPath, CLOUDFLARE_ENV: "removed-environment" });
-  assert.equal(target.configPath, resolve(PROJECT_ROOT, "wrangler.jsonc"));
+  const configPath = resolve(PROJECT_ROOT, "wrangler.jsonc");
+  const production = parseJsonc(readFileSync(configPath, "utf8"));
+  const target = await deployMain(["config"], { WRANGLER_CONFIG: alternate.configPath, CLOUDFLARE_ENV: "local" });
+  assert.equal(target.configPath, configPath);
+  assert.equal(target.name, production.name);
   assert.notEqual(target.database.database_id, alternate.config.d1_databases[0].database_id);
 });
 
@@ -267,6 +116,23 @@ test("invalid configuration fails before any Cloudflare request", async (t) => {
   let called = false;
   await assert.rejects(verifyResources({ CLOUDFLARE_API_TOKEN: "test" }, () => { called = true; }, { configPath }), /real database_id/);
   assert.equal(called, false);
+});
+
+test("credential URL redaction and an external wrapping key are required before remote operations", async (t) => {
+  for (const change of [
+    config => { delete config.observability; },
+    config => { delete config.observability.redact_query_string; },
+    config => { config.observability.redact_query_string = false; },
+    config => { config.observability.redact_query_string = "true"; },
+    config => { delete config.secrets; },
+    config => { config.secrets.required = ["DOMAIN"]; },
+    config => { config.vars = { KEY_ENCRYPTION_KEY: "never-a-production-var" }; },
+  ]) {
+    const { configPath } = fixture(t, config => { change(config); return config; });
+    let calls = 0;
+    await assert.rejects(verifyResources({ CLOUDFLARE_API_TOKEN: "test" }, () => { calls++; }, { configPath }), /redact_query_string|KEY_ENCRYPTION_KEY/);
+    assert.equal(calls, 0);
+  }
 });
 
 test("resource verification uses only configured identities and GET, without editing config", async (t) => {
@@ -321,9 +187,49 @@ test("health checks configured /api/alive, retries failures and rejects SPA/redi
 
 test("configuration rejects unsupported bindings", (t) => {
   const badD1 = fixture(t, (c) => { c.d1_databases[0].binding = "wrong"; return c; });
-  assert.throws(() => readTargetConfig({ configPath: badD1.configPath }), /binding=warden-db/);
+  assert.throws(() => readTargetConfig({ configPath: badD1.configPath }), /binding=DB/);
   const badR2 = fixture(t, (c) => { c.r2_buckets[0].binding = "wrong"; return c; });
   assert.throws(() => readTargetConfig({ configPath: badR2.configPath }), /incomplete R2/);
+});
+
+test("rate limit configuration fails before remote discovery when required bindings are missing or ambiguous", async (t) => {
+  for (const change of [
+    config => { delete config.ratelimits; },
+    config => { config.ratelimits = {}; },
+    config => { config.ratelimits = []; },
+    config => { config.ratelimits.splice(0, 1); },
+    config => { config.ratelimits.splice(1, 1); },
+    config => { config.ratelimits[0].name = "LOGIN_RATE_LIMITER_typo"; },
+    config => { config.ratelimits.push({ ...config.ratelimits[0] }); },
+    config => { config.ratelimits[1].namespace_id = "03101"; },
+  ]) {
+    const { configPath } = fixture(t, config => { change(config); return config; });
+    let requests = 0;
+    await assert.rejects(verifyResources({ CLOUDFLARE_API_TOKEN: "test" }, () => { requests++; }, { configPath }), /rate limit|ratelimits/);
+    assert.equal(requests, 0);
+  }
+});
+
+test("rate limit configuration rejects invalid provider parameters without echoing their values", (t) => {
+  const invalid = [
+    ...[undefined, "", "private-limiter-value", 3101, "1.5", "-1"].map(namespace_id => binding => { binding.namespace_id = namespace_id; }),
+    ...[undefined, null, {}].map(simple => binding => { binding.simple = simple; }),
+    ...[0, -1, 1.5, "5", Number.MAX_SAFE_INTEGER + 1].map(limit => binding => { binding.simple.limit = limit; }),
+    ...[0, 30, "60", null].map(period => binding => { binding.simple.period = period; }),
+  ];
+  for (const index of [0, 1]) for (const change of invalid) {
+    const { configPath } = fixture(t, config => { change(config.ratelimits[index]); return config; });
+    assert.throws(() => readTargetConfig({ configPath }), error => {
+      assert.match(error.message, /LOGIN_RATE_LIMITER|SEND_ACCESS_RATE_LIMITER/);
+      assert.match(error.message, /namespace_id|simple/);
+      assert.equal(error.message.includes("private-limiter-value"), false);
+      return true;
+    });
+  }
+  for (const period of [10, 60]) {
+    const { configPath } = fixture(t, config => { config.ratelimits[0].simple = { limit: 7, period }; return config; });
+    assert.equal(readTargetConfig({ configPath }).name, "configured-worker");
+  }
 });
 
 test("resources and health discover workers.dev without a custom domain or DOMAIN value", async (t) => {
@@ -360,133 +266,84 @@ test("workers.dev discovery reports missing subdomains, disabled endpoints and A
   await assert.rejects(checkHealth({ configPath: disabled.configPath }, () => { throw new Error("Unexpected fetch"); }, undefined, env), /enable workers_dev/);
 });
 
-test("integration gates same-run deployment on successful checks and keeps coverage separate", () => {
+test("Integration gates same-run deployment on both checks and coverage, and only stores release artifacts", () => {
   const integration = readFileSync(resolve(PROJECT_ROOT, ".github/workflows/integration.yml"), "utf8");
-  const coverage = readFileSync(resolve(PROJECT_ROOT, ".github/workflows/coverage.yml"), "utf8");
-  const [check, deployCall] = integration.split("\n  deploy:\n");
-  const deploy = readFileSync(resolve(PROJECT_ROOT, ".github/workflows/cloudflare.yaml"), "utf8");
-  assert.ok(deployCall, "Integration must call deployment after checks");
-  assert.match(deployCall, /uses: \.\/\.github\/workflows\/cloudflare\.yaml/);
-  assert.match(deployCall, /secrets: inherit/);
-  assert.match(deploy, /workflow_call:/);
-  assert.match(deploy, /ALLOWED_EMAILS: \$\{\{ secrets\.ALLOWED_EMAILS \}\}/);
-  assert.match(deploy, /OWNER_SETUP_TOKEN: \$\{\{ secrets\.OWNER_SETUP_TOKEN \}\}/);
-  assert.doesNotMatch(deploy, /DOMAIN: \$\{\{ secrets\.DOMAIN \}\}/);
-  assert.match(deploy, /workflow_dispatch:\n    inputs:\n      run_id:/);
-  assert.match(deploy, /required: true\n        type: string/);
-  assert.doesNotMatch(deploy, /workflow_run:/);
-  const setup = readFileSync(resolve(PROJECT_ROOT, ".github/actions/setup/action.yml"), "utf8");
-  assert.doesNotMatch(integration, /just bootstrap|dependency-locks/);
-  assert.match(integration, /just setup/);
-  assert.match(integration, /just ci/);
-  assert.match(integration, /just ui-download/);
-  assert.match(integration, /just dry-run/);
-  assert.match(integration, /just test-worker/);
-  assert.ok(integration.indexOf("run: just dry-run") < integration.indexOf("run: just test-worker"));
-  assert.ok(integration.indexOf("run: just test-worker") < integration.indexOf("run: just artifact"));
-  assert.match(integration, /run: just artifact$/m);
-  assert.match(setup, /config\.justVersion/);
-  assert.match(setup, /node-version-file: \.node-version/);
-  assert.match(setup, /default: "false"/);
-  for (const workflow of [integration, coverage, deploy]) assert.match(workflow, /uses: \.\/\.github\/actions\/setup/);
-  for (const workflow of [check, coverage]) assert.match(workflow, /rust: "true"/);
-  assert.doesNotMatch(deploy, /rust: "true"/);
-  assert.match(integration, /include-hidden-files: true/);
-  assert.match(integration, /overwrite: true/);
-  assert.match(integration, /name: raywarden-release-production-\$\{\{ github\.sha \}\}/);
-  assert.doesNotMatch(integration, /TARGET_ENV|inputs\.environment|options: \[production, dev\]/);
-  assert.match(integration, /\.wrangler\/deploy-check\//);
-  assert.match(coverage, /just coverage-setup/);
+  const deploy = readFileSync(resolve(PROJECT_ROOT, ".github/workflows/cloudflare.yml"), "utf8");
+  const [check, rest] = integration.split("\n  coverage:\n");
+  const [coverage, deployCall] = rest.split("\n  deploy:\n");
+  assert.ok(coverage && deployCall);
+  assert.match(deployCall, /needs: \[check, coverage\]/);
+  assert.match(deployCall, /uses: \.\/\.github\/workflows\/cloudflare\.yml/);
   assert.match(coverage, /just coverage$/m);
-  assert.match(coverage, /coverage\/lcov\.info/);
-  assert.doesNotMatch(coverage, /tarpaulin|just ci|just ui|just dry-run/);
-  assert.match(integration, /workflow_dispatch:/);
-  assert.match(deployCall, /needs: check/);
-  assert.doesNotMatch(integration, /workflow_run:|run_id|run-id:|github-token:|getWorkflowRun|always\(\)/);
-  assert.doesNotMatch(check, /actions: read/);
-  assert.match(deployCall, /permissions:\n      contents: read\n      actions: read/);
-  assert.match(deploy, /permissions:\n  contents: read\n  actions: read/);
-  const condition = deployCall.match(/^    if: (.+)$/m)?.[1];
-  assert.ok(condition, "Deployment must explicitly restrict its branch and event");
-  const startsWith = (value, prefix) => String(value ?? "").toLowerCase().startsWith(prefix.toLowerCase());
-  const mayDeploy = new Function("github", "startsWith", `return (${condition});`);
-  for (const [ref, event_name, expected] of [
-    ["refs/heads/main", "push", true],
-    ["refs/heads/main", "workflow_dispatch", true],
-    ["refs/heads/main", "pull_request", false],
-    ["refs/heads/feature", "push", false],
-    ["refs/heads/feature", "workflow_dispatch", false],
-    ["refs/heads/feat", "push", false],
-    ["refs/heads/feat/rust-worker-expansion", "push", false],
-    ["refs/heads/feat/rust-worker-expansion", "workflow_dispatch", false],
-    ["refs/pull/1/merge", "pull_request", false],
-  ]) assert.equal(mayDeploy({ ref, event_name, event: { head_commit: { message: "ordinary change" } } }, startsWith), expected, `${event_name} on ${ref}`);
-  for (const [ref, event_name, message, expected] of [
-    ["refs/heads/feat/test", "push", "[deploy] test", true],
-    ["refs/heads/feat", "push", "[DEPLOY] test", true],
-    ["refs/heads/feat/test", "push", "docs: explain [deploy]", false],
-    ["refs/heads/feat/test", "pull_request", "[deploy] test", false],
-    ["refs/heads/feat/test", "workflow_dispatch", "[deploy] test", false],
-    ["refs/heads/feature", "push", "[deploy] test", false],
-    ["refs/tags/feat/test", "push", "[deploy] test", false],
-  ]) assert.equal(mayDeploy({ ref, event_name, event: { head_commit: { message } } }, startsWith), expected, `${message} on ${ref}`);
-  assert.match(check, /concurrency:\n      group: ci-.*\n      cancel-in-progress: true/);
-  assert.match(deploy, /concurrency:\n      group: cloudflare-deploy-.*\n      cancel-in-progress: false/);
-  assert.equal(deploy.match(/ARTIFACT_SOURCE_SHA: \$\{\{ steps\.source\.outputs\.sha \}\}/g)?.length, 2);
-  assert.match(deploy, /actions\/download-artifact@v7/);
-  assert.match(deploy, /environment: production/);
-  assert.match(deploy, /ref: \$\{\{ steps\.source\.outputs\.sha \}\}/);
-  assert.match(deploy, /name: raywarden-release-production-\$\{\{ steps\.source\.outputs\.sha \}\}/);
-  assert.match(deploy, /github-token: \$\{\{ github\.token \}\}/);
-  assert.match(deploy, /repository: \$\{\{ github\.repository \}\}/);
-  assert.match(deploy, /run-id: \$\{\{ steps\.source\.outputs\.run_id \}\}/);
-  assert.match(deploy, /INTEGRATION_RUN_ID: \$\{\{ inputs\.run_id \}\}/);
-  const deploymentCondition = deploy.match(/^    if: (.+)$/m)?.[1];
-  assert.ok(deploymentCondition);
-  const mayRunDeployment = new Function("github", "inputs", "startsWith", `return (${deploymentCondition});`);
-  assert.equal(mayRunDeployment({ ref: "refs/heads/main" }), true);
-  for (const [ref, event_name, run_id, expected] of [
-    ["refs/heads/feat", "workflow_dispatch", "123", true],
-    ["refs/heads/feat/rust-worker-expansion", "workflow_dispatch", "123", true],
-    ["refs/heads/feat/test", "push", "123", false],
-    ["refs/heads/feat/test", "pull_request", "123", false],
-    ["refs/heads/feat/test", "workflow_dispatch", "", false],
-    ["refs/heads/feature", "workflow_dispatch", "123", false],
-    ["refs/heads/feat-other", "workflow_dispatch", "123", false],
-    ["refs/tags/feat/test", "workflow_dispatch", "123", false],
-  ]) assert.equal(mayRunDeployment({ ref, event_name, event: { head_commit: { message: "ordinary change" } } }, { run_id }, startsWith), expected, `${event_name} on ${ref}`);
-  for (const [ref, event_name, message, expected] of [
-    ["refs/heads/feat/test", "push", "[deploy] test", true],
-    ["refs/heads/feat", "push", "[DEPLOY] test", true],
-    ["refs/heads/feat/test", "push", "docs: explain [deploy]", false],
-    ["refs/heads/feat/test", "pull_request", "[deploy] test", false],
-    ["refs/heads/feature", "push", "[deploy] test", false],
-    ["refs/tags/feat/test", "push", "[deploy] test", false],
-  ]) assert.equal(mayRunDeployment({ ref, event_name, event: { head_commit: { message } } }, { run_id: "" }, startsWith), expected, `${message} on ${ref}`);
-  assert.ok(deploy.indexOf("id: source") < deploy.indexOf("- name: Check out source"));
-  assert.match(deploy, /just db-migrate production/);
-  assert.doesNotMatch(deploy, /TARGET_ENV|inputs\.environment|outputs\.environment/);
+  assert.match(check, /run: just ci[\s\S]*run: just dry-run[\s\S]*run: just test-worker[\s\S]*run: just artifact/);
+  assert.match(check, /if: startsWith\(github.ref, 'refs\/tags\/v'\)\s+run: just artifact/);
+  assert.match(check, /if: startsWith\(github.ref, 'refs\/tags\/v'\)\s+uses: actions\/upload-artifact@/);
+  assert.match(deploy, /on:\n  workflow_call:/);
+  assert.doesNotMatch(deploy, /workflow_dispatch:|inputs[.:]|run_id|run-id:|getWorkflowRun|listJobsForWorkflowRun/);
+  assert.match(deploy, /queue: max/);
   assert.match(deploy, /cancel-in-progress: false/);
-  assert.match(deploy, /just artifact-check/);
-  assert.match(deploy, /just setup-deploy/);
-  assert.doesNotMatch(deploy, /just setup(?: |$)|just ci|just dry-run|just bootstrap|just build|cargo|rustup|just ui/m);
-  assert.ok(deploy.indexOf('just artifact-check') < deploy.indexOf('just db-migrate'));
-  assert.ok(deploy.indexOf('just db-migrate') < deploy.indexOf('just deploy-worker'));
-  for (const old of ["ci.yml", "deploy.yml"]) assert.equal(existsSync(resolve(PROJECT_ROOT, ".github/workflows", old)), false);
+  assert.match(deploy, /environment: production/);
+  assert.match(deploy, /run: just artifact-check[\s\S]*just db-migrate production[\s\S]*run: just deploy-worker[\s\S]*run: just health/);
+  assert.doesNotMatch(deploy, /just ci|just dry-run|just build|rust: "true"/);
+  assert.match(deploy, /ref: \$\{\{ github\.sha \}\}/);
+  assert.match(deploy, /ARTIFACT_SOURCE_SHA: \$\{\{ github\.sha \}\}/);
+  for (const workflow of [integration, deploy]) {
+    assert.match(workflow, /name: raywarden-release-production-\$\{\{ github\.sha \}\}/);
+    assert.doesNotMatch(workflow, /\bfeat\b|\[deploy\]|head_commit\.message/);
+  }
+  for (const job of [deployCall, deploy]) {
+    assert.match(job, /^    if: startsWith\(github\.ref, 'refs\/tags\/v'\) && \(github\.event_name == 'push' \|\| github\.event_name == 'workflow_dispatch'\)$/m);
+  }
+});
+
+test("Release-plz queues main releases and publishes to Git before preparing the next PR", () => {
+  const workflow = readFileSync(resolve(PROJECT_ROOT, ".github/workflows/release.yml"), "utf8");
+  const config = readFileSync(resolve(PROJECT_ROOT, "release-plz.toml"), "utf8");
+  const cargo = readFileSync(resolve(PROJECT_ROOT, "Cargo.toml"), "utf8");
+  assert.match(workflow, /if: github.ref == 'refs\/heads\/main'/);
+  assert.match(workflow, /push:\n    branches: \[main\]/);
+  assert.match(workflow, /fetch-depth: 0/);
+  assert.match(workflow, /persist-credentials: false/);
+  assert.match(workflow, /cancel-in-progress: false\n  queue: max/);
+  assert.match(workflow, /permissions:\n  contents: read/);
+  assert.doesNotMatch(workflow, /release-plz\/action|secrets.GITHUB_TOKEN|CARGO_REGISTRY_TOKEN|just deploy|secrets: inherit/);
+  assert.match(workflow, /GITHUB_TOKEN: \$\{\{ secrets.RELEASE_PLZ_TOKEN \}\}/);
+  assert.match(workflow, /release-plz release --git-token[\s\S]*release-plz release-pr --git-token/);
+  assert.match(config, /^git_only = true$/m);
+  assert.match(config, /^release_always = false$/m);
+  assert.match(config, /^git_tag_name = "v\{\{ version \}\}"$/m);
+  assert.match(config, /^dependencies_update = false$/m);
+  assert.match(cargo.split("[lib]")[0], /^publish = false$/m);
+});
+
+test("Dependabot merging explicitly requires both GitHub Actions checks", () => {
+  const config = readFileSync(resolve(PROJECT_ROOT, ".github/mergify.yml"), "utf8");
+  const workflow = readFileSync(resolve(PROJECT_ROOT, ".github/workflows/integration.yml"), "utf8");
+  assert.match(config, /base=main/);
+  for (const job of ["check", "coverage"]) {
+    const name = workflow.match(new RegExp(`^  ${job}:\\n    name: (.+)$`, "m"))?.[1];
+    assert.ok(name, `Integration is missing its ${job} status check`);
+    assert.ok(config.includes(`"check-success = @github-actions/${name}"`));
+  }
 });
 
 test("production and local configurations isolate resources and route dynamic endpoints through the Worker", () => {
   const production = parseJsonc(readFileSync(resolve(PROJECT_ROOT, "wrangler.jsonc"), "utf8"));
-  const local = parseJsonc(readFileSync(resolve(PROJECT_ROOT, "wrangler.local.jsonc"), "utf8"));
-  assert.equal(production.env, undefined);
+  assert.deepEqual(Object.keys(production.env), ["local"]);
+  const local = production.env.local;
+  assert.equal(local.workers_dev, false);
+  assert.deepEqual(local.routes, []);
+  assert.deepEqual(local.triggers.crons, []);
+  assert.equal(local.secrets, undefined);
   assert.notEqual(production.name, local.name);
   assert.notEqual(production.d1_databases[0].database_id, local.d1_databases[0].database_id);
   assert.notEqual(production.d1_databases[0].database_name, local.d1_databases[0].database_name);
   assert.notEqual(production.r2_buckets[0].bucket_name, local.r2_buckets[0].bucket_name);
+  assert.deepEqual(local.durable_objects.bindings, production.durable_objects.bindings);
   const namespaces = [];
   for (const config of [production, local]) {
-    assert.equal(config.main, "build/index.js");
-    assert.equal(config.d1_databases[0].binding, "warden-db");
+    assert.equal(config.main ?? production.main, "build/index.js");
+    assert.equal(config.d1_databases[0].binding, "DB");
     assert.equal(config.r2_buckets[0].binding, "ATTACHMENTS_BUCKET");
     for (const name of ["LOGIN_RATE_LIMITER", "SEND_ACCESS_RATE_LIMITER"]) {
       const limiter = config.ratelimits.find((value) => value.name === name);
@@ -494,8 +351,9 @@ test("production and local configurations isolate resources and route dynamic en
       assert.match(String(limiter.namespace_id), /^\d+$/);
       namespaces.push(limiter.namespace_id);
     }
+    const assets = config.assets ?? production.assets;
     for (const path of ["/two-factor/send-email-login", "/css/vaultwarden.css", "/demo.html"]) {
-      assert.ok(config.assets.run_worker_first.some((rule) => rule === path || (rule.endsWith("/*") && path.startsWith(rule.slice(0, -1)))), `${config.name} must route ${path} through the Worker`);
+      assert.ok(assets.run_worker_first.some((rule) => rule === path || (rule.endsWith("/*") && path.startsWith(rule.slice(0, -1)))), `${config.name} must route ${path} through the Worker`);
     }
   }
   assert.equal(new Set(namespaces).size, 4);

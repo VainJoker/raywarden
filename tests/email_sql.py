@@ -12,13 +12,13 @@ class EmailVerification(unittest.TestCase):
         self.db = sqlite3.connect(':memory:')
         self.db.row_factory = sqlite3.Row
         self.db.execute('PRAGMA foreign_keys=ON')
-        apply_migrations(self.db, legacy_multi_user=True)
+        apply_migrations(self.db)
         for user in ('alice', 'bob'):
             self.db.execute("INSERT INTO users(id,email,master_password_hash,key,private_key,public_key,security_stamp,created_at,updated_at) VALUES(?,?,'hash','key','private','public','stamp','old','old')", (user, f'{user}@example.test'))
         self.addCleanup(self.db.close)
 
     def reserve(self, id='code', user='alice', purpose='protected-action', recipient='alice@example.test', context='', hash='digest', stamp='stamp', session='device-session', now=1000):
-        return self.db.execute(statement('email', 'reserve'), (id,user,user,purpose,recipient,context,hash,stamp,session,now,now+600,now-60)).fetchone()
+        return self.db.execute(statement('email', 'reserve_until'), (id,user,user,purpose,recipient,context,hash,stamp,session,now,now+600,now-60)).fetchone()
 
     def check(self, hash='digest', consume=True, user='alice', purpose='protected-action', recipient='alice@example.test', context='', stamp='stamp', session='device-session', now=1001):
         return self.db.execute(statement('email','check'), (hash,consume,now,user,purpose,recipient,context,stamp,session,5)).fetchone()
@@ -71,12 +71,21 @@ class EmailVerification(unittest.TestCase):
 
     def test_email_change_checks_stamp_and_preserves_other_accounts(self):
         sql = statement('email','change_email')
-        self.db.execute("INSERT INTO devices(user_id,identifier,name,type,session_token,created_at,updated_at) VALUES('alice','device','Browser',14,'session','old','old')")
-        args = ('new@example.test','new-hash','new-salt','rewrapped-key',0,600000,None,None,'new-stamp','new','alice','stamp','hash',account_snapshot(self.db, 'alice'),'device','session')
+        self.db.execute("INSERT INTO devices(user_id,device_id,name,device_type,session_token,created_at,updated_at) VALUES('alice','device','Browser',14,'session','old','old')")
+        args = ('new@example.test','new-hash','new-salt','rewrapped-key',0,600000,None,None,'new-stamp','new','alice','stamp','hash',account_snapshot(self.db, 'alice'),'device','session',None,600000,600000)
         self.assertEqual(self.db.execute(sql,args).fetchone()['id'],'alice')
         self.assertIsNone(self.db.execute(sql,args).fetchone())
         self.assertEqual(self.db.execute("SELECT email FROM users WHERE id='bob'").fetchone()['email'],'bob@example.test')
         self.assertEqual(self.db.execute("SELECT key FROM users WHERE id='alice'").fetchone()['key'],'rewrapped-key')
+        self.assertEqual(self.db.execute("SELECT password_iterations FROM users WHERE id='alice'").fetchone()[0],600000)
+
+    def test_email_claim_cannot_take_another_accounts_address(self):
+        sql = statement('email', 'change_email')
+        self.db.execute("INSERT INTO devices(user_id,device_id,name,device_type,session_token,created_at,updated_at) VALUES('alice','device','Browser',14,'session','old','old')")
+        args = ('BOB@example.test','new-hash','new-salt','rewrapped-key',0,600000,None,None,'new-stamp','new','alice','stamp','hash',account_snapshot(self.db, 'alice'),'device','session',None,600000,600000)
+        before = [tuple(row) for row in self.db.execute("SELECT * FROM users ORDER BY id")]
+        self.assertIsNone(self.db.execute(sql, args).fetchone())
+        self.assertEqual([tuple(row) for row in self.db.execute("SELECT * FROM users ORDER BY id")], before)
 
     def test_siteverify_token_can_only_be_claimed_once(self):
         sql=statement('email','claim_turnstile')

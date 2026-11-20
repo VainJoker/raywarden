@@ -1,27 +1,40 @@
-use worker::Result as WorkerResult;
+use worker::{
+    D1Database,
+    Env,
+    Result as WorkerResult,
+};
 
 use crate::errors::{
     AppError,
+    AppResult,
     DatabaseError,
 };
+
+const D1_BINDING: &str = "DB";
+
+/// Resolve the application's D1 binding for the current Worker environment.
+pub(crate) fn binding(env: &Env) -> WorkerResult<D1Database> {
+    env.d1(D1_BINDING)
+}
 
 /// Decode rows explicitly: a malformed stored row fails the entire read.
 pub fn decode_results<T: serde::de::DeserializeOwned>(
     result: &worker::D1Result,
-) -> Result<Vec<T>, AppError> {
+) -> AppResult<Vec<T>> {
     result
         .results::<serde_json::Value>()?
         .into_iter()
-        .map(|row| serde_json::from_value(row).map_err(|_| AppError::Internal))
+        .map(|row| {
+            serde_json::from_value(row).map_err(AppError::internal_error)
+        })
         .collect()
 }
 
-pub async fn run_query<Fut, T>(exec: Fut, msg: &str) -> Result<T, AppError>
+pub async fn run_query<F, T>(query: F, context: &str) -> AppResult<T>
 where
-    Fut: Future<Output = WorkerResult<T>>,
+    F: Future<Output = WorkerResult<T>>,
 {
-    exec.await.map_err(|e| {
-        log::error!("{msg}: {e}");
-        AppError::Database(DatabaseError::QueryFailed(msg.to_string()))
-    })
+    query
+        .await
+        .map_err(|error| DatabaseError::query(context, error))
 }

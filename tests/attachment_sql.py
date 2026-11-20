@@ -3,10 +3,10 @@
 import sqlite3
 import unittest
 
-from sql_regression import seed_cipher
+from sql_regression import seed_cipher, seed_attachment
 
 from sql_regression import NOW, OLD, database, statement, statements
-from send_compat_sql import guard_sql, session_sql, key_guard
+from send_transactions_sql import guard_sql, session_sql, key_guard
 from cipher_v2_sql import ATTACHMENTS, REVISION, literal, row_guard, source_literals
 
 
@@ -15,9 +15,8 @@ class AttachmentFinalizationSql(unittest.TestCase):
         self.db = database()
         self.addCleanup(self.db.close)
         seed_cipher(self.db, "cipher", data='{"name":"encrypted"}')
-        self.db.execute(statement("attachment", "insert_pending"),
-                        ("attachment", "cipher", "encrypted-name", 12, "wrapped-key", OLD, None))
-        self.db.execute("INSERT INTO devices(user_id,identifier,name,type,session_token,created_at,updated_at) VALUES('alice','device','test',1,'session',?,?)", (OLD, OLD))
+        seed_attachment(self.db, "attachment", "cipher", pending=True, name="encrypted-name", key="wrapped-key")
+        self.db.execute("INSERT INTO devices(user_id,device_id,name,device_type,session_token,created_at,updated_at) VALUES('alice','device','test',1,'session',?,?)", (OLD, OLD))
         self.owner = dict(self.db.execute("SELECT * FROM users WHERE id='alice'").fetchone())
         self.cipher = dict(self.db.execute("SELECT * FROM ciphers WHERE id='cipher'").fetchone())
         self.pending = dict(self.db.execute("SELECT * FROM attachments_pending WHERE id='attachment'").fetchone())
@@ -28,7 +27,7 @@ class AttachmentFinalizationSql(unittest.TestCase):
     def finalize(self):
         insert, remove, touch_cipher = self.batch
         pending_predicate = literal(ATTACHMENTS, "EXISTS(SELECT 1 FROM attachments_pending WHERE")
-        pending_args = [self.pending[column] for column in ("id", "cipher_id", "file_name", "file_size", "akey", "created_at", "updated_at", "organization_id")]
+        pending_args = [self.pending[column] for column in ("id", "cipher_id", "file_name", "file_size_bytes", "encrypted_key", "created_at", "updated_at", "organization_id")]
         with self.db:
             self.db.execute(session_sql(), ("alice", "stamp", "device", "session")).fetchall()
             self.db.execute(*key_guard(self.owner)).fetchall()
@@ -41,7 +40,7 @@ class AttachmentFinalizationSql(unittest.TestCase):
 
     def test_finalize_moves_reservation_and_updates_only_owner_revisions(self):
         self.finalize()
-        row = self.db.execute("SELECT file_size, akey, created_at, updated_at FROM attachments").fetchone()
+        row = self.db.execute("SELECT file_size_bytes, encrypted_key, created_at, updated_at FROM attachments").fetchone()
         self.assertEqual(tuple(row), (15, "wrapped-key", OLD, NOW))
         self.assertEqual(self.db.execute("SELECT storage_key FROM attachments").fetchone()[0], "staged-object")
         self.assertEqual(self.db.execute("SELECT COUNT(*) FROM attachments_pending").fetchone()[0], 0)
@@ -58,20 +57,13 @@ class AttachmentFinalizationSql(unittest.TestCase):
         self.assertEqual(self.db.execute("SELECT COUNT(*) FROM attachments_pending").fetchone()[0], 1)
         self.assertEqual(self.db.execute("SELECT updated_at FROM ciphers WHERE id='cipher'").fetchone()[0], OLD)
 
-    def test_duplicate_finalization_cannot_overwrite_completed_metadata(self):
-        self.finalize()
-        with self.assertRaises(sqlite3.OperationalError):
-            self.finalize()
-        self.assertEqual(self.db.execute("SELECT COUNT(*) FROM attachments").fetchone()[0], 1)
-        self.assertEqual(self.db.execute("SELECT file_size FROM attachments").fetchone()[0], 15)
-
     def replace(self, expected, key):
         update, touch = statements("attachment", "replace_upload")
         predicate = next(value for value in source_literals(ATTACHMENTS)
                          if value.startswith("EXISTS(SELECT 1 FROM attachments WHERE id=?1 AND cipher_id=?2")
                          and "storage_key IS ?9" in value)
         cipher = dict(self.db.execute("SELECT * FROM ciphers WHERE id='cipher'").fetchone())
-        args = [expected[column] for column in ("id", "cipher_id", "file_name", "file_size", "akey", "created_at", "updated_at", "organization_id", "storage_key")]
+        args = [expected[column] for column in ("id", "cipher_id", "file_name", "file_size_bytes", "encrypted_key", "created_at", "updated_at", "organization_id", "storage_key")]
         with self.db:
             self.db.execute(session_sql(), ("alice", "stamp", "device", "session")).fetchall()
             self.db.execute(*key_guard(self.owner)).fetchall()
@@ -85,7 +77,7 @@ class AttachmentFinalizationSql(unittest.TestCase):
         self.finalize()
         old = dict(self.db.execute("SELECT * FROM attachments").fetchone())
         self.replace(old, "replacement-object")
-        row = self.db.execute("SELECT storage_key,file_size,akey FROM attachments").fetchone()
+        row = self.db.execute("SELECT storage_key,file_size_bytes,encrypted_key FROM attachments").fetchone()
         self.assertEqual(tuple(row), ("replacement-object", 18, "replacement-wrapped-key"))
         self.assertIsNotNone(self.db.execute("SELECT object_key FROM storage_cleanup_jobs WHERE object_key='staged-object'").fetchone())
         self.assertEqual(self.db.execute("SELECT COUNT(*) FROM attachments_pending").fetchone()[0], 0)

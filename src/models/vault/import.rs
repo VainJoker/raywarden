@@ -1,0 +1,194 @@
+//! D1 import batching and transaction statement construction.
+use std::collections::HashSet;
+
+use serde_json::Value;
+use wasm_bindgen::JsValue;
+use worker::{
+    D1Database,
+    D1PreparedStatement,
+};
+
+use crate::errors::{
+    AppError,
+    AppResult,
+};
+
+const JSON_BIND_BYTES: usize = 1_900_000;
+const D1_STRING_BYTES: usize = 2_000_000;
+
+enum ImportChunk {
+    Json(String),
+    Columns(Vec<JsValue>),
+}
+
+// A JSON string can exceed D1's bind limit solely because ciphertext is escaped
+// a second time. Fall back to ordinary column binds for that individual row.
+fn import_chunks(
+    rows: Vec<Value>,
+    maximum_rows: usize,
+) -> AppResult<Vec<ImportChunk>> {
+    let mut chunks = Vec::new();
+    let mut batch = Vec::new();
+    let mut bytes = 2;
+    for row in rows {
+        let columns = row.as_array().ok_or(AppError::Internal)?;
+        if columns.iter().any(|value| {
+            value
+                .as_str()
+                .is_some_and(|value| value.len() > D1_STRING_BYTES)
+        }) {
+            return Err(AppError::PayloadTooLarge {
+                message: "Imported field exceeds the D1 size limit".into(),
+            });
+        }
+        let encoded =
+            serde_json::to_string(&row).map_err(AppError::internal_error)?;
+        if !batch.is_empty() &&
+            (batch.len() >= maximum_rows ||
+                bytes + encoded.len() + 1 > JSON_BIND_BYTES)
+        {
+            chunks.push(ImportChunk::Json(format!("[{}]", batch.join(","))));
+            batch.clear();
+            bytes = 2;
+        }
+        if encoded.len() + 2 > JSON_BIND_BYTES {
+            let columns = columns
+                .iter()
+                .map(|value| match value {
+                    Value::Null => Ok(JsValue::NULL),
+                    Value::String(v) => Ok(v.clone().into()),
+                    Value::Bool(v) => Ok(i32::from(*v).into()),
+                    Value::Number(v) => v
+                        .as_f64()
+                        .map(JsValue::from_f64)
+                        .ok_or(AppError::Internal),
+                    _ => Err(AppError::Internal),
+                })
+                .collect::<AppResult<Vec<_>>>()?;
+            chunks.push(ImportChunk::Columns(columns));
+        } else {
+            bytes += encoded.len() + 1;
+            batch.push(encoded);
+        }
+    }
+    if !batch.is_empty() {
+        chunks.push(ImportChunk::Json(format!("[{}]", batch.join(","))));
+    }
+    Ok(chunks)
+}
+fn collect_writes(
+    db: &D1Database,
+    rows: Vec<Value>,
+    maximum_rows: usize,
+    json_sql: &str,
+    columns_sql: &str,
+    shared: &[JsValue],
+    writes: &mut Vec<D1PreparedStatement>,
+) -> AppResult<()> {
+    for chunk in import_chunks(rows, maximum_rows)? {
+        let (sql, mut values) = match chunk {
+            ImportChunk::Json(value) => (json_sql, vec![value.into()]),
+            ImportChunk::Columns(values) => (columns_sql, values),
+        };
+        values.extend_from_slice(shared);
+        writes.push(db.prepare(sql).bind(&values)?);
+    }
+    Ok(())
+}
+
+pub(crate) fn required_folder_guard(
+    db: &D1Database,
+    user_id: &str,
+    required: &HashSet<String>,
+) -> AppResult<D1PreparedStatement> {
+    crate::models::mutation::guard(
+        db,
+        "NOT EXISTS(SELECT 1 FROM json_each(?1) required WHERE NOT \
+         EXISTS(SELECT 1 FROM folders WHERE id=required.value AND user_id=?2))",
+        &[
+            serde_json::to_string(&required)
+                .map_err(AppError::internal_error)?
+                .into(),
+            user_id.into(),
+        ],
+    )
+}
+
+pub(crate) fn collect_import_writes(
+    db: &D1Database,
+    user_id: &str,
+    now: &str,
+    folders: Vec<Value>,
+    ciphers: Vec<Value>,
+    maximum_rows: usize,
+) -> AppResult<Vec<D1PreparedStatement>> {
+    let shared = [user_id.into(), now.into()];
+    let mut writes = Vec::new();
+    collect_writes(
+        db,
+        folders,
+        maximum_rows,
+        "INSERT INTO folders(id,user_id,name,created_at,updated_at) SELECT \
+         json_extract(value,'$[0]'),?2,json_extract(value,'$[1]'),?3,?3 FROM \
+         json_each(?1)",
+        "INSERT INTO folders(id,user_id,name,created_at,updated_at) \
+         VALUES(?1,?3,?2,?4,?4)",
+        &shared,
+        &mut writes,
+    )?;
+    collect_writes(
+        db,
+        ciphers,
+        maximum_rows,
+        "INSERT INTO \
+         ciphers(id,user_id,organization_id,cipher_type,data,is_favorite,\
+         folder_id,archived_at,created_at,updated_at) SELECT \
+         json_extract(value,'$[0]'),?2,NULL,json_extract(value,'$[1]'),\
+         json_extract(value,'$[2]'),json_extract(value,'$[3]'),\
+         json_extract(value,'$[4]'),json_extract(value,'$[5]'),?3,?3 FROM \
+         json_each(?1)",
+        "INSERT INTO \
+         ciphers(id,user_id,organization_id,cipher_type,data,is_favorite,\
+         folder_id,archived_at,created_at,updated_at) \
+         VALUES(?1,?7,NULL,?2,?3,?4,?5,?6,?8,?8)",
+        &shared,
+        &mut writes,
+    )?;
+    Ok(writes)
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use super::*;
+
+    #[test]
+    fn import_json_chunks_preserve_escaped_rows_and_the_byte_boundary() {
+        let first = json!(["encrypted\"🙂"]);
+        let first_bytes = serde_json::to_string(&first)
+            .expect("encoded fixture")
+            .len();
+        // The chunk budget reserves one byte after each row, including the
+        // last.
+        let remaining = JSON_BIND_BYTES - first_bytes - r#"[""]"#.len() - 4;
+        for (extra, expected_chunks) in [(0, 1), (1, 2)] {
+            let rows =
+                vec![first.clone(), json!(["x".repeat(remaining + extra)])];
+            let chunks =
+                import_chunks(rows.clone(), 200).expect("valid import rows");
+            assert_eq!(chunks.len(), expected_chunks);
+            let mut result = Vec::new();
+            for chunk in chunks {
+                let ImportChunk::Json(encoded) = chunk else {
+                    panic!("both individual rows fit in JSON binds");
+                };
+                result.extend(
+                    serde_json::from_str::<Vec<Value>>(&encoded)
+                        .expect("valid JSON chunk"),
+                );
+            }
+            assert_eq!(result, rows);
+        }
+    }
+}

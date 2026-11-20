@@ -119,6 +119,9 @@ export async function runPresentationCompatibility({ fixture, check }) {
     let settings = (await config(f)).settings;
     equal(settings.disableUserRegistration, true, "a presentation variable cannot open public registration");
     equal(settings.suppressOnboardingInterstitials, false);
+    const baseline = await css(f);
+    const baselineEtag = baseline.response.headers.get("etag");
+    hidden(baseline.text, "app-vault-onboarding", false);
     const authorization = await f.fetch("/api/accounts/setup", {
       method: "POST", headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ token: f.env.OWNER_SETUP_TOKEN }),
@@ -131,8 +134,15 @@ export async function runPresentationCompatibility({ fixture, check }) {
       equal(settings.suppressOnboardingInterstitials, true);
       equal(settings.disableUserRegistration, false);
       equal((await config(f)).settings.disableUserRegistration, true);
+      const suppressed = await css(f, { headers: { "If-None-Match": baselineEtag } });
+      hidden(suppressed.text, "app-vault-onboarding { display:none !important; }", true);
+      const suppressedEtag = suppressed.response.headers.get("etag");
+      ok(suppressedEtag !== baselineEtag, "onboarding suppression retained the visible checklist validator");
       f.env.CLIENT_SUPPRESS_ONBOARDING = no;
       equal((await config(f, headers)).settings.suppressOnboardingInterstitials, false);
+      const restored = await css(f, { headers: { "If-None-Match": suppressedEtag } });
+      hidden(restored.text, "app-vault-onboarding", false);
+      equal(restored.response.headers.get("etag"), baselineEtag, "showing onboarding did not restore the baseline validator");
     }
     f.env.DISABLE_USER_REGISTRATION = "true";
     settings = (await config(f)).settings;

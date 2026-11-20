@@ -62,14 +62,14 @@ test("demo rejects Argon2, invalid KDF and unsupported V2 before account mutatio
     const f = await fixture((request, { json }) => request.path === "/api/accounts/prelogin" ? json({ kdf, kdfIterations: ITERATIONS }) : null);
     f.set("email", EMAIL); f.set("oldPassword", PASSWORD); f.set("newPassword", "replacement");
     await f.click("submit");
-    assert.match(f.text("result"), /正式客户端/);
+    assert.match(f.text("result"), /official client/);
     assert.deepEqual(f.requests.map(request => request.path), ["/api/accounts/prelogin"]);
   }
   const f = await fixture();
   f.token.AccountKeys.securityState = { securityVersion: 2 };
   f.set("email", EMAIL); f.set("oldPassword", PASSWORD); f.set("newPassword", "replacement");
   await f.click("submit");
-  assert.match(f.text("result"), /正式客户端/);
+  assert.match(f.text("result"), /official client/);
   assert.ok(!f.requests.some(request => request.path === "/api/accounts/password"));
 });
 
@@ -107,7 +107,7 @@ test("email change sends the gateway code first and commits with the same sessio
   const f = await fixture();
   f.set("emailCurrent", EMAIL); f.set("emailNew", "new@example.test"); f.set("emailPassword", PASSWORD);
   await f.click("submitEmail");
-  assert.match(f.text("resultEmail"), /先发送/); assert.equal(f.requests.length, 0);
+  assert.match(f.text("resultEmail"), /Send the verification code.*first/); assert.equal(f.requests.length, 0);
   await f.click("sendEmailToken");
   const send = f.requests.find(request => request.path === "/api/accounts/email-token");
   assert.ok(send, f.text("resultEmail")); assert.equal(send.method, "POST");

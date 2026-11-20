@@ -1,9 +1,9 @@
 """Date predicates compare old RFC3339 offsets by instant, without rewriting rows."""
 import unittest
 
-from sql_regression import seed_cipher
+from sql_regression import seed_cipher, seed_attachment
 
-from sql_regression import account_snapshot, database, statement, statements
+from sql_regression import account_snapshot, database, statement, trash_purge_statements
 
 CUTOFF = "2026-11-13T03:00:00.123Z"
 DATES = [
@@ -17,6 +17,7 @@ DATES = [
     ("future", "2026-11-13T03:00:00.124Z"),
 ]
 PAST = {name for name, _ in DATES if name.startswith("past-")}
+COUNT_LAST_WRITE = statement("cipher_mutation", "batch_count_last_write")
 
 
 class StoredTimestampSql(unittest.TestCase):
@@ -30,23 +31,23 @@ class StoredTimestampSql(unittest.TestCase):
     def test_pending_cleanup_keeps_equal_instants_with_every_legacy_offset(self):
         self.cipher()
         for name, date in DATES:
-            self.db.execute(statement("attachment", "insert_pending"),
-                            (name, "cipher", "encrypted-file", 12, "wrapped-key", date, None))
-        select, delete = statements("attachment", "purge_pending_before")
-        self.assertEqual(self.db.execute(select, (CUTOFF,)).fetchone()[0], len(PAST))
-        self.assertEqual({row[1] for row in self.db.execute(statement("purge", "stale_pending_keys"), (CUTOFF,))}, PAST)
-        self.db.execute(delete, (CUTOFF,))
+            seed_attachment(self.db, name, "cipher", pending=True, key="wrapped-key", created=date)
+        delete = statement("attachment", "purge_pending_before")
+        with self.db:
+            self.db.execute(delete, (CUTOFF,))
+            self.assertEqual(self.db.execute(COUNT_LAST_WRITE).fetchone()[0], len(PAST))
+        self.assertEqual({row[0] for row in self.db.execute("SELECT object_key FROM storage_cleanup_jobs")}, {f"cipher/{name}" for name in PAST})
         self.assertEqual({row[0] for row in self.db.execute("SELECT id FROM attachments_pending")}, {name for name, _ in DATES} - PAST)
 
     def test_trash_purge_is_strictly_before_the_same_absolute_cutoff(self):
         for name, date in DATES:
             self.cipher(name)
             self.db.execute("UPDATE ciphers SET deleted_at=? WHERE id=?", (date, name))
-        self.assertEqual(self.db.execute(statement("cipher", "count_soft_deleted_before"), (CUTOFF,)).fetchone()[0], len(PAST))
-        touch, delete = statements("purge", "delete_ciphers_before")
+        touch, delete = trash_purge_statements()
         with self.db:
             self.db.execute(touch, ("2026-11-14T03:00:00.123Z", CUTOFF))
             self.db.execute(delete, (CUTOFF,))
+            self.assertEqual(self.db.execute(COUNT_LAST_WRITE).fetchone()[0], len(PAST))
         self.assertEqual({row[0] for row in self.db.execute("SELECT id FROM ciphers")}, {name for name, _ in DATES} - PAST)
 
     def test_auth_approval_expiry_uses_instants_and_expires_at_equality(self):
@@ -57,6 +58,18 @@ class StoredTimestampSql(unittest.TestCase):
         self.assertEqual({row["id"] for row in rows}, {"future"})
         self.db.execute(statement("auth_request", "purge_expired"), (CUTOFF,))
         self.assertEqual({row[0] for row in self.db.execute("SELECT id FROM auth_requests")}, {"future"})
+
+    def test_email_verification_and_initial_key_id_advance_a_legacy_future_cursor(self):
+        self.db.execute("UPDATE users SET updated_at=? WHERE id='alice'",
+                        ("2099-01-01T08:00:00.000+08:00",))
+        self.db.execute(statement("email", "update_verified"),
+                        (CUTOFF, "alice", "alice@example.test", "stamp"))
+        self.assertEqual(self.db.execute("SELECT updated_at FROM users WHERE id='alice'").fetchone()[0],
+                         "2099-01-01T00:00:00.001Z")
+        self.db.execute(statement("account_keys", "set_key_id"),
+                        ("fixture-key-id", CUTOFF, "alice"))
+        self.assertEqual(self.db.execute("SELECT updated_at FROM users WHERE id='alice'").fetchone()[0],
+                         "2099-01-01T00:00:00.002Z")
 
     def test_webauthn_expiry_never_accepts_equal_instants_with_a_later_text_offset(self):
         for name, date in DATES:
@@ -69,7 +82,7 @@ class StoredTimestampSql(unittest.TestCase):
 
     def test_send_cleanup_accepts_existing_offset_and_fraction_formats(self):
         for name, date in DATES:
-            self.db.execute("INSERT INTO sends(id,user_id,name,type,data,akey,created_at,updated_at,deletion_date,access_stamp) VALUES(?,'alice','encrypted',0,'{}','wrapped',?,?,?,'stamp')", (name, CUTOFF, CUTOFF, date))
+            self.db.execute("INSERT INTO sends(id,user_id,name,send_type,data,encrypted_key,created_at,updated_at,deletes_at,access_stamp) VALUES(?,'alice','encrypted',0,'{}','wrapped',?,?,?,'stamp')", (name, CUTOFF, CUTOFF, date))
         rows = self.db.execute(statement("send", "cleanup_candidates"), (CUTOFF, "2026-11-12T03:00:00.123Z")).fetchall()
         self.assertEqual({row["id"] for row in rows}, {name for name, _ in DATES if name != "future"})
 

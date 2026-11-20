@@ -6,9 +6,10 @@ import { join } from "node:path";
 import { promisify } from "node:util";
 import { gzipSync } from "node:zlib";
 import test from "node:test";
-import { patchUi, pinnedVersion } from "../scripts/patch-ui.mjs";
+import { renderAssetHeaders, patchUi, readPinnedVaultVersion } from "../scripts/patch-ui.mjs";
 
 const run = promisify(execFile);
+const WEB_VAULT_VERSION = JSON.parse(await readFile(new URL("../package.json", import.meta.url), "utf8")).config.webVaultVersion;
 const prepare = (root, args = [], options = {}) => run("bash", [join(root, "scripts", "prepare-ui.sh"), ...args], { cwd: tmpdir(), ...options });
 function maliciousArchive(name) {
   const header = Buffer.alloc(512);
@@ -31,13 +32,14 @@ async function fixture(t) {
     await copyFile(new URL(`../scripts/${name}`, import.meta.url), join(root, "scripts", name));
   }
   await mkdir(join(root, "static", "overrides"), { recursive: true });
-  await writeFile(join(root, "package.json"), JSON.stringify({ config: { webVaultVersion: "2026.7.0" } }));
+  await copyFile(new URL("../static/security-headers.json", import.meta.url), join(root, "static/security-headers.json"));
+  await writeFile(join(root, "package.json"), JSON.stringify({ config: { webVaultVersion: WEB_VAULT_VERSION } }));
   await writeFile(join(root, "static", "overrides", "vaultwarden.css"), "body { color: red; }\n");
   await writeFile(join(root, "static", "overrides", "raywarden.js"), "window.raywarden = true;\n");
   return root;
 }
 
-async function vault(directory, version = "2026.7.0", html = "<html><head></head><body><app-root></app-root></body></html>") {
+async function vault(directory, version = WEB_VAULT_VERSION, html = "<html><head></head><body><app-root></app-root></body></html>") {
   await mkdir(directory, { recursive: true });
   await writeFile(join(directory, "vw-version.json"), JSON.stringify({ version }));
   await writeFile(join(directory, "index.html"), html);
@@ -46,14 +48,16 @@ async function vault(directory, version = "2026.7.0", html = "<html><head></head
 test("offline preparation copies both source assets, removes maps and is idempotent", async (t) => {
   const root = await fixture(t);
   const directory = join(root, "static", "web-vault");
-  await vault(directory, "2026.7.0", '<html><head><script defer src="js/raywarden.js"></script><script src="/js/raywarden.js"></script></head><body><script>/* turnstile-send-guard-v2 */oldGuard();</script></body></html>');
+  await vault(directory, WEB_VAULT_VERSION, '<html><head><script defer src="js/raywarden.js"></script><script src="/js/raywarden.js"></script></head><body><script>/* turnstile-send-guard-v2 */oldGuard();</script></body></html>');
   await mkdir(join(directory, "nested"));
   await writeFile(join(directory, "nested", "bundle.map"), "map");
   await writeFile(join(directory, "demo.html"), "unguarded stale demo");
   await prepare(root);
   const first = await readFile(join(directory, "index.html"), "utf8");
+  assert.equal(await readFile(join(directory, "_headers"), "utf8"), renderAssetHeaders(root));
   await prepare(root);
   assert.equal(await readFile(join(directory, "index.html"), "utf8"), first);
+  assert.equal(await readFile(join(directory, "_headers"), "utf8"), renderAssetHeaders(root));
   assert.equal(first.match(/js\/raywarden\.js/g).length, 1);
   assert.equal(first.match(/css\/vaultwarden\.css/g).length, 1);
   assert.ok(!first.includes("oldGuard"));
@@ -99,7 +103,7 @@ done
 cp -- "$UI_TEST_ARCHIVE" "$output"
 `, { mode: 0o755 });
   await prepare(root, ["--download"], { env: { ...process.env, PATH: `${bin}:${process.env.PATH}`, UI_TEST_CAPTURE: capture, UI_TEST_ARCHIVE: archive } });
-  assert.equal(await readFile(capture, "utf8"), "https://github.com/dani-garcia/bw_web_builds/releases/download/v2026.7.0/bw_web_v2026.7.0.tar.gz");
+  assert.equal(await readFile(capture, "utf8"), `https://github.com/dani-garcia/bw_web_builds/releases/download/v${WEB_VAULT_VERSION}/bw_web_v${WEB_VAULT_VERSION}.tar.gz`);
 });
 
 test("wrong versions and malformed archives preserve the existing vault", async (t) => {
@@ -152,7 +156,7 @@ test("missing assets, moving version labels and ambiguous input fail clearly", a
   await assert.rejects(prepare(root), /Missing existing Web Vault/);
   await assert.rejects(prepare(root, ["--download", "--archive"]), /Usage/);
   await writeFile(join(root, "package.json"), JSON.stringify({ config: { webVaultVersion: "latest" } }));
-  assert.throws(() => pinnedVersion(root), /must pin a release/);
+  assert.throws(() => readPinnedVaultVersion(root), /must pin a release/);
   await assert.rejects(prepare(root), { code: 1 });
 });
 
@@ -163,7 +167,7 @@ test("HTML patch validates version and document structure before writing", async
   await vault(directory, "2026.6.4", html);
   assert.throws(() => patchUi(root, directory), /does not match pinned/);
   assert.equal(await readFile(join(directory, "index.html"), "utf8"), html);
-  await writeFile(join(directory, "vw-version.json"), JSON.stringify({ version: "2026.7.0" }));
+  await writeFile(join(directory, "vw-version.json"), JSON.stringify({ version: WEB_VAULT_VERSION }));
   assert.throws(() => patchUi(root, directory), /no closing head/);
   assert.equal(await readFile(join(directory, "index.html"), "utf8"), html);
 });

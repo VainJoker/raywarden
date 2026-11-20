@@ -10,6 +10,7 @@ export WRANGLER_LOG_PATH := env("WRANGLER_LOG_PATH", justfile_directory() / ".wr
 unexport RUSTUP_TOOLCHAIN
 
 wrangler := "node node_modules/wrangler/bin/wrangler.js"
+local_wrangler_config := ".wrangler-local.generated.json"
 
 default:
     @just --list
@@ -102,13 +103,14 @@ check:
     cargo check --target wasm32-unknown-unknown --locked
 
 lint:
-    cargo clippy --target wasm32-unknown-unknown --locked --no-deps
+    cargo clippy --all-targets --locked --no-deps -- -D warnings
+    cargo clippy --target wasm32-unknown-unknown --locked --no-deps -- -D warnings
 
 test-rust:
     cargo test --lib --locked
 
 test-js:
-    node --test --test-isolation=none tests/*.test.mjs
+    npm test
 
 # Run the existing release WASM in workerd without sockets or application data.
 test-worker:
@@ -119,7 +121,7 @@ test-sql:
 
 test: test-js test-sql test-rust
 
-ci: fmt-check test-js test-sql test-rust check lint
+ci: fmt-check test lint
 
 # Shared with Wrangler's custom build command; never installs tools implicitly.
 build:
@@ -135,15 +137,9 @@ clean:
 ui:
     #!/usr/bin/env bash
     set -euo pipefail
-    if node --input-type=module <<'NODE'
-    import { readFileSync } from "node:fs";
-    import { pinnedVersion } from "./scripts/patch-ui.mjs";
-    try {
-      const version = pinnedVersion(process.cwd());
-      const metadata = JSON.parse(readFileSync("static/web-vault/vw-version.json", "utf8"));
-      const html = readFileSync("static/web-vault/index.html", "utf8");
-      if (metadata.version !== version || !/<\/head\s*>/i.test(html)) process.exit(1);
-    } catch { process.exit(1); }
+    if node --input-type=module >/dev/null 2>&1 <<'NODE'
+    import { readVaultIndex } from "./scripts/patch-ui.mjs";
+    readVaultIndex(process.cwd(), "static/web-vault");
     NODE
     then
       just ui-offline
@@ -195,14 +191,17 @@ db-migrate environment="local":
     #!/usr/bin/env bash
     set -euo pipefail
     case "$1" in
-      local) args=(--config wrangler.local.jsonc --env "" --local --persist-to .wrangler/local) ;;
+      local)
+        node scripts/local-config.mjs
+        args=(--config {{ local_wrangler_config }} --env local --local --persist-to .wrangler/local)
+        ;;
       production)
         node scripts/deploy.mjs config
         args=(--config wrangler.jsonc --env "" --remote)
         ;;
       *) echo "Expected database target: local or production" >&2; exit 2 ;;
     esac
-    {{ wrangler }} d1 migrations apply warden-db "${args[@]}"
+    {{ wrangler }} d1 migrations apply DB "${args[@]}"
 
 # Read-only verification of the configured Cloudflare resources.
 resources:
@@ -214,9 +213,9 @@ config:
 health:
     node scripts/deploy.mjs health
 
-# Always local: production routes and bindings never enter this command.
+# Select the local environment and local persistence explicitly.
 dev: setup-node setup-worker-build ui (db-migrate "local")
-    {{ wrangler }} dev --local --config wrangler.local.jsonc --env "" --persist-to .wrangler/local
+    {{ wrangler }} dev --local --config {{ local_wrangler_config }} --env local --persist-to .wrangler/local
 
 dry-run: ui
     node scripts/deploy.mjs config

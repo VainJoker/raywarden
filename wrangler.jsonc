@@ -8,6 +8,11 @@
   // Use the default workers.dev address; a custom domain is optional.
   "workers_dev": true,
   "preview_urls": false,
+  // The pinned Web Vault rejects HTTP API origins, including localhost.
+  "dev": {
+    "local_protocol": "https"
+  },
+
   // Local builds and dry-runs; artifact deployment skips this command.
   "build": {
     "command": "just build"
@@ -31,16 +36,16 @@
     }
   ],
   // Deployment derives DOMAIN from the public endpoint and uploads it as a Secret.
-  // ALLOWED_EMAILS is one owner email, supplied by GitHub Secrets on first deployment.
+  // ALLOWED_EMAILS is a comma/newline-separated list of exact account emails, supplied as a Secret.
+  // KEY_ENCRYPTION_KEY is an independent 32-byte base64url Secret; never put it in vars.
   "secrets": {
-    "required": ["DOMAIN", "ALLOWED_EMAILS"]
+    "required": ["DOMAIN", "ALLOWED_EMAILS", "KEY_ENCRYPTION_KEY"]
   },
   // Optional settings and credentials: docs/runtime-config.md.
   "vars": {
     "DISABLE_USER_REGISTRATION": "true",
     "HEAVY_DO_SHARDS": "1",
-    // Global level plus optional overrides: info,auth=debug,db=warn,external=debug,notify=info
-    // Levels: off, error, warn, info, debug, trace. Modules: auth, api, db, external, notify.
+    // Global application log level: off, error, warn, info, debug, or trace.
     "LOG_LEVEL": "info",
     // Optional overrides: uncomment to manage these in this file.
     // Examples stay commented to preserve existing Dashboard values with keep_vars.
@@ -76,7 +81,7 @@
     // Opt-in self-test page; its operations still require normal API authorization.
     // "DEMO_PAGE_ENABLED": "false",
     // Comma-separated origins. Empty/* allows all without cookie credentials.
-    // Invalid restrictive lists deny cross-origin access. ALLOWED_ORIGINS remains a fallback alias.
+    // Invalid restrictive lists deny cross-origin access.
     // "CORS_ALLOWED_ORIGINS": "",
   },
   // Daily 03:00 UTC: cleanup and global-domain cache refresh.
@@ -87,15 +92,19 @@
   },
   "d1_databases": [
     {
-      "binding": "warden-db",
+      "binding": "DB",
       "database_name": "warden-db",
       "database_id": "619ed8d2-2e40-4e96-a4e6-619cbe6c9447",
       "migrations_dir": "sql/migrations"
     }
   ],
   "observability": {
+    // Notification/file capability URLs contain credentials. Hide query strings
+    // in both logs and traces, and keep only application logs by default.
+    "redact_query_string": true,
     "logs": {
-      "enabled": true
+      "enabled": true,
+      "invocation_logs": false
     }
   },
   "r2_buckets": [
@@ -142,14 +151,133 @@
       "/ciphers/*",
       "/sends/*",
       "/alive",
+      "/alive/*",
       "/two-factor/*",
       "/notifications/*",
       "/events/*",
       "/icons/*",
       "/css/vaultwarden.css",
+      "/css/vaultwarden.css/*",
       "/js/raywarden.js",
+      "/js/raywarden.js/*",
       "/send-verify",
+      "/send-verify/*",
       "/.well-known/*"
     ]
   },
+
+  "env": {
+    "local": {
+      "name": "raywarden-local",
+      "workers_dev": false,
+      "routes": [],
+
+      // Keep production Cron triggers out of local development.
+      "triggers": {
+        "crons": []
+      },
+
+      "observability": {
+        "enabled": false
+      },
+
+      // Local commands omit the production secrets declaration in their generated config.
+      "vars": {
+        "DOMAIN": "https://localhost:8787",
+        "ALLOWED_EMAILS": "owner@example.test",
+        // Public development-only key (bytes 0..31). Never use it in production.
+        "KEY_ENCRYPTION_KEY": "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8",
+        "DISABLE_USER_REGISTRATION": "true",
+        "HEAVY_DO_SHARDS": "1",
+        // Global application log level.
+        "LOG_LEVEL": "info",
+        // Client onboarding is independent of registration permissions.
+        "CLIENT_SUPPRESS_ONBOARDING": "false",
+        // Dynamic CSS switches control presentation, not API authorization/capabilities.
+        "VW_CSS_SIGNUP_DISABLED": "true",
+        "VW_CSS_SENDS_ALLOWED": "true",
+        "VW_CSS_PASSWORD_HINTS_ALLOWED": "true",
+        "VW_CSS_SSO_ENABLED": "false",
+        "VW_CSS_SSO_ONLY": "false",
+        "VW_CSS_PASSKEY_2FA_SUPPORTED": "true",
+        "VW_CSS_PASSKEY_LOGIN_ENABLED": "true",
+        "VW_CSS_REMEMBER_2FA_DISABLED": "false",
+        "VW_CSS_MAIL_2FA_ENABLED": "true",
+        // MAIL_ENABLED is automatic unless explicitly overridden; local mail is not configured by default.
+        // "VW_CSS_MAIL_ENABLED": "false",
+        "VW_CSS_YUBICO_ENABLED": "false",
+        "VW_CSS_DUO_ENABLED": "false",
+        "VW_CSS_EMERGENCY_ACCESS_ALLOWED": "false",
+        "VW_CSS_LOAD_USER_CSS": "true",
+        "VW_CSS_USER": "",
+        // Minimum severity: info, warning (warn), error.
+        "NOTIFY_LEVEL": "warning",
+        // none | all | comma-separated event names. Channels use local .dev.vars:
+        // WEWORK_WEBHOOK_URL, or TELEGRAM_BOT_TOKEN + TELEGRAM_CHAT_ID.
+        // Standard events and legacy aliases: docs/runtime-config.md. No external messages by default.
+        "NOTIFY_EVENTS": "none",
+        "DEMO_PAGE_ENABLED": "false",
+        // Comma-separated origins; empty/* allows all without cookie credentials.
+        "CORS_ALLOWED_ORIGINS": ""
+      },
+
+      "d1_databases": [
+        {
+          "binding": "DB",
+          "database_name": "raywarden-local",
+          "database_id": "00000000-0000-4000-8000-000000000001",
+          "migrations_dir": "sql/migrations"
+        }
+      ],
+
+      "r2_buckets": [
+        {
+          "binding": "ATTACHMENTS_BUCKET",
+          "bucket_name": "raywarden-attachments-local"
+        }
+      ],
+
+      "ratelimits": [
+        {
+          "name": "LOGIN_RATE_LIMITER",
+          "namespace_id": "4101",
+          "simple": {
+            "limit": 5,
+            "period": 60
+          }
+        },
+        {
+          "name": "SEND_ACCESS_RATE_LIMITER",
+          "namespace_id": "4103",
+          "simple": {
+            "limit": 15,
+            "period": 60
+          }
+        }
+      ],
+
+      "durable_objects": {
+        "bindings": [
+          {
+            "name": "NOTIFY_DO",
+            "class_name": "NotifyDo"
+          },
+          {
+            "name": "HEAVY_DO",
+            "class_name": "HeavyDo"
+          }
+        ]
+      },
+
+      "migrations": [
+        {
+          "tag": "v1-notify-heavy",
+          "new_sqlite_classes": [
+            "NotifyDo",
+            "HeavyDo"
+          ]
+        }
+      ]
+    }
+  }
 }

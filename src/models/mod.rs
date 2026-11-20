@@ -1,19 +1,9 @@
-pub mod account_keys;
-pub mod api_key;
-pub mod attachment;
-pub mod auth_request;
-pub mod cipher;
-pub mod device;
-pub mod domains;
-pub mod email;
-pub mod folder;
-pub mod import;
-pub mod meta;
-pub mod purge;
-pub mod push;
-pub mod serde_helpers;
-pub mod sync;
-pub mod twofactor;
+//! Persisted records and atomic writes, grouped by identity, vault and Send.
+//! Cross-feature transactions, usage queries and row helpers remain shared.
+pub(crate) mod health;
+pub mod identity;
+pub mod mutation;
+pub mod send;
+pub mod storage_cleanup;
 pub mod usage;
-pub mod user;
-pub mod webauthn;
+pub mod vault;

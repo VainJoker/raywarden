@@ -2,7 +2,8 @@ name: Integration
 
 on:
   push:
-    branches: [main, feat, 'feat/**']
+    branches: [main]
+    tags: ['v[0-9]*.[0-9]*.[0-9]*']
   pull_request:
   workflow_dispatch:
 
@@ -34,15 +35,15 @@ jobs:
         run: just setup
       - name: Check Rust, Node and SQL
         run: just ci
-      - name: Prepare pinned Web Vault
-        run: just ui-download
-      - name: Validate release Worker bundle without deploying
+      - name: Prepare Web Vault and validate the release Worker bundle
         run: just dry-run
       - name: Exercise compiled Rust Worker in workerd without a listener
         run: just test-worker
       - name: Record artifact source, configuration and file digests
+        if: startsWith(github.ref, 'refs/tags/v')
         run: just artifact
       - name: Upload validated release artifact
+        if: startsWith(github.ref, 'refs/tags/v')
         uses: actions/upload-artifact@v6
         with:
           name: raywarden-release-production-${{ github.sha }}
@@ -57,13 +58,40 @@ jobs:
             .wrangler/artifact-manifest.json
             .wrangler/deploy-check/production/
 
+  coverage:
+    name: Host Rust library coverage
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    concurrency:
+      group: coverage-${{ github.ref }}
+      cancel-in-progress: true
+    steps:
+      - name: Check out source
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+      - name: Set up project tools
+        uses: ./.github/actions/setup
+        with:
+          rust: "true"
+      - name: Install host coverage tools
+        run: just coverage-setup
+      - name: Collect host Rust library coverage
+        run: just coverage
+      - name: Upload LCOV report
+        uses: actions/upload-artifact@v6
+        with:
+          name: rust-library-coverage
+          overwrite: true
+          path: coverage/lcov.info
+          if-no-files-found: error
+
   deploy:
     name: Deploy to Cloudflare
-    needs: check
-    # Feature deployment is explicitly requested by the pushed tip commit.
-    if: (github.ref == 'refs/heads/main' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch')) || (github.event_name == 'push' && (github.ref == 'refs/heads/feat' || startsWith(github.ref, 'refs/heads/feat/')) && startsWith(github.event.head_commit.message, '[deploy]'))
+    needs: [check, coverage]
+    # Only explicit version tags publish to production; branch pushes only check.
+    if: startsWith(github.ref, 'refs/tags/v') && (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
     permissions:
       contents: read
-      actions: read
-    uses: ./.github/workflows/cloudflare.yaml
+    uses: ./.github/workflows/cloudflare.yml
     secrets: inherit

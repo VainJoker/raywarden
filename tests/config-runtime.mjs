@@ -30,16 +30,15 @@ export async function runConfigurationCompatibility({ fixture, check }) {
     }
   });
 
-  await check("CORS canonical variable, legacy alias, wildcard and restrictive invalid lists share one policy", async () => {
-    for (const [primary, legacy, expected] of [
-      [undefined, origin, origin], [undefined, undefined, "*"], ["", "https://other.test", "*"],
-      ["*", "https://other.test", "*"], [origin, "https://other.test", origin],
-      ["https://other.test", origin, null], ["not-an-origin", origin, null],
-      ["https://user:pass@client.test", origin, null], [",,,", origin, null],
+  await check("CORS applies the same policy to routes, preflight and errors", async () => {
+    for (const [origins, expected] of [
+      [undefined, "*"], ["", "*"], ["*", "*"], [origin, origin],
+      ["https://other.test", null], ["not-an-origin", null],
+      ["https://user:pass@client.test", null], [",,,", null],
     ]) {
       const f = fixture();
-      if (primary !== undefined) f.env.CORS_ALLOWED_ORIGINS = primary;
-      if (legacy === undefined) delete f.env.ALLOWED_ORIGINS; else f.env.ALLOWED_ORIGINS = legacy;
+      if (origins === undefined) delete f.env.CORS_ALLOWED_ORIGINS;
+      else f.env.CORS_ALLOWED_ORIGINS = origins;
       const alive = await f.fetch("/api/alive", { headers: { Origin: origin } });
       equal(alive.status, 200); headers(alive, expected);
       const preflight = await f.fetch("/api/sync", { method: "OPTIONS", headers: { Origin: origin, "Access-Control-Request-Method": "GET", "Access-Control-Request-Headers": "authorization,device-type" } });
@@ -48,7 +47,7 @@ export async function runConfigurationCompatibility({ fixture, check }) {
       equal(outer.status, 404); headers(outer, expected);
       const notifyPreflight = await f.fetch("/notifications/hub/negotiate", { method: "OPTIONS", headers: { Origin: origin } });
       equal(notifyPreflight.status, 204); headers(notifyPreflight, expected);
-      delete f.env["warden-db"];
+      delete f.env.DB;
       const failure = await f.fetch("/api/alive", { headers: { Origin: origin } });
       equal(failure.status, 500); headers(failure, expected);
     }

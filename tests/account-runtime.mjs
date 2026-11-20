@@ -1,3 +1,5 @@
+import { openFixtureJwtKeys } from "./jwt-runtime.mjs";
+
 /** Account HTTP regressions against the compiled Worker and workerd SQLite. */
 export async function runAccountCompatibility({ fixture, check, accessToken, USER, CIPHER, sql }) {
   const id = "0123456789abcdef0123456789abcdef";
@@ -49,7 +51,7 @@ export async function runAccountCompatibility({ fixture, check, accessToken, USE
         "prf-public", "prf-user", "prf-private", snapshot, "2026-01-01T00:00:00.000Z", "2026-01-01T00:00:00.000Z");
     }
   };
-  const readyEmailCode = async (recipient) => {
+  const readyEmailCode = async (f, recipient) => {
     const parts = [USER, "change-email", recipient, "", "123456"];
     const encode = new TextEncoder();
     const chunks = [];
@@ -60,12 +62,87 @@ export async function runAccountCompatibility({ fixture, check, accessToken, USE
     }
     const bytes = new Uint8Array(chunks.reduce((n, part) => n + part.length, 0));
     let offset = 0; for (const part of chunks) { bytes.set(part, offset); offset += part.length; }
-    const secret = sql.exec("SELECT access_secret FROM jwt_keys WHERE id='global'").one().access_secret;
+    const { access_secret: secret } = await openFixtureJwtKeys(
+      sql.exec("SELECT access_secret,refresh_secret FROM jwt_keys WHERE id='global'").one(), f.env.KEY_ENCRYPTION_KEY);
     const key = await crypto.subtle.importKey("raw", encode.encode(secret), { name: "HMAC", hash: "SHA-256" }, false, ["sign"]);
     const digest = Array.from(new Uint8Array(await crypto.subtle.sign("HMAC", key, bytes)), byte => byte.toString(16).padStart(2, "0")).join("");
     const now = Math.floor(Date.now() / 1000);
     sql.exec("INSERT INTO verification_codes(id,owner_key,user_id,purpose,recipient,context,code_hash,security_stamp,session_token,issued_at,expires_at,ready) VALUES('email-runtime',?,?,'change-email',?,'',?,'owner-stamp','session',?,?,1)", USER, USER, recipient, digest, now, now + 600);
   };
+
+  await check("both account deletion routes send logout and unregister captured push devices only after commit", async () => {
+    class DurableObjectNamespace {
+      constructor(deliver) { this.deliver = deliver; }
+      idFromName(name) { return { name }; }
+      get() { return { fetch: this.deliver }; }
+    }
+    for (const recovery of [false, true]) {
+      for (const fail of [true, false]) {
+        const f = fixture(), effects = [];
+        const owners = () => sql.exec("SELECT COUNT(*) AS n FROM users WHERE id=?", USER).one().n;
+        sql.exec("UPDATE devices SET push_id='fixture-push',push_token='fixture-mobile-token' WHERE user_id=?", USER);
+        Object.assign(f.env, {
+          MAIL_WEBHOOK_URL: "https://deletion-mail.runtime.test/verify",
+          PUSH_ENABLED: "true",
+          PUSH_INSTALLATION_ID: "fixture-installation",
+          PUSH_INSTALLATION_KEY: "fixture-installation-key",
+          PUSH_IDENTITY_URI: "https://deletion-push.runtime.test",
+          PUSH_RELAY_URI: "https://deletion-push.runtime.test",
+        });
+        f.env.NOTIFY_DO = new DurableObjectNamespace(async request => {
+          const update = await request.json();
+          equal(owners(), 0, "WebSocket logout precedes deletion");
+          equal(update.selector.user_id, USER);
+          equal(update.logout, true);
+          effects.push("logout");
+          return new Response('{"sent":1}');
+        });
+
+        let code;
+        const fetch = globalThis.fetch;
+        globalThis.fetch = async input => {
+          const request = input instanceof Request ? input : new Request(input);
+          const url = new URL(request.url);
+          if (url.hostname === "deletion-mail.runtime.test") {
+            const message = await request.json();
+            equal(message.purpose, "delete-recover");
+            code = message.text.split("\n\n")[1];
+            return Response.json({});
+          }
+          equal(url.hostname, "deletion-push.runtime.test");
+          equal(owners(), 0, "push relay called before deletion");
+          if (url.pathname === "/connect/token") {
+            return Response.json({ access_token: "fixture-push-access", expires_in: 300 });
+          }
+          effects.push(url.pathname);
+          if (url.pathname === "/push/send") {
+            const update = await request.json();
+            equal(update.type, 11);
+            equal(update.userId, USER);
+            equal(update.deviceId, recovery ? null : "fixture-push");
+          }
+          return Response.json({});
+        };
+        try {
+          if (recovery) {
+            await expectStatus(await json(f, "/api/accounts/delete-recover", { email: "owner@example.test" }), 200);
+            equal(typeof code, "string", "recovery mail delivered");
+          }
+          if (fail) {
+            sql.exec("CREATE TRIGGER reject_account_deletion BEFORE DELETE ON users BEGIN SELECT RAISE(ABORT, 'fixture deletion failure'); END");
+          }
+          const response = recovery
+            ? await json(f, "/api/accounts/delete-recover-token", { userId: USER, token: code })
+            : await json(f, "/api/accounts/delete", { masterPasswordHash: "hash" }, await accessToken());
+          await expectStatus(response, fail ? 500 : 200);
+          equal(owners(), fail ? 1 : 0);
+          equal(effects.join(","), fail ? "" : "logout,/push/send,/push/delete/fixture-push");
+        } finally {
+          globalThis.fetch = fetch;
+        }
+      }
+    }
+  });
 
   await check("V2 registration persists complete material and returns it through token, profile and sync", async () => {
     const f = fixture({ empty: true });
@@ -184,8 +261,8 @@ export async function runAccountCompatibility({ fixture, check, accessToken, USE
     const foreignCipher = "00000000-0000-4000-8000-000000000101";
     const foreignFile = "00000000-0000-4000-8000-000000000102";
     const date = "2026-01-01T00:00:00.000Z";
-    sql.exec("INSERT INTO ciphers(id,user_id,type,data,created_at,updated_at) VALUES(?,'other-owner',1,?,?,?)", foreignCipher, '{"name":"foreign-encrypted"}', date, date);
-    sql.exec("INSERT INTO attachments(id,cipher_id,file_name,file_size,akey,created_at,updated_at) VALUES(?,?,?,6,?,?,?)", foreignFile, foreignCipher, "foreign-file", "foreign-key", date, date);
+    sql.exec("INSERT INTO ciphers(id,user_id,cipher_type,data,created_at,updated_at) VALUES(?,'other-owner',1,?,?,?)", foreignCipher, '{"name":"foreign-encrypted"}', date, date);
+    sql.exec("INSERT INTO attachments(id,cipher_id,file_name,file_size_bytes,encrypted_key,created_at,updated_at) VALUES(?,?,?,6,?,?,?)", foreignFile, foreignCipher, "foreign-file", "foreign-key", date, date);
     const owned = sql.exec("SELECT id FROM attachments WHERE cipher_id=?", CIPHER).one();
     const attachments2 = {
       [owned.id]: { fileName: "7.rotated-own-file", key: "7.rotated-own-key" },
@@ -199,7 +276,7 @@ export async function runAccountCompatibility({ fixture, check, accessToken, USE
       accounts: sql.exec("SELECT * FROM users ORDER BY id").toArray(),
       ciphers: sql.exec("SELECT * FROM ciphers ORDER BY id").toArray(),
       attachments: sql.exec("SELECT * FROM attachments ORDER BY id").toArray(),
-      sessions: sql.exec("SELECT * FROM devices ORDER BY user_id,identifier").toArray(),
+      sessions: sql.exec("SELECT * FROM devices ORDER BY user_id,device_id").toArray(),
     });
     const bearer = await accessToken();
     await expectStatus(await f.fetch("/api/accounts/profile", { headers: { Authorization: `Bearer ${bearer}` } }), 200);
@@ -214,14 +291,15 @@ export async function runAccountCompatibility({ fixture, check, accessToken, USE
     // cipher/attachment and had valid credentials and account key material.
     delete attachments2[foreignFile];
     await expectStatus(await json(f, "/api/accounts/key-management/rotate-user-keys", body, bearer), 200);
-    equal(sql.exec("SELECT akey FROM attachments WHERE id=?", owned.id).one().akey, "7.rotated-own-key");
-    equal(sql.exec("SELECT akey FROM attachments WHERE id=?", foreignFile).one().akey, "foreign-key");
+    equal(sql.exec("SELECT encrypted_key FROM attachments WHERE id=?", owned.id).one().encrypted_key, "7.rotated-own-key");
+    equal(sql.exec("SELECT encrypted_key FROM attachments WHERE id=?", foreignFile).one().encrypted_key, "foreign-key");
   });
 
   await check("email credential commit rejects a same-stamp V2 upgrade and preserves remember state", async () => {
     const f = fixture(); const recipient = "new-owner@example.test";
-    await readyEmailCode(recipient);
-    sql.exec("INSERT INTO twofactor(uuid,user_uuid,atype,data) VALUES('email-remember',?,5,'{}')", USER);
+    f.env.ALLOWED_EMAILS = `owner@example.test,${recipient}`;
+    await readyEmailCode(f, recipient);
+    sql.exec("INSERT INTO two_factors(id,user_id,provider_type,data) VALUES('email-remember',?,5,'{}')", USER);
     const batch = f.db.batch.bind(f.db); let changed = false;
     f.db.batch = async (statements) => {
       if (!changed && statements[0]?.sql.startsWith("UPDATE users SET email=")) {
@@ -234,23 +312,64 @@ export async function runAccountCompatibility({ fixture, check, accessToken, USE
     equal(changed, true, "email fixture reached guarded publication");
     const user = sql.exec("SELECT email,key,security_stamp FROM users WHERE id=?", USER).one();
     equal(user.email, "owner@example.test"); equal(user.key, "7.concurrent-upgrade"); equal(user.security_stamp, "owner-stamp");
-    equal(sql.exec("SELECT COUNT(*) AS n FROM twofactor WHERE user_uuid=? AND atype=5", USER).one().n, 1);
+    equal(sql.exec("SELECT COUNT(*) AS n FROM two_factors WHERE user_id=? AND provider_type=5", USER).one().n, 1);
+  });
+
+  await check("an email claimed by another account during commit returns a conflict and preserves account state", async () => {
+    const f = fixture(), recipient = "contended@example.test";
+    f.env.ALLOWED_EMAILS = `owner@example.test,${recipient}`;
+    await readyEmailCode(f, recipient);
+    sql.exec("INSERT INTO two_factors(id,user_id,provider_type,data) VALUES('contended-remember',?,5,'{}')", USER);
+    const batch = f.db.batch.bind(f.db); let claimed = false;
+    f.db.batch = async statements => {
+      if (!claimed && statements[0]?.sql.startsWith("UPDATE users SET email=")) {
+        claimed = true;
+        sql.exec("UPDATE users SET email=? WHERE id='other-owner'", recipient);
+      }
+      return batch(statements);
+    };
+    await expectStatus(await json(f, "/api/accounts/email", { masterPasswordHash: "hash", newMasterPasswordHash: "new-auth",
+      newEmail: recipient, key: "2.rewrapped", token: "123456" }, await accessToken()), 409);
+    equal(claimed, true);
+    const user = sql.exec("SELECT email,key,security_stamp FROM users WHERE id=?", USER).one();
+    equal(user.email, "owner@example.test"); equal(user.key, "2.wrapped"); equal(user.security_stamp, "owner-stamp");
+    equal(sql.exec("SELECT email FROM users WHERE id='other-owner'").one().email, recipient);
+    equal(sql.exec("SELECT COUNT(*) AS n FROM two_factors WHERE id='contended-remember'").one().n, 1);
   });
 
   await check("password and email changes retag only a current PRF wrapper without replacing its ciphertext", async () => {
+    class DurableObjectNamespace {
+      constructor(handler) { this.handler = handler; }
+      idFromName(name) { return { name }; }
+      get() { return { fetch: req => this.handler(req) }; }
+    }
     for (const kind of ["password", "email"]) {
       const f = fixture(); seedPrf();
       const bearer = await accessToken(); const wrapper = `2.${kind}-rewrapped-user`;
       let path, body;
       if (kind === "email") {
-        const recipient = "changed-owner@example.test"; await readyEmailCode(recipient);
+        const recipient = "changed-owner@example.test"; f.env.ALLOWED_EMAILS = `owner@example.test,${recipient}`; await readyEmailCode(f, recipient);
         path = "/api/accounts/email";
         body = { masterPasswordHash: "hash", newMasterPasswordHash: "new-auth", newEmail: recipient, key: wrapper, token: "123456" };
       } else {
         path = "/api/accounts/password";
         body = { masterPasswordHash: "hash", newMasterPasswordHash: "new-auth", key: wrapper };
       }
+      const captured = [];
+      f.env.NOTIFY_DO = new DurableObjectNamespace(async req => {
+        const update = await req.json();
+        const key = sql.exec("SELECT key FROM users WHERE id=?", USER).one().key;
+        captured.push({ update, key });
+        return new Response(null, { status: 204 });
+      });
       await expectStatus(await json(f, path, body, bearer), 200);
+      equal(captured.length, 1, `${kind} notification count`);
+      const { update, key } = captured[0];
+      equal(key, wrapper, `${kind} published before commit`);
+      equal(update.selector.kind, "user"); equal(update.selector.user_id, USER); equal(update.logout, true);
+      const frame = atob(update.message);
+      equal(frame.includes("\xa4Type\x0b"), true, "LogOut type");
+      equal(frame.includes("\xa9ContextId\xa6device"), true, "authenticated device context");
       const current = sql.exec("SELECT account_snapshot,encrypted_user_key,encrypted_private_key FROM webauthn_credentials WHERE id='account-passkey-1'").one();
       equal(JSON.parse(current.account_snapshot).key, wrapper); equal(current.encrypted_user_key, "prf-user"); equal(current.encrypted_private_key, "prf-private");
       equal(JSON.parse(sql.exec("SELECT account_snapshot FROM webauthn_credentials WHERE id='account-passkey-2'").one().account_snapshot).key, "older-generation");
@@ -280,7 +399,7 @@ export async function runAccountCompatibility({ fixture, check, accessToken, USE
     const ciphers = [];
     for (let number = 0; number < 5; number++) {
       const cipher = `large-rotation-${number}`;
-      sql.exec("INSERT INTO ciphers(id,user_id,type,data,created_at,updated_at) VALUES(?,?,1,?,?,?)", cipher, USER, JSON.stringify({ name: "", data: blob }), "2026-01-01T00:00:00.000Z", "2026-01-01T00:00:00.000Z");
+      sql.exec("INSERT INTO ciphers(id,user_id,cipher_type,data,created_at,updated_at) VALUES(?,?,1,?,?,?)", cipher, USER, JSON.stringify({ name: "", data: blob }), "2026-01-01T00:00:00.000Z", "2026-01-01T00:00:00.000Z");
       ciphers.push({ id: cipher, type: 1, data: blob, key: "7.rewrapped-item", encryptedFor: USER, encryptedByKeyId: id });
     }
     const body = upgrade(null, ciphers);
@@ -305,7 +424,7 @@ export async function runAccountCompatibility({ fixture, check, accessToken, USE
 
   await check("sync includes SSH entries only for supported stable client versions", async () => {
     const f = fixture();
-    sql.exec("INSERT INTO ciphers(id,user_id,type,data,created_at,updated_at) VALUES('account-ssh',?,5,?,?,?)", USER,
+    sql.exec("INSERT INTO ciphers(id,user_id,cipher_type,data,created_at,updated_at) VALUES('account-ssh',?,5,?,?,?)", USER,
       JSON.stringify({ name: "2.encrypted-ssh", sshKey: { privateKey: "2.private", publicKey: "2.public", keyFingerprint: "2.fingerprint" } }), "2026-01-01T00:00:00.000Z", "2026-01-01T00:00:00.000Z");
     const bearer = await accessToken();
     for (const [version, included] of [[undefined, false], ["invalid", false], ["2024.11.9", false], ["2024.12.0", true], ["2026.11.0", true], ["2026.11.0-beta.1", false]]) {

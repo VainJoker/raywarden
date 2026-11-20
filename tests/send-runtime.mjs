@@ -36,6 +36,54 @@ export async function runSendCompatibility({ fixture, check, accessToken, USER, 
     return f.fetch(route, { method: "POST", headers: { Authorization: `Bearer ${await accessToken()}` }, body: form });
   }
 
+  await check("Send creation and counted access notify with the committed owner revision", async () => {
+    const f = fixture(), messages = [];
+    class DurableObjectNamespace {
+      idFromName(name) { return { name }; }
+      get() { return { fetch: async request => {
+        messages.push(await request.json());
+        return new Response(null, { status: 204 });
+      } }; }
+    }
+    f.env.NOTIFY_DO = new DurableObjectNamespace();
+    const future = "2099-01-01T00:00:00.000Z";
+    sql.exec("UPDATE users SET updated_at=? WHERE id=?", future, USER);
+    let previousRevision = Date.parse(future);
+    function assertRevision(id, type) {
+      equal(messages.length, 1);
+      const message = messages.shift();
+      equal(message.selector.user_id, USER);
+      const frame = atob(message.message);
+      ok(frame.includes(`\xa4Type${String.fromCharCode(type)}`), "unexpected Send update type");
+      // MessagePack fixstr "RevisionDate", then the 64-bit timestamp extension.
+      const marker = "\xacRevisionDate\xd7\xff";
+      const index = frame.indexOf(marker);
+      ok(index >= 0, "notification is missing the revision timestamp");
+      const offset = index + marker.length;
+      const value = Uint8Array.from(frame.slice(offset, offset + 8), char => char.charCodeAt(0));
+      const millis = Date.parse(sql.exec("SELECT updated_at FROM users WHERE id=?", USER).one().updated_at);
+      equal(millis, previousRevision + 1, "committed owner revision");
+      const timestamp = (BigInt(millis % 1000) * 1_000_000n << 34n) | BigInt(Math.floor(millis / 1000));
+      equal(new DataView(value.buffer).getBigUint64(0), timestamp, "notified revision");
+      ok(Date.parse(row(id).updated_at) < millis, "resource revision must keep its own clock");
+      previousRevision = millis;
+    }
+
+    const send = await create(f);
+    equal(send.revisionDate, row(send.id).updated_at);
+    assertRevision(send.id, 12);
+    const issued = await expect(await issue(f, send.accessId), 200);
+    await expect(await access(f, issued.access_token), 200);
+    equal(count(send.id), 1);
+    assertRevision(send.id, 13);
+
+    await expect(await f.fetch(`/api/sends/${SEND}/access/file/${FILE}`, {
+      method: "POST", headers: { "Content-Type": "application/json" }, body: "{}",
+    }), 200);
+    equal(count(), 1);
+    assertRevision(SEND, 13);
+  });
+
   await check("Send issuance does not count; five concurrent actual text reads enforce max two", async () => {
     const f = fixture();
     const send = await create(f, { maxAccessCount: 2, hideEmail: true });
@@ -93,9 +141,30 @@ export async function runSendCompatibility({ fixture, check, accessToken, USER, 
     const f = fixture(); const original = JSON.stringify(row());
     const key = `sends/${SEND}/${FILE}`;
     equal((await upload(f, "short")).status, 400);
+    const put = f.bucket.put.bind(f.bucket), written = [];
+    f.bucket.put = async (key, ...args) => { written.push(key); return put(key, ...args); };
     equal((await upload(f, "valid!", true)).status, 400);
+    equal(written.length, 1, "invalid multipart writes one staged object");
+    ok(written[0].startsWith(`${key}/`), "multipart write did not use a staged key");
+    equal(f.bucket.deleted.filter(key => key === written[0]).length, 1, "the written stage is cleaned once");
     equal(JSON.stringify(row()), original, "metadata unchanged after invalid replacements");
     equal(f.bucket.objects.get(key).join(","), "0,1,2,3,128,255", "original file remains");
+    equal([...f.bucket.objects.keys()].filter(key => key.startsWith("sends/")).length, 1);
+  });
+
+  await check("zero-byte Send replacement publishes its staged object and removes the old bytes", async () => {
+    const f = fixture(), oldKey = `sends/${SEND}/${FILE}`;
+    sql.exec("UPDATE sends SET file_size_bytes=0 WHERE id=?", SEND);
+    const response = await upload(f, "");
+    equal(response.status, 201, await response.text());
+    const published = row(), adopted = published.storage_key;
+    equal(published.upload_state, 0, "empty file is published");
+    equal(published.file_size_bytes, 0, "published size remains zero");
+    ok(adopted?.startsWith(`${oldKey}/`), "empty upload did not adopt a new staged key");
+    ok(f.bucket.objects.has(adopted), "published empty object is missing");
+    equal(f.bucket.objects.get(adopted).length, 0, "published object is empty");
+    ok(f.bucket.deleted.includes(oldKey), "old file was not cleaned after empty replacement");
+    equal(f.bucket.objects.has(oldKey), false, "old bytes remain after replacement");
     equal([...f.bucket.objects.keys()].filter(key => key.startsWith("sends/")).length, 1);
   });
 
@@ -121,7 +190,7 @@ export async function runSendCompatibility({ fixture, check, accessToken, USER, 
     const f = fixture(); const batch = f.db.batch.bind(f.db); let fail = true;
     f.db.batch = async statements => {
       const result = await batch(statements);
-      if (fail && statements.some(statement => /^UPDATE sends SET pending=0,file_size=/.test(statement.sql.trim()))) {
+      if (fail && statements.some(statement => /^UPDATE sends SET upload_state=0,file_size_bytes=/.test(statement.sql.trim()))) {
         fail = false; throw new Error("synthetic lost Send commit response");
       }
       return result;
@@ -129,7 +198,7 @@ export async function runSendCompatibility({ fixture, check, accessToken, USER, 
     equal((await upload(f, "newest")).status, 500);
     const adopted = row().storage_key;
     ok(adopted, "staged pointer was not committed");
-    equal(row().pending, 0); equal(new TextDecoder().decode(f.bucket.objects.get(adopted)), "newest");
+    equal(row().upload_state, 0); equal(new TextDecoder().decode(f.bucket.objects.get(adopted)), "newest");
     ok(!f.bucket.deleted.includes(adopted), "adopted bytes were deleted after an ambiguous response");
   });
 

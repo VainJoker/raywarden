@@ -15,24 +15,46 @@ pub struct UsageRow {
     pub bytes: i64,
 }
 
-pub struct UsageDB;
-impl UsageDB {
-    pub async fn for_user(
-        db: &D1Database,
-        user: &str,
-    ) -> AppResult<Vec<UsageRow>> {
-        db::run_query(async {
-            query!(db, "SELECT 'ciphers' AS name, COALESCE(SUM(length(CAST(data AS BLOB))),0) AS bytes FROM ciphers WHERE user_id=?1
-             UNION ALL SELECT 'folders',COALESCE(SUM(length(CAST(name AS BLOB))),0) FROM folders WHERE user_id=?1
-             UNION ALL SELECT 'sends',COALESCE(SUM(length(CAST(data AS BLOB))+length(CAST(name AS BLOB))+length(CAST(akey AS BLOB))),0) FROM sends WHERE user_id=?1
-             UNION ALL SELECT 'devices',COALESCE(SUM(length(identifier)+length(name)+length(session_token)),0) FROM devices WHERE user_id=?1
-             UNION ALL SELECT 'twoFactor',COALESCE(SUM(length(data)),0) FROM twofactor WHERE user_uuid=?1
-             UNION ALL SELECT 'account',COALESCE(SUM(length(email)+length(key)+length(private_key)+length(public_key)
-             +COALESCE(length(CAST(signed_public_key AS BLOB)),0)+COALESCE(length(CAST(security_state AS BLOB)),0)
-             +COALESCE(length(CAST(signature_key_pair AS BLOB)),0)+COALESCE(length(CAST(v2_upgrade_token AS BLOB)),0)),0) FROM users WHERE id=?1
-             UNION ALL SELECT 'attachmentFiles',COALESCE(SUM(a.file_size),0) FROM attachments a JOIN ciphers c ON c.id=a.cipher_id WHERE c.user_id=?1
-             UNION ALL SELECT 'pendingAttachmentFiles',COALESCE(SUM(a.file_size),0) FROM attachments_pending a JOIN ciphers c ON c.id=a.cipher_id WHERE c.user_id=?1
-             UNION ALL SELECT 'sendFiles',COALESCE(SUM(file_size),0) FROM sends WHERE user_id=?1", user)?.all().await?.results()
-        }, "Failed to estimate user storage").await
-    }
+pub async fn for_user(db: &D1Database, user: &str) -> AppResult<Vec<UsageRow>> {
+    db::run_query(
+        async {
+            query!(
+                db,
+                "WITH usage(name,bytes) AS (VALUES ('ciphers',(SELECT \
+                 COALESCE(SUM(length(CAST(data AS BLOB))),0) FROM ciphers \
+                 WHERE user_id=?1)), ('folders',(SELECT \
+                 COALESCE(SUM(length(CAST(name AS BLOB))),0) FROM folders \
+                 WHERE user_id=?1)), ('sends',(SELECT \
+                 COALESCE(SUM(length(CAST(data AS BLOB))+ length(CAST(name AS \
+                 BLOB))+length(CAST(encrypted_key AS BLOB))),0) FROM sends \
+                 WHERE user_id=?1)), ('devices',(SELECT \
+                 COALESCE(SUM(length(CAST(device_id AS BLOB))+ \
+                 length(CAST(name AS BLOB))+length(CAST(session_token AS \
+                 BLOB))),0) FROM devices WHERE user_id=?1)), \
+                 ('twoFactor',(SELECT COALESCE(SUM(length(CAST(data AS \
+                 BLOB))),0) FROM two_factors WHERE user_id=?1)), \
+                 ('account',(SELECT COALESCE(SUM(length(CAST(email AS BLOB))+ \
+                 length(CAST(key AS BLOB))+length(CAST(private_key AS BLOB))+ \
+                 length(CAST(public_key AS BLOB))+ \
+                 COALESCE(length(CAST(signed_public_key AS BLOB)),0)+ \
+                 COALESCE(length(CAST(security_state AS BLOB)),0)+ \
+                 COALESCE(length(CAST(signature_key_pair AS BLOB)),0)+ \
+                 COALESCE(length(CAST(v2_upgrade_token AS BLOB)),0)),0) FROM \
+                 users WHERE id=?1)), ('attachmentFiles',(SELECT \
+                 COALESCE(SUM(a.file_size_bytes),0) FROM attachments a JOIN \
+                 ciphers c ON c.id=a.cipher_id WHERE c.user_id=?1)), \
+                 ('pendingAttachmentFiles',(SELECT \
+                 COALESCE(SUM(a.file_size_bytes),0) FROM attachments_pending \
+                 a JOIN ciphers c ON c.id=a.cipher_id WHERE c.user_id=?1)), \
+                 ('sendFiles',(SELECT COALESCE(SUM(file_size_bytes),0) FROM \
+                 sends WHERE user_id=?1))) SELECT name,bytes FROM usage",
+                user
+            )?
+            .all()
+            .await?
+            .results()
+        },
+        "Failed to estimate user storage",
+    )
+    .await
 }

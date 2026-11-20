@@ -3,8 +3,8 @@
 import sqlite3
 import unittest
 
-from sql_source import source as read_source
-from sql_regression import apply_migrations, rust_strings
+from sql_source import statement
+from sql_regression import apply_migrations
 
 
 class JwtKeySql(unittest.TestCase):
@@ -13,10 +13,26 @@ class JwtKeySql(unittest.TestCase):
         self.addCleanup(self.db.close)
         self.db.execute("PRAGMA foreign_keys=ON")
         apply_migrations(self.db)
-        self.sql = [text for text in rust_strings(read_source("jwt_keys"))
-                    if text.startswith(("SELECT ", "INSERT "))]
-        self.select = next(text for text in self.sql if text.startswith("SELECT "))
-        self.insert = next(text for text in self.sql if text.startswith("INSERT "))
+        self.select = statement("jwt_keys", "find")
+        self.insert = statement("jwt_keys", "initialize_if_allowed")
+        self.wrap = statement("jwt_keys", "wrap_if_current")
+
+    def test_legacy_wrapping_is_an_atomic_compare_and_swap_of_both_fields(self):
+        original = (" original-access ", " original-refresh ")
+        self.db.execute(self.insert, (*original, 0))
+        wrapped = ("v1.first-access", "v1.first-refresh")
+        self.assertEqual(self.db.execute(self.wrap, (*wrapped, *original)).rowcount, 1)
+        # A competing wrapper of the same plaintext cannot replace the winner.
+        self.assertEqual(self.db.execute(self.wrap, ("v1.loser-access", "v1.loser-refresh", *original)).rowcount, 0)
+        self.assertEqual(self.db.execute(self.select).fetchone(), wrapped)
+
+    def test_legacy_wrapping_cannot_overwrite_a_change_to_either_field(self):
+        for changed in [("changed-access", "original-refresh"), ("original-access", "changed-refresh")]:
+            with self.subTest(changed=changed):
+                self.db.execute("DELETE FROM jwt_keys")
+                self.db.execute(self.insert, (*changed, 0))
+                self.assertEqual(self.db.execute(self.wrap, ("v1.access", "v1.refresh", "original-access", "original-refresh")).rowcount, 0)
+                self.assertEqual(self.db.execute(self.select).fetchone(), changed)
 
     def test_first_insert_wins_and_following_initializers_cannot_replace_keys(self):
         self.assertIsNone(self.db.execute(self.select).fetchone())

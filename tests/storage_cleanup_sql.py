@@ -14,9 +14,9 @@ class StorageCleanupSql(unittest.TestCase):
         self.db.execute("PRAGMA foreign_keys=ON")
         apply_migrations(self.db)
         self.db.execute("INSERT INTO users(id,email,master_password_hash,key,private_key,public_key,created_at,updated_at) VALUES('u','owner@example.test','hash','key','private','public','old','old')")
-        self.db.execute("INSERT INTO ciphers(id,user_id,type,data,created_at,updated_at) VALUES('c','u',1,'{}','old','old')")
-        self.db.execute("INSERT INTO attachments(id,cipher_id,file_name,file_size,created_at,updated_at) VALUES('a','c','encrypted',5,'old','old')")
-        self.db.execute("INSERT INTO sends(id,user_id,name,type,data,akey,created_at,updated_at,deletion_date,access_stamp,file_id) VALUES('s','u','encrypted',1,'{}','key','old','old','future','stamp','f')")
+        self.db.execute("INSERT INTO ciphers(id,user_id,cipher_type,data,created_at,updated_at) VALUES('c','u',1,'{}','old','old')")
+        self.db.execute("INSERT INTO attachments(id,cipher_id,file_name,file_size_bytes,created_at,updated_at) VALUES('a','c','encrypted',5,'old','old')")
+        self.db.execute("INSERT INTO sends(id,user_id,name,send_type,data,encrypted_key,created_at,updated_at,deletes_at,access_stamp,file_id) VALUES('s','u','encrypted',1,'{}','key','old','old','future','stamp','f')")
         sql = list(rust_strings(read_source("storage_cleanup")))
         self.enqueue = next(v for v in sql if v.startswith("INSERT INTO storage_cleanup_jobs"))
         self.select = next(v for v in sql if v.startswith("SELECT object_key, generation"))
@@ -38,13 +38,13 @@ class StorageCleanupSql(unittest.TestCase):
         self.assertEqual(self.db.execute("SELECT COUNT(*) FROM storage_cleanup_jobs").fetchone()[0], 2)
 
     def test_account_cascade_retains_jobs_without_an_account_foreign_key(self):
-        self.db.execute("INSERT INTO attachments_pending(id,cipher_id,file_name,file_size,created_at,updated_at) VALUES('p','c','pending',7,'old','old')")
+        self.db.execute("INSERT INTO attachments_pending(id,cipher_id,file_name,file_size_bytes,created_at,updated_at) VALUES('p','c','pending',7,'old','old')")
         self.db.execute("DELETE FROM users WHERE id='u'")
         self.assertEqual({r[0] for r in self.db.execute(self.select)}, {'c/a', 'c/p', 'sends/s/f'})
         self.assertEqual(self.db.execute('PRAGMA foreign_key_check').fetchall(), [])
 
     def test_finalized_legacy_object_is_protected_from_pending_delete_job(self):
-        self.db.execute("INSERT INTO attachments_pending(id,cipher_id,file_name,file_size,created_at,updated_at) VALUES('a','c','pending',5,'old','old')")
+        self.db.execute("INSERT INTO attachments_pending(id,cipher_id,file_name,file_size_bytes,created_at,updated_at) VALUES('a','c','pending',5,'old','old')")
         self.db.execute("DELETE FROM attachments_pending WHERE id='a'")
         self.assertEqual(self.db.execute("SELECT COUNT(*) FROM storage_cleanup_jobs").fetchone()[0], 1)
         self.assertEqual(self.db.execute(self.select).fetchall(), [])

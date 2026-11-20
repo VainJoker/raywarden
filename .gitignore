@@ -6,6 +6,7 @@ node_modules/
 
 # Cloudflare local state, caches, and deployment artifacts
 .wrangler/
+/.wrangler-local.generated.json*
 
 # Local environment and secrets; allow sanitized templates
 .env

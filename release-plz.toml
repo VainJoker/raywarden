@@ -1,0 +1,10 @@
+[workspace]
+# This application deploys to Cloudflare; it is not a registry package.
+git_only = true
+release_always = false
+git_tag_name = "v{{ version }}"
+git_release_enable = true
+# Worker runtime and protocol checks are the compatibility gate, not a Rust API.
+semver_check = false
+# Dependency updates remain an explicit, separately reviewed change.
+dependencies_update = false

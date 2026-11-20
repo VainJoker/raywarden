@@ -5,17 +5,38 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { promisify } from "node:util";
 import test from "node:test";
+import { unstable_getVarsForDev, unstable_readConfig } from "wrangler";
 import { parseJsonc } from "../scripts/deploy.mjs";
 
 const run = promisify(execFile);
+const WEB_VAULT_VERSION = JSON.parse(await readFile(new URL("../package.json", import.meta.url), "utf8")).config.webVaultVersion;
 
 test("local dev serves the HTTPS origin required by the pinned Web Vault", async () => {
-  const config = parseJsonc(await readFile(new URL("../wrangler.local.jsonc", import.meta.url), "utf8"));
-  const domain = new URL(config.vars.DOMAIN);
+  const config = parseJsonc(await readFile(new URL("../wrangler.jsonc", import.meta.url), "utf8"));
+  const domain = new URL(config.env.local.vars.DOMAIN);
   assert.equal(domain.protocol, "https:");
   assert.equal(domain.hostname, "localhost");
   assert.equal(domain.port, "8787");
   assert.equal(config.dev.local_protocol, "https");
+});
+
+test("local env loads credentials from the existing dev vars file", async t => {
+  const root = await mkdtemp(join(tmpdir(), "raywarden-dev-vars-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  await mkdir(join(root, "scripts"));
+  for (const name of ["wrangler.jsonc", "scripts/local-config.mjs", "scripts/deploy.mjs"]) {
+    await copyFile(new URL(`../${name}`, import.meta.url), join(root, name));
+  }
+  await writeFile(join(root, ".dev.vars"), "OWNER_SETUP_TOKEN=local-test-token\nJWT_SECRET=local-legacy-key\n");
+  await run(process.execPath, ["scripts/local-config.mjs"], { cwd: root });
+  const config = join(root, ".wrangler-local.generated.json");
+  const generated = parseJsonc(await readFile(config, "utf8"));
+  assert.equal(generated.secrets, undefined);
+  assert.ok(parseJsonc(await readFile(join(root, "wrangler.jsonc"), "utf8")).secrets.required.includes("KEY_ENCRYPTION_KEY"));
+  const local = unstable_readConfig({ config, env: "local" });
+  const bindings = unstable_getVarsForDev(config, undefined, local.vars, "local", true, local.secrets);
+  assert.deepEqual(bindings.OWNER_SETUP_TOKEN, { type: "secret_text", value: "local-test-token" });
+  assert.deepEqual(bindings.JWT_SECRET, { type: "secret_text", value: "local-legacy-key" });
 });
 
 async function fixture(t) {
@@ -24,10 +45,10 @@ async function fixture(t) {
   for (const directory of ["scripts", "static/overrides", "bin", "cargo/bin", "release/web-vault"]) {
     await mkdir(join(root, directory), { recursive: true });
   }
-  for (const name of ["Justfile", "package.json", "package-lock.json", "rust-toolchain.toml", "scripts/patch-ui.mjs", "scripts/prepare-ui.sh", "static/overrides/vaultwarden.css", "static/overrides/raywarden.js"]) {
+  for (const name of ["Justfile", "package.json", "package-lock.json", "rust-toolchain.toml", "wrangler.jsonc", "scripts/local-config.mjs", "scripts/deploy.mjs", "scripts/patch-ui.mjs", "scripts/prepare-ui.sh", "static/security-headers.json", "static/overrides/vaultwarden.css", "static/overrides/raywarden.js"]) {
     await copyFile(new URL(`../${name}`, import.meta.url), join(root, name));
   }
-  await writeFile(join(root, "release/web-vault/vw-version.json"), '{"version":"2026.7.0"}');
+  await writeFile(join(root, "release/web-vault/vw-version.json"), JSON.stringify({ version: WEB_VAULT_VERSION }));
   await writeFile(join(root, "release/web-vault/index.html"), "<html><head></head><body></body></html>");
   await run("tar", ["-czf", join(root, "release.tar.gz"), "-C", join(root, "release"), "web-vault"]);
   const stub = async (name, source) => writeFile(join(root, name), `#!${process.execPath}\n${source}`, { mode: 0o755 });
@@ -75,8 +96,18 @@ test("just dev prepares a fresh checkout, then reuses tools and UI before local 
   assert.match(first, /rust-install/);
   assert.match(first, /cargo install worker-build --version =0\.9\.0 --locked --root \.tools/);
   assert.match(first, /download/);
-  assert.match(first, /wrangler \["d1","migrations","apply","warden-db".*"--local".*"\.wrangler\/local"/);
-  assert.match(first, /wrangler \["dev","--local","--config","wrangler.local.jsonc"/);
+  const commands = first.split("\n")
+    .filter(line => line.startsWith("wrangler ["))
+    .map(line => JSON.parse(line.slice("wrangler ".length)));
+  assert.equal(commands.length, 2);
+  assert.deepEqual(commands[0].slice(0, 4), ["d1", "migrations", "apply", "DB"]);
+  assert.equal(commands[1][0], "dev");
+  for (const args of commands) {
+    assert.equal(args[args.indexOf("--config") + 1], ".wrangler-local.generated.json");
+    assert.equal(args[args.indexOf("--env") + 1], "local");
+    assert.ok(args.includes("--local"));
+    assert.equal(args[args.indexOf("--persist-to") + 1], ".wrangler/local");
+  }
   assert.ok(first.indexOf("download") < first.indexOf('wrangler ["d1"'));
   assert.ok(first.indexOf('wrangler ["d1"') < first.indexOf('wrangler ["dev"'));
   await f.just("dev");

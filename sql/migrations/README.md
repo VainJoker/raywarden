@@ -1,93 +1,134 @@
-# D1 migrations
+# D1 migrations and database design
 
-This directory is the authoritative runtime source for database structure.
-The baseline groups the original DDL into five functional files. Subsequent
-migrations add runtime-managed keys, equivalent-domain refresh state, V2
-account envelopes and durable file cleanup. Remaining feature gaps are tracked
-in the feature-parity document.
+This directory is the authoritative runtime schema. The eight CREATE migrations,
+`0001` through `0008`, directly define the canonical schema for personal vaults
+and small private groups. New databases apply all eight files. Existing instances
+with older schemas or migration histories need a separately planned transfer to
+a new database. Editing baseline files does not upgrade an application database;
+do not overwrite existing tables or rewrite `d1_migrations` records.
 
-| File | Contents |
+Migration filenames follow `NNNN_<scope>_<subject>.sql`: a four-digit
+execution order followed by two lowercase snake_case words describing the contents.
+The same rule applies to all eight files:
+
+| File | Tables and responsibility |
 | --- | --- |
-| `0001_accounts.sql` | Users |
-| `0002_vault.sql` | Folders, ciphers, attachments, pending attachments, global equivalent domains |
-| `0003_authentication.sql` | Devices, auth requests, two-factor, WebAuthn, API keys |
-| `0004_verification.sql` | Verification codes and Turnstile redemptions |
-| `0005_sends.sql` | Sends |
-| `0006_jwt_keys.sql` | Persistent server signing keys |
-| `0007_global_domains_cache.sql` | Global equivalent-domain refresh state |
-| `0008_account_encryption.sql` | V2 account envelopes and PRF/approval generation snapshots |
-| `0009_file_lifecycle.sql` | File object pointers and deletion outbox triggers |
-| `0010_single_user.sql` | Unique owner constraint, including competing initial registrations |
+| `0001_user_accounts.sql` | Account identity, server password cost, client KDF, V1/V2 envelopes and write guards |
+| `0002_personal_vault.sql` | Personal folders and ciphers, including ownership invariants |
+| `0003_access_credentials.sql` | Devices, approval requests, API keys and device-bound API-key grants |
+| `0004_authentication_methods.sql` | Second factors, passkeys and single-use WebAuthn challenges |
+| `0005_verification_records.sql` | Email/action verification codes and redeemed Turnstile hashes |
+| `0006_encrypted_sends.sql` | Encrypted Text/File Sends, access policy, object pointer and upload state |
+| `0007_instance_state.sql` | Persistent JWT keys and shared equivalent-domain dataset/refresh lease |
+| `0008_file_lifecycle.sql` | Attachments, upload reservations, cleanup outbox and storage triggers |
 
-New databases apply these files in order with Wrangler's native
-`d1 migrations apply`. Each table is declared in full, followed by its indexes;
-the old add-column patch chain is no longer used. `CREATE TABLE` has no
-`IF NOT EXISTS`: Wrangler skips recorded migrations rather than suppressing
-duplicate-object errors.
+Each table is declared once with canonical names, including V2 account fields,
+snapshots, object pointers and verifier costs. This consolidated baseline creates
+new tables; it supplies no conversion of older schemas or encrypted payloads.
+There is no single-user constraint.
+Files follow dependency order. Storage triggers are declared only after both
+vault and Send tables exist. The current schema has 19 tables and 47 explicit DDL
+objects. Runtime initialization, rather than migrations, populates signing keys
+and the shared domain cache. Migrations create no accounts or client keys.
 
-`sql/schema.sql` is a generated snapshot of the current application structure,
-not a second migration or initialization path. It is useful for reading all
-tables at once, reviewing the net effect of migrations, or creating a disposable
-SQLite database for analysis. It contains no business or seed data and no
-`d1_migrations` history, so it is not a backup or a production restore file.
+For Rust type roles, shared domain terms, and explicit wire mappings, see the
+[project naming policy](../../docs/naming-conventions.md).
 
-After adding a migration, run `just schema` to regenerate the snapshot and
-`just test-sql` to check that replaying it matches the complete migration chain.
-The existing `just ci` command also runs this consistency check.
-Do not hand-edit the snapshot, import it into an application database, or follow
-it with the full historical migrations. Normal `just dev`, deployment and
-regression test setup continue to use migrations, not the snapshot.
+## Persisted naming and baseline compatibility
 
-Wrangler creates and updates `d1_migrations` as files actually execute. The
-current complete chain has ten records; do not prefill migration history.
+Persisted Rust fields use the same lowercase snake_case names as SQL columns.
+Protocol request/response names remain independent, so the public JSON contract
+continues to use fields such as `type`, `favorite`, `key` and `emailVerified`.
+The factor table is `two_factors`; its provider and replay fields are
+`provider_type`, `is_enabled` and `last_used_step`. The latter is a TOTP step,
+not a timestamp. File metadata uses `encrypted_key` and `file_size_bytes`.
+Send records use `send_type`, `expires_at`, `deletes_at`, `is_disabled`,
+`is_email_hidden` and `password_iterations`. Their `upload_state` retains all
+three integer states (0, 1 and 2); it is not a boolean. Device and approval fields
+use `device_id`, `device_type`, `push_id`, `request_device_id`, `created_at`,
+`responded_at` and `authenticated_at`. Cipher rows use `cipher_type` and
+`is_favorite`; users use `is_email_verified` and `two_factor_recovery_code`.
 
-## Commands
+Named indexes use `idx_<table>_<columns>` names directly in the CREATE files.
+The canonical schema retains primary/unique keys, composite device-session
+foreign keys, ownership constraints and file-cleanup triggers. Regression checks
+exercise these rules and schema-snapshot parity on the eight-file chain.
 
-From the repository root:
+Wrangler records migration filenames in `d1_migrations`. Renaming a baseline
+file does not rename an existing history entry, even when its numeric prefix is
+unchanged; the renamed CREATE file may appear unapplied. Existing instances need
+a fresh destination database and an explicit transfer plan. Do not replay these
+files over existing tables or rewrite history to mark them applied. Deploy
+matching code after the destination is ready; see the
+[upgrade and rollback boundary](../../docs/naming-conventions.md#upgrade-and-rollback-boundary).
+
+## Account and ownership model
+
+Accounts have independent vaults, devices, factors, API keys, domains and Sends.
+`users.email` has case-insensitive uniqueness; different allowed emails may
+register concurrently, while duplicate-email races produce a conflict. There
+is no global account limit or administrator/organization subsystem. Private
+enrollment requires both an exact `ALLOWED_EMAILS` entry and `OWNER_SETUP_TOKEN`
+authorization. Commas and newlines separate addresses; wildcards, malformed and
+empty entries are rejected. The normalized list is sorted and deduplicated.
+Short-lived setup cookies bind to DOMAIN and the hash of the current list, so
+changing the list invalidates their scope. Registration clears the browser's
+cookie; visit `/setup` again for another account. Existing accounts continue to
+log in after whitelist changes. Email changes use the same exact whitelist.
+
+Every cipher requires an account owner. Foreign keys cascade account-owned
+records on deletion; indexes cover the referencing columns and per-user vault
+reads. Cipher triggers enforce that a folder belongs to the same account,
+including changes to either reference; folder ownership cannot be reassigned.
+Deleting a folder retains its ciphers and sets their folder to NULL. The API's
+user/session/snapshot guards remain necessary for authorization and concurrency.
+Supported cipher types and boolean/file-size fields have basic CHECK constraints.
+Opaque encrypted payloads remain in their existing protocol representation.
+
+## Index and storage decisions
+
+Per-account folder/cipher indexes avoid scanning other vaults during sync,
+usage calculation and cascading deletion. WebAuthn's existing unique
+`(user_id, credential_use, slot)` index already covers user lookups, so a duplicate
+user-only index is unnecessary. Verification codes and challenges have user
+indexes for account deletion. Expiry indexes use `julianday(...)` where production
+queries compare timestamp instants, preserving time-zone semantics while making
+those queries indexable. The Send pending-upload index is partial. Cleanup jobs
+are ordered by `(created_at, object_key)` for bounded retry batches.
+
+Attachment and Send bytes remain in object storage; D1 holds metadata and the
+committed storage pointer. Deletion/replacement triggers queue old objects in a
+durable outbox. The outbox deliberately has no account FK so cascades cannot
+erase cleanup work. Its generation token protects retry acknowledgement from
+concurrent replacement. Unfinished attachment uploads remain separate reservations
+because finalization, quota accounting and expiry have different lifecycles.
+
+Server password verification defaults to 600000 iterations, independently of
+client KDF settings. Credential writes record their actual cost and preserve
+higher costs. Explicit lower-cost/raw verifier records remain readable by the
+existing guarded login-upgrade code; no historical data rewrite runs at baseline.
+JWT keys survive account deletion and must be preserved with KEY_ENCRYPTION_KEY
+in any backup. Global-domain caches are rebuildable.
+
+## Commands and future changes
 
 ```bash
-just dev                  # Apply pending local migrations, then start locally.
-just db-migrate           # Apply local migrations only (default: local).
-just db-migrate local     # Same explicit local target.
-just schema               # Regenerate the structure snapshot in memory only.
+just schema               # Regenerate sql/schema.sql in memory.
+just test-sql             # Exercise model queries and verify snapshot parity.
+just db-migrate local     # Apply with Wrangler to the selected local database.
+just dev                  # Apply pending local migrations before serving.
 ```
 
-Local commands use `wrangler.local.jsonc`, `--local` and `.wrangler/local`.
-Remote migration requires an explicit `just db-migrate production`; it
-validates production configuration before using `--remote`. Do not use a remote command to validate a local change.
+`sql/schema.sql` is a generated structural reference, not an initialization or
+restore path. Do not hand-edit it, import it into an application database or
+prefill migration history. Wrangler owns execution tracking; CREATE statements
+deliberately omit IF NOT EXISTS so mistakes fail.
+Local commands select `env.local` in `wrangler.jsonc` and persist to
+`.wrangler/local`. Remote migration requires the explicit
+`just db-migrate production` target.
 
-## Baseline boundary
-
-This is a new baseline, not an in-place upgrade path for databases with the old
-`d1_migrations` records. Do not apply the current migration chain directly to an old
-application database or invent replacement history. Transferring existing data
-to this baseline needs a separate plan; no compatibility mapping is provided.
-
-This change did not clear or modify the user's existing local database, read
-or write a remote database, or run a migration against an application database. Native migration errors
-stop execution; they are not ignored to make the new baseline fit an old one.
-
-## Future changes
-
-- Add changes as `0011_*.sql` and later, using Wrangler's migration creation
-  command and reviewing its generated name.
-- After this baseline is established, preserve applied files and append changes
-  instead of editing or reordering them.
-- Test new databases by applying the complete current chain from `0001`, and
-  test later upgrades against databases created from this baseline.
-- Apply pending migrations successfully before uploading Worker code that
-  depends on them. Use the configured local or explicit remote environment.
-
-The baseline creates empty tables. Later migrations may alter tables and
-transform existing data; `0008` binds existing PRF material to its current
-account generation without upgrading account encryption or clearing key IDs.
-Runtime initialization stores JWT keys in
-`jwt_keys` once; preserve that row with the database, including during recovery.
-Global equivalent domains are fetched and cached automatically, independently
-of user-defined groups. Their cache can be rebuilt; signing keys cannot.
-
-`0010` enforces the single-user design with a unique index over a constant.
-It preserves an existing sole owner and rejects every second account, even
-when two first registrations race. If multiple users already exist, migration
-fails without removing or merging them; review the database and its backup
-before deciding how to transfer it to a single-owner installation.
+After this consolidation, preserve applied filenames and contents, then append `0009_*.sql`
+and later for future changes. Regenerate the snapshot and check fresh databases
+and any supported upgrade from the preceding schema. Existing instances with
+older schemas need a separately planned transfer; this change does not clear,
+upgrade or deploy them.

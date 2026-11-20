@@ -46,6 +46,25 @@ export function parseJsonc(source) {
   return JSON.parse(json.replace(/^\uFEFF/, ""));
 }
 
+function validateRateLimitBindings(config) {
+  const required = ["LOGIN_RATE_LIMITER", "SEND_ACCESS_RATE_LIMITER"];
+  if (!Array.isArray(config.ratelimits)) throw new Error(`production requires ratelimits bindings: ${required.join(", ")}`);
+  const namespaces = [];
+  for (const name of required) {
+    const bindings = config.ratelimits.filter(binding => binding?.name === name);
+    if (bindings.length !== 1) throw new Error(`production requires exactly one ${name} rate limit binding`);
+    const binding = bindings[0];
+    if (typeof binding.namespace_id !== "string" || !/^\d+$/.test(binding.namespace_id)) {
+      throw new Error(`${name} requires a numeric string namespace_id`);
+    }
+    if (!Number.isSafeInteger(binding.simple?.limit) || binding.simple.limit <= 0 || ![10, 60].includes(binding.simple?.period)) {
+      throw new Error(`${name} requires a positive integer simple.limit and simple.period of 10 or 60 seconds`);
+    }
+    namespaces.push(binding.namespace_id.replace(/^0+(?=\d)/, ""));
+  }
+  if (new Set(namespaces).size !== required.length) throw new Error("production login and Send rate limit bindings must use distinct namespace_id values");
+}
+
 export function readTargetConfig({ configPath = resolve(PROJECT_ROOT, "wrangler.jsonc") } = {}) {
   configPath = resolve(configPath);
   const config = parseJsonc(readFileSync(configPath, "utf8"));
@@ -53,12 +72,24 @@ export function readTargetConfig({ configPath = resolve(PROJECT_ROOT, "wrangler.
   if (typeof name !== "string" || name.length > 255 || !/^[a-z0-9][a-z0-9_-]*$/i.test(name)) throw new Error("Invalid or missing production Worker name");
   if (!Array.isArray(config.d1_databases) || config.d1_databases.length !== 1) throw new Error("production must configure exactly one explicit D1 binding");
   const database = config.d1_databases[0];
-  if (database.binding !== "warden-db" || typeof database.database_name !== "string" || !database.database_name || !DATABASE_ID.test(database.database_id ?? "")) throw new Error("production D1 binding requires binding=warden-db, database_name and a real database_id");
+  if (database.binding !== "DB" || typeof database.database_name !== "string" || !database.database_name || !DATABASE_ID.test(database.database_id ?? "")) throw new Error("production D1 binding requires binding=DB, database_name and a real database_id");
   if (!database.migrations_dir || typeof database.migrations_dir !== "string") throw new Error("production D1 binding requires an explicit migrations_dir");
   const projectDir = dirname(configPath);
   const migrationsDir = resolve(projectDir, database.migrations_dir);
   const relativeDir = relative(projectDir, migrationsDir);
   if (relativeDir.startsWith("..") || isAbsolute(relativeDir)) throw new Error("migrations_dir must be inside the project");
+  // Fail before resource discovery, migrations or upload. Runtime failures
+  // also reject protected attempts rather than removing guessing protection.
+  validateRateLimitBindings(config);
+  if (config.observability?.redact_query_string !== true) {
+    throw new Error("production requires observability.redact_query_string=true for credential-bearing URLs");
+  }
+  if (!Array.isArray(config.secrets?.required) || !config.secrets.required.includes("KEY_ENCRYPTION_KEY")) {
+    throw new Error("production requires KEY_ENCRYPTION_KEY in secrets.required");
+  }
+  if (Object.hasOwn(config.vars ?? {}, "KEY_ENCRYPTION_KEY")) {
+    throw new Error("KEY_ENCRYPTION_KEY must be a Worker Secret, not a production var");
+  }
   // Custom domains are optional. Without one, resolve workers.dev remotely.
   const routes = config.routes ?? [];
   if (!Array.isArray(routes)) throw new Error("routes must be an array");
@@ -152,7 +183,7 @@ export async function verifyResources(env = process.env, fetchImpl = globalThis.
 }
 
 
-export async function checkHealth({ configPath, attempts = 12, interval = 5000 } = {}, fetchImpl = globalThis.fetch, wait = delay, environment = process.env) {
+export async function checkHealth({ configPath, attempts = 12, interval: retryIntervalMs = 5000 } = {}, fetchImpl = globalThis.fetch, wait = delay, environment = process.env) {
   const target = readTargetConfig({ configPath });
   let origin = target.domain;
   if (!origin) {
@@ -171,27 +202,31 @@ export async function checkHealth({ configPath, attempts = 12, interval = 5000 }
       console.log(`Health check passed: ${url}`);
       return { url };
     } catch (error) { failure = error; }
-    if (attempt < attempts) await wait(interval);
+    if (attempt < attempts) await wait(retryIntervalMs);
   }
   throw new Error(`Health check failed for ${url}: ${failure?.message}`);
 }
 
 
 const SHA = /^[0-9a-f]{40}$/;
-const hash = (file) => createHash("sha256").update(readFileSync(file)).digest("hex");
+const fileSha256 = (file) => createHash("sha256").update(readFileSync(file)).digest("hex");
 const posix = (path) => path.split(sep).join("/");
-async function currentHead(projectDir) {
-  const { stdout } = await promisify(execFile)("git", ["rev-parse", "HEAD"], { cwd: projectDir });
+function withoutSetupSecrets(environment) {
+  const { ALLOWED_EMAILS: _email, OWNER_SETUP_TOKEN: _token, KEY_ENCRYPTION_KEY: _key, ...remaining } = environment;
+  return remaining;
+}
+async function readGitHead(projectDir) {
+  const { stdout } = await promisify(execFile)("git", ["rev-parse", "HEAD"], { cwd: projectDir, env: withoutSetupSecrets(process.env) });
   return stdout.trim();
 }
-function inside(projectDir, path) {
+function resolveArtifactPath(projectDir, path) {
   const full = resolve(projectDir, path);
   const rel = relative(projectDir, full);
   if (!rel || rel.startsWith("..") || resolve(projectDir, rel) !== full) throw new Error(`Artifact path must be inside the project: ${path}`);
   return full;
 }
 function filesBelow(projectDir, path) {
-  const full = inside(projectDir, path);
+  const full = resolveArtifactPath(projectDir, path);
   if (!existsSync(full)) throw new Error(`Missing artifact input: ${path}`);
   const stat = lstatSync(full);
   if (stat.isSymbolicLink()) throw new Error(`Artifact inputs cannot contain symbolic links: ${path}`);
@@ -199,33 +234,34 @@ function filesBelow(projectDir, path) {
   if (!stat.isDirectory()) throw new Error(`Unsupported artifact input: ${path}`);
   return readdirSync(full).sort().flatMap((name) => filesBelow(projectDir, posix(relative(projectDir, resolve(full, name)))));
 }
-function inventory(target, bundleDirectory) {
-  return [bundleDirectory, "static/web-vault", "Cargo.lock", "package-lock.json"]
-    .flatMap((path) => filesBelow(target.projectDir, path)).sort();
+function collectArtifactFiles(target, bundleFiles) {
+  const remainingFiles = ["static/web-vault", "Cargo.lock", "package-lock.json"]
+    .flatMap((path) => filesBelow(target.projectDir, path));
+  return [...bundleFiles, ...remainingFiles].sort();
 }
-function validateInputs(target, bundleDirectory) {
-  const assets = inside(target.projectDir, "static/web-vault/index.html");
+function validateArtifactInputs(target, bundleDirectory) {
+  const assets = resolveArtifactPath(target.projectDir, "static/web-vault/index.html");
   if (!existsSync(assets)) throw new Error("Missing prepared Web Vault; obtain a successful Integration artifact");
   const bundleFiles = filesBelow(target.projectDir, bundleDirectory);
   const wasm = bundleFiles.filter((file) => file.endsWith(".wasm"));
   if (!wasm.length) throw new Error("Prebundled Worker artifact contains no WASM module");
   for (const file of wasm) {
-    if (!readFileSync(inside(target.projectDir, file)).subarray(0, 8).equals(Buffer.from([0, 97, 115, 109, 1, 0, 0, 0]))) throw new Error(`Invalid WASM module: ${file}`);
+    if (!readFileSync(resolveArtifactPath(target.projectDir, file)).subarray(0, 8).equals(Buffer.from([0, 97, 115, 109, 1, 0, 0, 0]))) throw new Error(`Invalid WASM module: ${file}`);
   }
   return bundleFiles;
 }
-export async function createArtifactManifest({ configPath, manifestPath, expectedSha } = {}, head = currentHead) {
+export async function createArtifactManifest({ configPath, manifestPath, expectedSha } = {}, head = readGitHead) {
   const target = readTargetConfig({ configPath });
   const sourceSha = await head(target.projectDir);
   if (!SHA.test(sourceSha) || (expectedSha && sourceSha !== expectedSha)) throw new Error("Artifact source SHA does not match the checked-out commit");
   const bundleDirectory = ".wrangler/deploy-check/production";
-  const bundleFiles = validateInputs(target, bundleDirectory);
+  const bundleFiles = validateArtifactInputs(target, bundleDirectory);
   const config = parseJsonc(readFileSync(target.configPath, "utf8"));
   const entryName = basename(config.main).replace(/\.[cm]?tsx?$/, ".js");
   const entrypoint = `${bundleDirectory}/${entryName}`;
   if (!bundleFiles.includes(entrypoint)) throw new Error(`Missing prebundled entrypoint ${entrypoint}; run the release dry-run for this environment`);
-  const files = Object.fromEntries(inventory(target, bundleDirectory).map((file) => [file, hash(inside(target.projectDir, file))]));
-  const manifest = { formatVersion: 1, sourceSha, environment: "production", configurationSha256: hash(target.configPath), bundleDirectory, entrypoint, files };
+  const files = Object.fromEntries(collectArtifactFiles(target, bundleFiles).map((file) => [file, fileSha256(resolveArtifactPath(target.projectDir, file))]));
+  const manifest = { formatVersion: 1, sourceSha, environment: "production", configurationSha256: fileSha256(target.configPath), bundleDirectory, entrypoint, files };
   const output = manifestPath ? resolve(manifestPath) : resolve(target.projectDir, ".wrangler/artifact-manifest.json");
   mkdirSync(dirname(output), { recursive: true });
   writeFileSync(output, `${JSON.stringify(manifest, null, 2)}\n`);
@@ -233,20 +269,20 @@ export async function createArtifactManifest({ configPath, manifestPath, expecte
   return manifest;
 }
 
-export async function verifyArtifact({ configPath, manifestPath, expectedSha } = {}, head = currentHead) {
+export async function verifyArtifact({ configPath, manifestPath, expectedSha } = {}, head = readGitHead) {
   const target = readTargetConfig({ configPath });
   const file = manifestPath ? resolve(manifestPath) : resolve(target.projectDir, ".wrangler/artifact-manifest.json");
   const manifest = JSON.parse(readFileSync(file, "utf8"));
   const sourceSha = await head(target.projectDir);
   if (manifest.formatVersion !== 1 || !SHA.test(manifest.sourceSha ?? "") || manifest.sourceSha !== sourceSha || (expectedSha && sourceSha !== expectedSha)) throw new Error("Artifact source SHA does not match the selected successful run and checkout");
   if (manifest.environment !== "production") throw new Error("Artifact environment does not match the deployment target");
-  if (manifest.configurationSha256 !== hash(target.configPath)) throw new Error("Deployment configuration changed after this artifact was built");
+  if (manifest.configurationSha256 !== fileSha256(target.configPath)) throw new Error("Deployment configuration changed after this artifact was built");
   const bundleDirectory = ".wrangler/deploy-check/production";
   if (manifest.bundleDirectory !== bundleDirectory || !manifest.entrypoint?.startsWith(`${bundleDirectory}/`)) throw new Error("Invalid artifact bundle path");
-  validateInputs(target, bundleDirectory);
-  const files = inventory(target, bundleDirectory);
+  const bundleFiles = validateArtifactInputs(target, bundleDirectory);
+  const files = collectArtifactFiles(target, bundleFiles);
   if (!manifest.files || JSON.stringify(Object.keys(manifest.files).sort()) !== JSON.stringify(files)) throw new Error("Artifact file inventory changed or files are missing");
-  for (const path of files) if (manifest.files[path] !== hash(inside(target.projectDir, path))) throw new Error(`Artifact digest mismatch: ${path}`);
+  for (const path of files) if (manifest.files[path] !== fileSha256(resolveArtifactPath(target.projectDir, path))) throw new Error(`Artifact digest mismatch: ${path}`);
   if (!files.includes(manifest.entrypoint)) throw new Error("Artifact entrypoint is missing");
   console.log(`Verified production artifact from ${sourceSha}`);
   return { target, manifest };
@@ -257,8 +293,8 @@ export function compiledConfig(target, manifest) {
   delete config.build;
   delete config.env;
   for (const binding of config.d1_databases ?? []) if (binding.migrations_dir) binding.migrations_dir = resolve(target.projectDir, binding.migrations_dir);
-  config.main = inside(target.projectDir, manifest.entrypoint);
-  config.base_dir = inside(target.projectDir, manifest.bundleDirectory);
+  config.main = resolveArtifactPath(target.projectDir, manifest.entrypoint);
+  config.base_dir = resolveArtifactPath(target.projectDir, manifest.bundleDirectory);
   config.find_additional_modules = true;
   config.rules = [
     { type: "CompiledWasm", globs: ["**/*.wasm"], fallthrough: true },
@@ -290,19 +326,29 @@ function runWrangler(args, { projectRoot, environment }) {
 
 function configuredSecrets(environment) {
   const secrets = {};
+  const encryptionKey = environment.KEY_ENCRYPTION_KEY;
+  if (encryptionKey !== undefined && encryptionKey !== "") {
+    if (typeof encryptionKey !== "string" || !/^[A-Za-z0-9_-]{43}$/.test(encryptionKey) ||
+        Buffer.from(encryptionKey, "base64url").length !== 32 || Buffer.from(encryptionKey, "base64url").toString("base64url") !== encryptionKey) {
+      throw new Error("KEY_ENCRYPTION_KEY must be 32 bytes encoded as unpadded canonical base64url");
+    }
+    secrets.KEY_ENCRYPTION_KEY = encryptionKey;
+  }
   const email = environment.ALLOWED_EMAILS;
   if (email !== undefined && email !== "") {
-    // Unicode White_Space agrees with Rust str::trim (JS trim also strips BOM).
-    const normalized = email.replace(/^\p{White_Space}+|\p{White_Space}+$/gu, "").toLowerCase();
-    const parts = normalized.split("@");
-    const local = parts[0], domain = parts[1];
-    if (/[^\x00-\x7f]/.test(email) || /\p{Cc}/u.test(email) || normalized.length > 254 || parts.length !== 2 ||
-        !local || local.length > 64 || !/^[a-z0-9._+-]+$/.test(local) || local.startsWith(".") || local.endsWith(".") || local.includes("..") ||
-        !domain || domain.length > 253 || domain.split(".").length < 2 ||
-        domain.split(".").some(label => !/^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/.test(label))) {
-      throw new Error("ALLOWED_EMAILS must contain exactly one complete owner email address");
-    }
-    secrets.ALLOWED_EMAILS = normalized;
+    const emails = email.split(/[,\n]/).map(value => {
+      const normalized = value.replace(/^\p{White_Space}+|\p{White_Space}+$/gu, "").toLowerCase();
+      const parts = normalized.split("@");
+      const local = parts[0], domain = parts[1];
+      if (/[^\x00-\x7f]/.test(value) || /\p{Cc}/u.test(value) || normalized.length > 254 || parts.length !== 2 ||
+          !local || local.length > 64 || !/^[a-z0-9._+-]+$/.test(local) || local.startsWith(".") || local.endsWith(".") || local.includes("..") ||
+          !domain || domain.length > 253 || domain.split(".").length < 2 ||
+          domain.split(".").some(label => !/^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/.test(label))) {
+        throw new Error("ALLOWED_EMAILS must contain complete email addresses separated by commas or newlines, without wildcards or empty entries");
+      }
+      return normalized;
+    });
+    secrets.ALLOWED_EMAILS = [...new Set(emails)].sort().join(",");
   }
   const token = environment.OWNER_SETUP_TOKEN;
   if (token !== undefined && token !== "") {
@@ -315,7 +361,7 @@ function configuredSecrets(environment) {
   return secrets;
 }
 
-export async function deployArtifact(options = {}, runner = runWrangler, head = currentHead, environment = process.env, fetchImpl = globalThis.fetch) {
+export async function deployArtifact(options = {}, runner = runWrangler, head = readGitHead, environment = process.env, fetchImpl = globalThis.fetch) {
   const { target, manifest } = await verifyArtifact(options, head);
   // Invalid supplied values fail before network calls or temporary secret files.
   // Omitted optional values inherit the existing encrypted Worker bindings.
@@ -340,8 +386,7 @@ export async function deployArtifact(options = {}, runner = runWrangler, head = 
     // prevents the separate custom command from invoking worker-build/Cargo.
     // First deployment cannot pre-create secrets on a nonexistent Worker.
     // Values travel only through the private file, never in argv or logs.
-    const { ALLOWED_EMAILS: _email, OWNER_SETUP_TOKEN: _token, ...commandEnvironment } = environment;
-    return await runner(["deploy", "--no-bundle", "--config", configPath, "--secrets-file", secretsPath, "--env", ""], { projectRoot: target.projectDir, environment: commandEnvironment });
+    return await runner(["deploy", "--no-bundle", "--config", configPath, "--secrets-file", secretsPath, "--env", ""], { projectRoot: target.projectDir, environment: withoutSetupSecrets(environment) });
   } finally { rmSync(temp, { recursive: true, force: true }); }
 }
 

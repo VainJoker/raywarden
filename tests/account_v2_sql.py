@@ -4,9 +4,9 @@ import re
 import sqlite3
 import unittest
 
-from sql_regression import seed_cipher
+from sql_regression import seed_cipher, seed_attachment
 
-from sql_source import source as read_source
+from sql_source import account_guard, source as read_source
 from sql_regression import (NOW, OLD, FUTURE, account_snapshot, database,
                             function_source, rust_strings, statement, statements)
 
@@ -38,21 +38,20 @@ def rotation_claim(db, user="alice"):
         predicate = " AND ".join(f"{column} IS ?{i+2}" for i, column in enumerate(columns))
         for row in rows:
             guards.append(guard(f"EXISTS(SELECT 1 FROM {table} WHERE {where} AND {predicate})", (user, *row)))
-    from send_compat_sql import send_guard
+    from send_transactions_sql import send_guard
     from sql_source import literal
     sends = db.execute("SELECT * FROM sends WHERE user_id=? ORDER BY id", (user,)).fetchall()
     guards.append(guard(literal("send_mutation", "(SELECT COUNT(*) FROM sends"), (user, len(sends))))
     guards.extend(send_guard(dict(row)) for row in sends)
-    columns = list(rust_strings(re.search(r"\[(.*?)\]", function_source("account_keys", "matches_sql"), re.S).group(1)))
-    account_guard = " AND ".join(f"{column} IS json_extract(?23, '$.{column}')" for column in columns)
-    claim = next(text for text in service_strings() if text.startswith("UPDATE users SET key=")).replace("{}", account_guard)
+    claim = statement("account_rotation", "claim_rotation").replace("{}", account_guard(23))
     old = dict(db.execute("SELECT * FROM users WHERE id=?", (user,)).fetchone())
     args = ["new-user-key", "7.new-private", "public", "signed", "state", 2,
             '{"signatureAlgorithm":"ed25519","wrappedSigningKey":"7.signing","verifyingKey":"verify"}',
             "a" * 32, '{"wrappedUserKey1":"one","wrappedUserKey2":"two"}', old["security_stamp"],
             "fresh-random-write-token", old["master_password_hash"], old["password_salt"], old["kdf_type"],
             old["kdf_iterations"], old["kdf_memory"], old["kdf_parallelism"], old["master_password_hint"],
-            NOW, user, old["security_stamp"], old["master_password_hash"], account_snapshot(db, user), "device", "nonce"]
+            NOW, user, old["security_stamp"], old["master_password_hash"], account_snapshot(db, user), "device", "nonce",
+            old["password_salt"], old["password_iterations"], old["password_iterations"]]
     return claim, args, guards
 
 
@@ -68,7 +67,7 @@ class AccountV2Sql(unittest.TestCase):
     def setUp(self):
         self.db = database()
         self.addCleanup(self.db.close)
-        self.db.execute("INSERT INTO devices(user_id,identifier,name,type,session_token,created_at,updated_at) VALUES('alice','device','Browser',14,'nonce',?,?)", (OLD, OLD))
+        self.db.execute("INSERT INTO devices(user_id,device_id,name,device_type,session_token,created_at,updated_at) VALUES('alice','device','Browser',14,'nonce',?,?)", (OLD, OLD))
         seed_cipher(self.db, "cipher", data='{"name":"encrypted"}')
         self.db.commit()
 
@@ -110,10 +109,17 @@ class AccountV2Sql(unittest.TestCase):
         user = self.db.execute("SELECT key,user_key_id,security_stamp FROM users WHERE id='alice'").fetchone()
         self.assertEqual(tuple(user), ("new-user-key", "a" * 32, "stamp"))
 
+    def test_key_only_rotation_preserves_the_existing_verifier_cost(self):
+        self.db.execute("UPDATE users SET password_salt='old-salt',password_iterations=1200000 WHERE id='alice'")
+        self.db.commit()
+        claim, args, guards = rotation_claim(self.db)
+        self.assertIsNotNone(apply_rotation(self.db, claim, args, guards))
+        self.assertEqual(tuple(self.db.execute("SELECT master_password_hash,password_salt,password_iterations FROM users WHERE id='alice'").fetchone()),
+                         ("hash", "old-salt", 1200000))
+
     def test_pending_attachment_blocks_rotation_inside_the_claim(self):
         claim, args, guards = rotation_claim(self.db)
-        self.db.execute(statement("attachment", "insert_pending"),
-                        ("pending", "cipher", "file", 12, "old-key", OLD, None))
+        seed_attachment(self.db, "pending", "cipher", pending=True, name="file", key="old-key")
         self.db.commit()
         self.assertIsNone(apply_rotation(self.db, claim, args, guards))
 
@@ -122,7 +128,8 @@ class AccountV2Sql(unittest.TestCase):
         self.db.execute("INSERT INTO webauthn_credentials(id,user_id,slot,name,credential_id,public_key,sign_count,credential_use,account_snapshot,created_at,updated_at) VALUES('credential','alice',1,'Passkey','wire','public',0,'login',?,?,?)", (snapshot, OLD, OLD))
         self.db.execute("UPDATE users SET key='upgraded-user-key' WHERE id='alice'")
         changed = self.db.execute(statement("webauthn", "update_keys"),
-                                  ("Passkey", 0, "enc-public", "stale-key", "enc-private", NOW, "credential", "alice", snapshot)).fetchone()
+                                  ("Passkey", 0, "enc-public", "stale-key", "enc-private", NOW, "credential", "alice", snapshot,
+                                   "stamp", "device", "nonce", 0, "accepted-challenge")).fetchone()
         self.assertIsNone(changed)
         self.assertIsNone(self.db.execute("SELECT encrypted_user_key FROM webauthn_credentials").fetchone()[0])
 
@@ -131,7 +138,7 @@ class AccountV2Sql(unittest.TestCase):
         self.db.setlimit(sqlite3.SQLITE_LIMIT_FUNCTION_ARG, 32)
         self.db.execute("DELETE FROM ciphers")
         for number in range(5):
-            self.db.execute("INSERT INTO ciphers(id,user_id,type,data,created_at,updated_at) VALUES(?,'alice',1,?,?,?)", (f"large-{number}", "x" * 450_000, OLD, OLD))
+            self.db.execute("INSERT INTO ciphers(id,user_id,cipher_type,data,created_at,updated_at) VALUES(?,'alice',1,?,?,?)", (f"large-{number}", "x" * 450_000, OLD, OLD))
         self.db.commit()
         claim, args, guards = rotation_claim(self.db)
         self.assertLess(max(len(value.encode()) for _, values in guards for value in values if isinstance(value, str)), 500_000)
@@ -141,10 +148,10 @@ class AccountV2Sql(unittest.TestCase):
     def email_args(self):
         return ("new@example.test", "new-hash", "new-salt", "rewrapped-user", 0, 600000,
                 None, None, "email-write-token", NOW, "alice", "stamp", "hash",
-                account_snapshot(self.db, "alice"), "device", "nonce")
+                account_snapshot(self.db, "alice"), "device", "nonce", None, 600000, 600000)
 
     def seed_remember_and_prf(self):
-        self.db.execute("INSERT INTO twofactor(uuid,user_uuid,atype,data) VALUES('remember','alice',5,'{}')")
+        self.db.execute("INSERT INTO two_factors(id,user_id,provider_type,data) VALUES('remember','alice',5,'{}')")
         snapshot = account_snapshot(self.db, "alice")
         for name, stored in (("current", snapshot), ("stale", snapshot.replace('\"key\":\"key\"', '\"key\":\"previous-generation\"')), ("untagged", None)):
             self.db.execute("INSERT INTO webauthn_credentials(id,user_id,slot,name,credential_id,public_key,sign_count,credential_use,prf_status,encrypted_user_key,encrypted_private_key,account_snapshot,created_at,updated_at) VALUES(?,'alice',?,? ,?,'public',0,'login',0,'prf-user','prf-private',?,?,?)",
@@ -168,7 +175,7 @@ class AccountV2Sql(unittest.TestCase):
         self.assertIsNone(self.apply_email_batch(args))
         user = self.db.execute("SELECT email,key FROM users WHERE id='alice'").fetchone()
         self.assertEqual(tuple(user), ("alice@example.test", "7.concurrent-upgrade"))
-        self.assertEqual(self.db.execute("SELECT COUNT(*) FROM twofactor WHERE atype=5").fetchone()[0], 1)
+        self.assertEqual(self.db.execute("SELECT COUNT(*) FROM two_factors WHERE provider_type=5").fetchone()[0], 1)
 
     def test_email_change_rechecks_nonce_and_verified_password_hash(self):
         args = self.email_args()
@@ -187,7 +194,7 @@ class AccountV2Sql(unittest.TestCase):
         args = self.email_args()
         self.assertIsNotNone(self.apply_email_batch(args))
         self.assertIsNone(self.db.execute("SELECT v2_upgrade_token FROM users WHERE id='alice'").fetchone()[0])
-        self.assertEqual(self.db.execute("SELECT COUNT(*) FROM twofactor WHERE atype=5").fetchone()[0], 0)
+        self.assertEqual(self.db.execute("SELECT COUNT(*) FROM two_factors WHERE provider_type=5").fetchone()[0], 0)
         rows = {row["id"]: row for row in self.db.execute("SELECT id,account_snapshot,encrypted_user_key FROM webauthn_credentials")}
         self.assertEqual(json.loads(rows["current"]["account_snapshot"])["key"], "rewrapped-user")
         self.assertEqual(json.loads(rows["stale"]["account_snapshot"])["key"], "previous-generation")
@@ -205,6 +212,66 @@ class AccountV2Sql(unittest.TestCase):
         self.assertEqual(json.loads(rows["current"])["key"], "new-wrapper")
         self.assertEqual(json.loads(rows["stale"])["key"], "previous-generation")
         self.assertIsNone(rows["untagged"])
+
+
+class PasswordVerifierSql(unittest.TestCase):
+    def setUp(self):
+        self.db = database()
+        self.addCleanup(self.db.close)
+        self.db.execute("INSERT INTO devices(user_id,device_id,name,device_type,session_token,created_at,updated_at) VALUES('alice','device','Browser',14,'nonce',?,?)", (OLD, OLD))
+        self.db.execute("UPDATE users SET updated_at='2099-12-31T23:59:59.999Z' WHERE id='alice'")
+        self.db.commit()
+
+    def user(self):
+        return dict(self.db.execute("SELECT * FROM users WHERE id='alice'").fetchone())
+
+    def upgrade(self):
+        old = self.user()
+        query = statement("user", "migrate_password_if_current").replace("{}", account_guard(9))
+        return query, ("upgraded-hash", "upgraded-salt", 600000, "alice", old["master_password_hash"],
+                       old["password_salt"], old["password_iterations"], old["security_stamp"], account_snapshot(self.db, "alice"))
+
+    def claims(self):
+        old = self.user()
+        snapshot = account_snapshot(self.db, "alice")
+        password = next(query for query in statements("account_rotation", "change_credentials")
+                        if query.startswith("UPDATE users SET ")).replace("{}", account_guard(14))
+        password_args = ("new-hash", "new-salt", "new-key", 0, 600000, None, None, None,
+                         "new-stamp", NOW, "alice", "stamp", old["master_password_hash"], snapshot,
+                         "device", "nonce", old["password_salt"], old["password_iterations"], 600000,
+                         old["private_key"], old["public_key"])
+        email_args = ("new@example.test", "new-hash", "new-salt", "new-key", 0, 600000,
+                      None, None, "new-stamp", NOW, "alice", "stamp", old["master_password_hash"],
+                      snapshot, "device", "nonce", old["password_salt"], old["password_iterations"], 600000)
+        rotation, rotation_args, _ = rotation_claim(self.db)
+        return [("password-upgrade", *self.upgrade()), ("password-or-client-kdf-change", password, password_args),
+                ("email-change", statement("email", "change_email"), email_args),
+                ("key-rotation", rotation, rotation_args)]
+
+    def test_transparent_upgrade_preserves_cursor_stamp_and_existing_sessions(self):
+        before = self.user()
+        query, args = self.upgrade()
+        self.assertIsNotNone(self.db.execute(query, args).fetchone())
+        after = self.user()
+        for name in before.keys() - {"master_password_hash", "password_salt", "password_iterations"}:
+            self.assertEqual(after[name], before[name], name)
+        self.assertEqual((after["master_password_hash"], after["password_salt"], after["password_iterations"]),
+                         ("upgraded-hash", "upgraded-salt", 600000))
+        self.assertEqual(self.db.execute("SELECT session_token FROM devices WHERE user_id='alice'").fetchone()[0], "nonce")
+        self.assertEqual(self.db.execute("SELECT password_iterations FROM users WHERE id='bob'").fetchone()[0], 600000)
+        self.assertIsNone(self.db.execute(query, args).fetchone())
+
+    def test_every_credential_write_rejects_concurrent_verifier_and_envelope_changes(self):
+        for operation, query, args in self.claims():
+            for field, value in (("master_password_hash", "concurrent-hash"), ("password_salt", "concurrent-salt"),
+                                 ("password_iterations", 1200000), ("security_stamp", "concurrent-stamp"),
+                                 ("key", "concurrent-envelope")):
+                with self.subTest(operation=operation, concurrent=field):
+                    self.db.execute(f"UPDATE users SET {field}=? WHERE id='alice'", (value,))
+                    before = self.user()
+                    self.assertIsNone(self.db.execute(query, args).fetchone())
+                    self.assertEqual(self.user(), before)
+                    self.db.rollback()
 
 
 if __name__ == "__main__":

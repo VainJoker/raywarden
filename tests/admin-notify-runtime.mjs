@@ -67,7 +67,7 @@ export async function runAdminNotificationCompatibility({ fixture, check, access
       await status(await login(f, "wrong-password-secret"), 401);
       equal(captured.length, 1); equal(event(captured[0]), "login_failed");
       ok(captured[0].includes("Level: warning"), "failure severity");
-      sql.exec("INSERT INTO twofactor(uuid,user_uuid,atype,enabled,data,last_used) VALUES('admin-runtime-totp',?,0,1,'GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ',0)", USER);
+      sql.exec("INSERT INTO two_factors(id,user_id,provider_type,is_enabled,data,last_used_step) VALUES('admin-runtime-totp',?,0,1,'GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ',0)", USER);
       const challenge = await (await status(await login(f), 400)).json();
       ok(challenge.TwoFactorProviders || challenge.TwoFactorProviders2, "actual two-factor challenge response");
       equal(captured.length, 1, "challenge is not a failed login");
@@ -130,7 +130,7 @@ export async function runAdminNotificationCompatibility({ fixture, check, access
 
   await check("administrative recovery applies error threshold and failed delivery cannot undo recovery", async () => {
     const f = fixture(); configure(f, "all", "error");
-    sql.exec("UPDATE users SET totp_recover='private-admin-recovery-code' WHERE id=?", USER);
+    sql.exec("UPDATE users SET two_factor_recovery_code='private-admin-recovery-code' WHERE id=?", USER);
     await sink(async captured => {
       await status(await f.fetch("/api/two-factor/get-recover", { method: "POST", headers: await owner(), body: JSON.stringify({ masterPasswordHash: "hash" }) }), 200);
       equal(captured.length, 0, "warning recovery-code view is below threshold");
@@ -138,7 +138,7 @@ export async function runAdminNotificationCompatibility({ fixture, check, access
         body: JSON.stringify({ email: "owner@example.test", masterPasswordHash: "hash", recoveryCode: "private-admin-recovery-code" }) }), 200);
       equal(captured.length, 1); equal(event(captured[0]), "2fa_recover");
       ok(captured[0].includes("Level: error"), "recovery severity");
-      equal(sql.exec("SELECT totp_recover FROM users WHERE id=?", USER).one().totp_recover, null, "recovery remains committed");
+      equal(sql.exec("SELECT two_factor_recovery_code FROM users WHERE id=?", USER).one().two_factor_recovery_code, null, "recovery remains committed");
     }, 500);
   });
 
@@ -149,11 +149,11 @@ export async function runAdminNotificationCompatibility({ fixture, check, access
     const disableEmail = async () => f.fetch("/api/two-factor/email", { method: "DELETE", headers: await owner(),
       body: JSON.stringify({ masterPasswordHash: "hash" }) });
     const seed = (type, id) => {
-      sql.exec("INSERT INTO twofactor(uuid,user_uuid,atype,enabled,data,last_used) VALUES(?,?,?,1,?,0)", id, USER, type,
+      sql.exec("INSERT INTO two_factors(id,user_id,provider_type,is_enabled,data,last_used_step) VALUES(?,?,?,1,?,0)", id, USER, type,
         type === 1 ? JSON.stringify({ email: "factor@example.test" }) : "GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ");
-      sql.exec("INSERT INTO twofactor(uuid,user_uuid,atype,enabled,data,last_used) VALUES(?,?,5,1,'{}',0)", `${id}-remember`, USER);
+      sql.exec("INSERT INTO two_factors(id,user_id,provider_type,is_enabled,data,last_used_step) VALUES(?,?,5,1,'{}',0)", `${id}-remember`, USER);
     };
-    const noRemember = () => equal(sql.exec("SELECT COUNT(*) AS n FROM twofactor WHERE user_uuid=? AND atype=5", USER).one().n, 0, "Remember cleanup remains effective");
+    const noRemember = () => equal(sql.exec("SELECT COUNT(*) AS n FROM two_factors WHERE user_id=? AND provider_type=5", USER).one().n, 0, "Remember cleanup remains effective");
     await sink(async captured => {
       await status(await disable(0), 200);
       await status(await disable(1), 200);

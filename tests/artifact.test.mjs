@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import test from "node:test";
@@ -12,10 +12,15 @@ function fixture(t) {
   t.after(() => rmSync(dir, { recursive: true, force: true }));
   const write = (path, content) => { mkdirSync(dirname(join(dir, path)), { recursive: true }); writeFileSync(join(dir, path), content); };
   const config = {
-    name: "artifact-worker", main: "build/index.js", build: { command: "must-never-run" }, secrets: { required: ["DOMAIN"] }, vars: { LOG_LEVEL: "info" },
+    name: "artifact-worker", main: "build/index.js", build: { command: "must-never-run" }, secrets: { required: ["DOMAIN", "KEY_ENCRYPTION_KEY"] }, vars: { LOG_LEVEL: "info" },
+    observability: { redact_query_string: true, logs: { enabled: true, invocation_logs: false } },
     assets: { directory: "static/web-vault", not_found_handling: "404-page" }, routes: [{ pattern: "vault.example.test", custom_domain: true }],
-    d1_databases: [{ binding: "warden-db", database_name: "artifact-db", database_id: "11111111-1111-4111-8111-111111111111", migrations_dir: "sql/migrations" }],
+    d1_databases: [{ binding: "DB", database_name: "artifact-db", database_id: "11111111-1111-4111-8111-111111111111", migrations_dir: "sql/migrations" }],
     r2_buckets: [{ binding: "ATTACHMENTS_BUCKET", bucket_name: "artifact-files" }], migrations: [{ tag: "v1", new_sqlite_classes: ["NotifyDo"] }],
+    ratelimits: [
+      { name: "LOGIN_RATE_LIMITER", namespace_id: "3101", simple: { limit: 5, period: 60 } },
+      { name: "SEND_ACCESS_RATE_LIMITER", namespace_id: "3103", simple: { limit: 15, period: 60 } },
+    ],
   };
   write("wrangler.jsonc", JSON.stringify(config));
   for (const path of ["Cargo.lock", "package-lock.json"]) write(path, "fixture\n");
@@ -38,6 +43,18 @@ test("manifest binds source SHA and configuration to final JavaScript/WASM, asse
   ].sort());
   const verified = await verifyArtifact(options, head);
   assert.equal(verified.manifest.sourceSha, sha);
+});
+
+test("real Git subprocess receives no application Secrets while resolving the artifact commit", async (t) => {
+  const { dir, options, write } = fixture(t), observation = join(dir, "git-environment.json");
+  write("bin/git", `#!${process.execPath}\nconst fs = require("node:fs");\nfs.writeFileSync(${JSON.stringify(observation)}, JSON.stringify(Object.fromEntries(["ALLOWED_EMAILS","OWNER_SETUP_TOKEN","KEY_ENCRYPTION_KEY"].map(name => [name, Object.hasOwn(process.env,name)]))));\nfs.writeSync(1, ${JSON.stringify(sha + "\n")});\n`);
+  chmodSync(join(dir, "bin/git"), 0o700);
+  const inherited = process.env;
+  try {
+    process.env = { PATH: `${join(dir, "bin")}:${inherited.PATH}`, ALLOWED_EMAILS: "fake@example.test", OWNER_SETUP_TOKEN: "fake-setup", KEY_ENCRYPTION_KEY: "fake-root" };
+    await createArtifactManifest(options);
+  } finally { process.env = inherited; }
+  assert.deepEqual(JSON.parse(readFileSync(observation, "utf8")), { ALLOWED_EMAILS: false, OWNER_SETUP_TOKEN: false, KEY_ENCRYPTION_KEY: false });
 });
 
 test("changed final JavaScript, WASM, assets and locks prevent upload", async (t) => {
@@ -122,12 +139,26 @@ test("compiled deployment disables both custom and internal builds and retains r
     assert.equal(deployed.d1_databases[0].migrations_dir, join(dir, "sql/migrations"));
     assert.deepEqual(deployed.routes, config.routes);
     assert.deepEqual(deployed.vars, config.vars);
-    assert.deepEqual(deployed.secrets, { required: ["DOMAIN"] });
+    assert.deepEqual(deployed.ratelimits, config.ratelimits);
+    assert.deepEqual(deployed.secrets, config.secrets);
+    assert.deepEqual(deployed.observability, config.observability);
     assert.equal(deployed.vars.DOMAIN, undefined);
   }, head, {});
   assert.equal(called, 1);
   assert.equal(existsSync(temporary), false);
   assert.deepEqual(JSON.parse(readFileSync(options.configPath, "utf8")), config);
+});
+
+test("missing required rate limit bindings reject artifact upload before network or private files", async (t) => {
+  const { options, dir, config, write } = fixture(t);
+  await createArtifactManifest(options, head);
+  delete config.ratelimits;
+  write("wrangler.jsonc", JSON.stringify(config));
+  let uploads = 0, requests = 0;
+  await assert.rejects(deployArtifact(options, () => { uploads++; }, head, {}, () => { requests++; }), /requires ratelimits/);
+  assert.equal(uploads, 0);
+  assert.equal(requests, 0);
+  assert.equal(readdirSync(join(dir, ".wrangler")).some(name => name.startsWith("compiled-config-")), false);
 });
 
 
@@ -150,17 +181,19 @@ test("failed artifact upload cleans its temporary configuration without rebuildi
 test("first upload supplies private owner secrets and the selected origin without putting values in argv or child environment", async (t) => {
   const { options, config } = fixture(t);
   await createArtifactManifest(options, head);
-  const environment = { ALLOWED_EMAILS: " Owner+Vault@Example.Test ", OWNER_SETUP_TOKEN: "fake-private-setup-token-".repeat(2), DOMAIN: "https://ignored.example.test", CLOUDFLARE_API_TOKEN: "fake-cloudflare-token" };
+  const environment = { ALLOWED_EMAILS: " Owner+Vault@Example.Test ", OWNER_SETUP_TOKEN: "fake-private-setup-token-".repeat(2), KEY_ENCRYPTION_KEY: "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8", DOMAIN: "https://ignored.example.test", CLOUDFLARE_API_TOKEN: "fake-cloudflare-token" };
   let temporary;
   await deployArtifact(options, (args, commandOptions) => {
     temporary = args[args.indexOf("--secrets-file") + 1];
     assert.deepEqual(JSON.parse(readFileSync(temporary, "utf8")), {
       ALLOWED_EMAILS: "owner+vault@example.test", OWNER_SETUP_TOKEN: environment.OWNER_SETUP_TOKEN, DOMAIN: "https://vault.example.test",
+      KEY_ENCRYPTION_KEY: environment.KEY_ENCRYPTION_KEY,
     });
     assert.equal(commandOptions.environment.ALLOWED_EMAILS, undefined);
     assert.equal(commandOptions.environment.OWNER_SETUP_TOKEN, undefined);
+    assert.equal(commandOptions.environment.KEY_ENCRYPTION_KEY, undefined);
     assert.equal(commandOptions.environment.CLOUDFLARE_API_TOKEN, environment.CLOUDFLARE_API_TOKEN);
-    for (const value of [environment.ALLOWED_EMAILS, environment.OWNER_SETUP_TOKEN]) assert.equal(args.join(" ").includes(value), false);
+    for (const value of [environment.ALLOWED_EMAILS, environment.OWNER_SETUP_TOKEN, environment.KEY_ENCRYPTION_KEY]) assert.equal(args.join(" ").includes(value), false);
     const deployed = JSON.parse(readFileSync(args[args.indexOf("--config") + 1], "utf8"));
     assert.deepEqual(deployed.vars, config.vars);
   }, head, environment);
@@ -168,8 +201,17 @@ test("first upload supplies private owner secrets and the selected origin withou
   assert.equal(existsSync(dirname(temporary)), false);
 });
 
+test("private enrollment deployment accepts and canonicalizes multiple exact account emails", async (t) => {
+  const { options } = fixture(t);
+  await createArtifactManifest(options, head);
+  await deployArtifact(options, (args) => {
+    const secrets = JSON.parse(readFileSync(args[args.indexOf("--secrets-file") + 1], "utf8"));
+    assert.equal(secrets.ALLOWED_EMAILS, "alice@example.test,bob@example.test");
+  }, head, { ALLOWED_EMAILS: " Bob@Example.Test,alice@example.test\nbob@example.test " });
+});
+
 test("redeploying without optional values preserves existing owner secrets rather than clearing them", async (t) => {
-  for (const environment of [{}, { ALLOWED_EMAILS: "", OWNER_SETUP_TOKEN: "" }]) {
+  for (const environment of [{}, { ALLOWED_EMAILS: "", OWNER_SETUP_TOKEN: "", KEY_ENCRYPTION_KEY: "" }]) {
     const { options } = fixture(t);
     await createArtifactManifest(options, head);
     await deployArtifact(options, (args) => {
@@ -178,11 +220,26 @@ test("redeploying without optional values preserves existing owner secrets rathe
   }
 });
 
+test("malformed wrapping keys fail before private files or network and never enter error messages", async (t) => {
+  const { options, dir } = fixture(t);
+  await createArtifactManifest(options, head);
+  for (const value of ["private-short-key", " ".repeat(43), "A".repeat(42), "A".repeat(44), "A".repeat(42) + "=", "A".repeat(42) + "B", "A".repeat(42) + "+", "A".repeat(42) + "/", 7, null]) {
+    let calls = 0;
+    await assert.rejects(deployArtifact(options, () => { calls++; }, head, { KEY_ENCRYPTION_KEY: value }, () => { calls++; }), error => {
+      assert.match(error.message, /KEY_ENCRYPTION_KEY must/);
+      if (typeof value === "string" && value.trim().length > 1) assert.equal(error.message.includes(value), false);
+      return true;
+    });
+    assert.equal(calls, 0);
+    assert.equal(readdirSync(join(dir, ".wrangler")).some(name => name.startsWith("compiled-config-")), false);
+  }
+});
+
 test("invalid owner configuration fails before discovery, private files or upload without exposing values", async (t) => {
   const { options, dir } = fixture(t);
   await createArtifactManifest(options, head);
   const invalid = [
-    ...[" ", "a@b.test,c@d.test", "a@b.test\nc@d.test", "*@example.test", "a?@example.test", "a@example", "a..b@example.test", ".a@example.test", "a.@example.test", "a@example..test", "a@-example.test", "a@exam_ple.test", "a".repeat(65) + "@example.test", "\u0085owner@example.test", "\u00a0owner@example.test\u00a0"].map(ALLOWED_EMAILS => ({ ALLOWED_EMAILS })),
+    ...[" ", "a@example.test,", ",a@example.test", "a@example.test,,b@example.test", "*@example.test", "a?@example.test", "a@example", "a..b@example.test", ".a@example.test", "a.@example.test", "a@example..test", "a@-example.test", "a@exam_ple.test", "a".repeat(65) + "@example.test", "\u0085owner@example.test", "\u00a0owner@example.test\u00a0"].map(ALLOWED_EMAILS => ({ ALLOWED_EMAILS })),
     ...["a".repeat(31), "a".repeat(513), "😀".repeat(513), " a".repeat(32), "a".repeat(32) + " ", "a".repeat(32) + "\n", "a".repeat(32) + "\u0085"].map(OWNER_SETUP_TOKEN => ({ OWNER_SETUP_TOKEN })),
   ];
   for (const environment of invalid) {
@@ -242,7 +299,9 @@ test("the default uploader propagates Wrangler process failure and removes its t
 test("deployment CLI requires a subcommand with command-specific flags and always targets production", () => {
   assert.throws(() => parseDeployArgs([]), /Usage/);
   assert.throws(() => parseDeployArgs(["--env", "production"]), /Usage/);
-  assert.throws(() => parseDeployArgs(["worker", "--env", "dev"]), /Unknown/);
+  for (const args of [["config", "--env"], ["config", "--env", "production"], ["worker", "--env", "dev"]]) {
+    assert.throws(() => parseDeployArgs(args), /Unknown/);
+  }
   assert.throws(() => parseDeployArgs(["worker", "--verify-only"]), /Unknown/);
   assert.throws(() => parseDeployArgs(["config", "--manifest", "file.json"]), /apply only/);
   assert.throws(() => parseDeployArgs(["verify", "--manifest"]), /requires a value/);

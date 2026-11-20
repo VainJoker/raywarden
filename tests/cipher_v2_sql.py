@@ -5,18 +5,20 @@ import unittest
 
 from sql_regression import OLD, NOW, database, rust_strings, statements, cipher_rows_query
 from sql_source import literal, source_literals
-from send_compat_sql import guard_sql, session_sql, key_guard
+from send_transactions_sql import guard_sql, session_sql, key_guard
 
 
-CIPHERS = "cipher_http"
+CIPHERS = "cipher_writes"
 IMPORT = "vault_import"
-ATTACHMENTS = "attachment_http"
-REVISION = literal("cipher_mutation", "UPDATE users SET updated_at = CASE")
+ATTACHMENTS = "attachment"
+REVISION = literal("cipher_mutation", "UPDATE users SET updated_at = ").replace(
+    "{NEXT_USER_REVISION_SQL}", literal("cipher_mutation", "CASE WHEN julianday(updated_at)")
+)
 
 
 def row_guard(row):
     predicate = literal("cipher_mutation", "EXISTS(SELECT 1 FROM ciphers WHERE id=")
-    columns = ("id", "user_id", "organization_id", "type", "data", "favorite", "folder_id", "deleted_at", "archived_at", "created_at", "updated_at")
+    columns = ("id", "user_id", "organization_id", "cipher_type", "data", "is_favorite", "folder_id", "deleted_at", "archived_at", "created_at", "updated_at")
     return guard_sql(predicate), [row[column] for column in columns]
 
 
@@ -24,8 +26,8 @@ class CipherTransactions(unittest.TestCase):
     def setUp(self):
         self.db = database()
         self.addCleanup(self.db.close)
-        self.db.execute("INSERT INTO devices(user_id,identifier,name,type,session_token,created_at,updated_at) VALUES('alice','device','test',1,'session',?,?)", (OLD, OLD))
-        self.db.execute("INSERT INTO ciphers(id,user_id,type,data,created_at,updated_at) VALUES('cipher','alice',1,?, ?, ?)", (json.dumps({"name": "encrypted", "login": {}}), OLD, OLD))
+        self.db.execute("INSERT INTO devices(user_id,device_id,name,device_type,session_token,created_at,updated_at) VALUES('alice','device','test',1,'session',?,?)", (OLD, OLD))
+        self.db.execute("INSERT INTO ciphers(id,user_id,cipher_type,data,created_at,updated_at) VALUES('cipher','alice',1,?, ?, ?)", (json.dumps({"name": "encrypted", "login": {}}), OLD, OLD))
         self.db.commit()
 
     def row(self):
@@ -35,7 +37,7 @@ class CipherTransactions(unittest.TestCase):
         return dict(self.db.execute("SELECT * FROM users WHERE id='alice'").fetchone())
 
     def test_exact_snapshot_detects_same_revision_data_and_archive_changes(self):
-        for column, value in (("data", '{"name":"other"}'), ("archived_at", NOW), ("favorite", 1), ("deleted_at", NOW), ("type", 8), ("created_at", NOW)):
+        for column, value in (("data", '{"name":"other"}'), ("archived_at", NOW), ("is_favorite", 1), ("deleted_at", NOW), ("cipher_type", 8), ("created_at", NOW)):
             with self.subTest(column=column):
                 before = self.row()
                 self.db.execute(f"UPDATE ciphers SET {column}=? WHERE id='cipher'", (value,))
@@ -81,7 +83,7 @@ class CipherTransactions(unittest.TestCase):
     def test_bulk_snapshot_checks_every_selected_row_without_row_bind_expansion(self):
         rows = []
         for i in range(450):
-            self.db.execute("INSERT INTO ciphers(id,user_id,type,data,created_at,updated_at) VALUES(?,'alice',1,'{}',?,?)", (f"bulk-{i}", OLD, OLD))
+            self.db.execute("INSERT INTO ciphers(id,user_id,cipher_type,data,created_at,updated_at) VALUES(?,'alice',1,'{}',?,?)", (f"bulk-{i}", OLD, OLD))
             rows.append(dict(self.db.execute("SELECT * FROM ciphers WHERE id=?", (f"bulk-{i}",)).fetchone()))
         self.db.commit()
         predicate = literal("cipher_changes", "(SELECT COUNT(*) FROM ciphers c JOIN json_each")
@@ -95,7 +97,7 @@ class CipherTransactions(unittest.TestCase):
 
     def test_import_json_chunks_preserve_blob_type_folder_and_archive(self):
         folder_sql = literal(IMPORT, "INSERT INTO folders(id,user_id,name,created_at,updated_at) SELECT")
-        cipher_sql = literal(IMPORT, "INSERT INTO ciphers(id,user_id,organization_id,type,data,favorite,folder_id,archived_at,created_at,updated_at) SELECT")
+        cipher_sql = literal(IMPORT, "INSERT INTO ciphers(id,user_id,organization_id,cipher_type,data,is_favorite,folder_id,archived_at,created_at,updated_at) SELECT")
         blob = '{"format_version":2,"data":"opaque"}'
         encoded = json.dumps({"name": "", "data": blob, "key": "wrapped"})
         with self.db:
@@ -103,11 +105,11 @@ class CipherTransactions(unittest.TestCase):
             self.db.execute(cipher_sql, (json.dumps([["import-cipher", 8, encoded, True, "import-folder", NOW]]), "alice", NOW))
             self.db.execute(REVISION, (NOW, "alice")).fetchall()
         row = self.db.execute("SELECT * FROM ciphers WHERE id='import-cipher'").fetchone()
-        self.assertEqual((row["type"], row["folder_id"], row["archived_at"]), (8, "import-folder", NOW))
+        self.assertEqual((row["cipher_type"], row["folder_id"], row["archived_at"]), (8, "import-folder", NOW))
         self.assertEqual(json.loads(row["data"])["data"], blob)
 
     def test_large_escaped_import_raw_column_fallback_stays_below_bind_count_limit(self):
-        sql = literal(IMPORT, "INSERT INTO ciphers(id,user_id,organization_id,type,data,favorite,folder_id,archived_at,created_at,updated_at) VALUES")
+        sql = literal(IMPORT, "INSERT INTO ciphers(id,user_id,organization_id,cipher_type,data,is_favorite,folder_id,archived_at,created_at,updated_at) VALUES")
         data = json.dumps({"name": '"' * 600_000, "login": {}})
         self.assertLess(len(data), 2_000_000)
         self.assertGreater(len(json.dumps(data)), 1_900_000)
@@ -130,7 +132,7 @@ class CipherTransactions(unittest.TestCase):
         blob = json.dumps({"format_version": 2, "data": "x" * 450_000})
         data = json.dumps({"name": "", "data": blob})
         for index in range(5):
-            self.db.execute("INSERT INTO ciphers(id,user_id,type,data,created_at,updated_at) VALUES(?,'alice',8,?,?,?)", (f"large-{index}", data, OLD, OLD))
+            self.db.execute("INSERT INTO ciphers(id,user_id,cipher_type,data,created_at,updated_at) VALUES(?,'alice',8,?,?,?)", (f"large-{index}", data, OLD, OLD))
         self.db.setlimit(sqlite3.SQLITE_LIMIT_LENGTH, 2_000_000)
         self.db.setlimit(sqlite3.SQLITE_LIMIT_FUNCTION_ARG, 32)
         # This is the old single-value aggregation's failure boundary, not a
@@ -143,11 +145,11 @@ class CipherTransactions(unittest.TestCase):
         self.assertEqual(json.loads(rows[4]["data"])["data"], blob)
 
     def test_attachment_publication_adopts_only_one_staged_pointer(self):
-        self.db.execute("INSERT INTO attachments_pending(id,cipher_id,file_name,file_size,akey,created_at,updated_at) VALUES('file','cipher','encrypted',7,'wrapped',?,?)", (OLD, OLD))
+        self.db.execute("INSERT INTO attachments_pending(id,cipher_id,file_name,file_size_bytes,encrypted_key,created_at,updated_at) VALUES('file','cipher','encrypted',7,'wrapped',?,?)", (OLD, OLD))
         self.db.commit()
         pending = dict(self.db.execute("SELECT * FROM attachments_pending WHERE id='file'").fetchone())
         predicate = literal(ATTACHMENTS, "EXISTS(SELECT 1 FROM attachments_pending WHERE")
-        params = [pending[c] for c in ("id", "cipher_id", "file_name", "file_size", "akey", "created_at", "updated_at", "organization_id")]
+        params = [pending[c] for c in ("id", "cipher_id", "file_name", "file_size_bytes", "encrypted_key", "created_at", "updated_at", "organization_id")]
         writes = statements("attachment", "finalize_upload")
         with self.db:
             self.db.execute(guard_sql(predicate), params).fetchall()
