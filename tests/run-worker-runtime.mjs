@@ -64,7 +64,9 @@ ${modules.join(",\n")}
 );
 `);
   await new Promise((done, fail) => {
-    const child = spawn(resolve(root, "node_modules/.bin/workerd"), ["test", join(directory, "config.capnp")], { cwd: root, stdio: "inherit", timeout: 120_000, killSignal: "SIGKILL" });
+    // The full suite also exercises production-cost PBKDF2 in WASM rather
+    // than delegating every verifier to native Web Crypto.
+    const child = spawn(resolve(root, "node_modules/.bin/workerd"), ["test", join(directory, "config.capnp")], { cwd: root, stdio: "inherit", timeout: 600_000, killSignal: "SIGKILL" });
     child.once("error", fail);
     child.once("close", (code, signal) => code === 0 ? done() : fail(new Error(`workerd test failed (${code ?? signal})`)));
   });

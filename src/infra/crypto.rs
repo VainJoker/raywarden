@@ -31,6 +31,19 @@ pub async fn pbkdf2_sha256(
     iterations: u32,
     key_length_bits: u32,
 ) -> AppResult<Vec<u8>> {
+    if iterations == 0 || key_length_bits == 0 || !key_length_bits.is_multiple_of(8) {
+        return Err(CryptoError::Pbkdf2Failed("invalid derivation parameters").into());
+    }
+
+    // Production Workers reject Web Crypto PBKDF2 calls above 100,000
+    // iterations, even when local workerd accepts them. Preserve the exact
+    // persisted verifier format and cost using RustCrypto for higher costs.
+    if iterations > 100_000 {
+        let mut derived = vec![0; (key_length_bits / 8) as usize];
+        pbkdf2::pbkdf2_hmac::<sha2::Sha256>(password, salt, iterations, &mut derived);
+        return Ok(derived);
+    }
+
     let subtle = subtle_crypto()?;
 
     let password_array = Uint8Array::new_from_slice(password);

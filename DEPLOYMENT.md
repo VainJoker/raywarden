@@ -199,6 +199,7 @@ To restore a Raywarden instance completely, back up and retain these three items
 | **Pushing to `main` did not deploy** | Deployments run on `v*` tags. Push a new `vX.Y.Z` tag or merge the Release-plz PR. |
 | **`First deployment requires supplied Secrets`** | Ensure `ALLOWED_EMAILS` and `KEY_ENCRYPTION_KEY` are set in the GitHub `production` environment secrets. |
 | **`Invalid KEY_ENCRYPTION_KEY`** | Must be a 43-character unpadded `base64url` string (32 random bytes). Use the Node command in [Section 3](#2-key_encryption_key). |
+| **`PBKDF2 key derivation failed: await bit derivation` during registration or login** | Update to a release with the RustCrypto PBKDF2 implementation for server verifiers above Workers' 100,000-iteration Web Crypto limit. Existing verifier hashes and iteration counts remain compatible; no database reset or client KDF change is needed. |
 | **D1 ID or name mismatch** | Verify that `database_id` and `database_name` in `wrangler.jsonc` match the D1 database in your target Cloudflare account. |
 | **`workers.dev` subdomain lookup fails** | Enable a `workers.dev` subdomain in **Workers & Pages**, or configure a `custom_domain` route in `wrangler.jsonc`. |
 | **Migration fails due to existing tables** | Do not manually import `sql/schema.sql` before deploying; start with an empty D1 database so Wrangler manages migrations. |

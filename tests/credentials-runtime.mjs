@@ -139,6 +139,40 @@ async function runPasswordChecks({ fixture, check, sql, accessToken, USER }) {
     await validStoredPassword(CLIENT_HASH, current);
   });
 
+  await check("production PBKDF2 ceiling permits registration, login and existing higher-cost verifiers", async () => {
+    const higherCost = await salted(1200000);
+    const subtle = crypto.subtle, nativeDerive = subtle.deriveBits;
+    let rejected = 0;
+    subtle.deriveBits = function (algorithm, ...args) {
+      if (algorithm.name === "PBKDF2" && algorithm.iterations > 100000) {
+        rejected++;
+        return Promise.reject(new DOMException("PBKDF2 iteration counts above 100000 are not supported", "NotSupportedError"));
+      }
+      return nativeDerive.call(this, algorithm, ...args);
+    };
+    let current;
+    try {
+      await expectStatus(await login(higherCost), 200);
+      equal(row().password_iterations, 1200000);
+      await expectStatus(await login(higherCost, "wrong-password"), 401);
+
+      const f = fixture({ empty: true });
+      f.env.ALLOWED_EMAILS = EMAIL; f.env.OWNER_SETUP_TOKEN = "password-runtime-private-owner-setup-token";
+      await expectStatus(await f.fetch("/identity/accounts/register/finish", {
+        method: "POST", headers: { "Content-Type": "application/json", "X-Raywarden-Setup-Token": f.env.OWNER_SETUP_TOKEN },
+        body: JSON.stringify({ email: EMAIL, masterPasswordHash: CLIENT_HASH, key: "2.wrapped-user", kdf: 0, kdfIterations: 600000,
+          keys: { publicKey: "public", encryptedPrivateKey: "2.private" } }),
+      }), 200);
+      await expectStatus(await login(f), 200);
+      current = sql.exec("SELECT master_password_hash,password_salt,password_iterations FROM users WHERE email=?", EMAIL).one();
+      equal(current.password_iterations, 600000);
+      equal(rejected, 0, "application sent an unsupported iteration count to Web Crypto");
+    } finally {
+      subtle.deriveBits = nativeDerive;
+    }
+    await validStoredPassword(CLIENT_HASH, current);
+  });
+
   const KEY_ID = "0123456789abcdef0123456789abcdef";
   const clientKdf = (iterations = 600000) => ({ kdfType: 0, iterations, memory: null, parallelism: null });
   const currentRequest = (kdf = clientKdf()) => ({ masterPasswordHash: CLIENT_HASH,
