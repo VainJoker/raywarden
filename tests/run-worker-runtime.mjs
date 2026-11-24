@@ -1,5 +1,14 @@
 import { spawn } from "node:child_process";
-import { copyFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
+import {
+  copyFileSync,
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  readdirSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -11,7 +20,7 @@ import { parseJsonc } from "../scripts/deploy.mjs";
 const root = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const config = parseJsonc(readFileSync(resolve(root, "wrangler.jsonc"), "utf8"));
 const entry = "worker-runtime.mjs";
-const support = ["runtime-assertions.mjs", "runtime-auth.mjs", "runtime-fixture.mjs"];
+const support = ["runtime-tools.mjs", "runtime-fixture.mjs"];
 const runner = basename(fileURLToPath(import.meta.url));
 const suites = readdirSync(join(root, "tests"))
   .filter(name => name.endsWith("-runtime.mjs") && name !== entry && name !== runner)

@@ -1,7 +1,7 @@
 import RustWorker from "./index.js";
 import { schema, reset } from "./runtime-schema.mjs";
-import { equal, ok } from "./runtime-assertions.mjs";
-import { toBase64Url as base64url } from "./runtime-auth.mjs";
+import { equal, ok } from "./runtime-tools.mjs";
+import { toBase64Url as base64url } from "./runtime-tools.mjs";
 
 export { base64url };
 
@@ -15,6 +15,13 @@ export const ORIGIN = "https://client.test";
 export const ATTACHMENT_KEY = `${CIPHER}/${FILE}`;
 export const SEND_KEY = `sends/${SEND}/${FILE}`;
 export const encoder = new TextEncoder();
+
+// Capture every column so failure-path tests also catch unexpected side effects.
+export function snapshotTables(sql, tables) {
+  return JSON.stringify(Object.fromEntries(tables.map(table => [
+    table, sql.exec(`SELECT * FROM ${table} ORDER BY rowid`).toArray(),
+  ])));
+}
 
 // Match workerd's D1PreparedStatement.bind contract before native SQLite:
 // booleans become integers; BigInt/undefined are rejected rather than masked.

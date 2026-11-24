@@ -8,7 +8,7 @@ const html = await readFile(new URL("../static/demo.html", import.meta.url), "ut
 const script = html.match(/<script>([\s\S]*?)<\/script>/)[1];
 const EMAIL = "owner@example.test", PASSWORD = "test password", ITERATIONS = 100;
 
-async function fixture(override) {
+async function demoFixture(override) {
   const elements = new Map(), requests = [];
   const element = id => {
     if (!elements.has(id)) elements.set(id, { value: "", textContent: "", handlers: new Map(),
@@ -59,13 +59,13 @@ async function fixture(override) {
 
 test("demo rejects Argon2, invalid KDF and unsupported V2 before account mutation", async () => {
   for (const kdf of [1, 7, null]) {
-    const f = await fixture((request, { json }) => request.path === "/api/accounts/prelogin" ? json({ kdf, kdfIterations: ITERATIONS }) : null);
+    const f = await demoFixture((request, { json }) => request.path === "/api/accounts/prelogin" ? json({ kdf, kdfIterations: ITERATIONS }) : null);
     f.set("email", EMAIL); f.set("oldPassword", PASSWORD); f.set("newPassword", "replacement");
     await f.click("submit");
     assert.match(f.text("result"), /official client/);
     assert.deepEqual(f.requests.map(request => request.path), ["/api/accounts/prelogin"]);
   }
-  const f = await fixture();
+  const f = await demoFixture();
   f.token.AccountKeys.securityState = { securityVersion: 2 };
   f.set("email", EMAIL); f.set("oldPassword", PASSWORD); f.set("newPassword", "replacement");
   await f.click("submit");
@@ -74,7 +74,7 @@ test("demo rejects Argon2, invalid KDF and unsupported V2 before account mutatio
 });
 
 test("demo login sends a stable page device and optional existing TOTP without rendering credentials", async () => {
-  const f = await fixture();
+  const f = await demoFixture();
   f.set("loginTotp", "123456");
   await f.context.login(EMAIL, "sensitive-password-hash", ITERATIONS);
   await f.context.login(EMAIL, "sensitive-password-hash", ITERATIONS);
@@ -89,7 +89,7 @@ test("demo login sends a stable page device and optional existing TOTP without r
 });
 
 test("password change posts the current key DTO and preserves the existing user key crypto", async () => {
-  const f = await fixture();
+  const f = await demoFixture();
   f.set("email", EMAIL); f.set("oldPassword", PASSWORD); f.set("newPassword", "replacement");
   await f.click("submit");
   const request = f.requests.find(item => item.path === "/api/accounts/password");
@@ -104,7 +104,7 @@ test("password change posts the current key DTO and preserves the existing user 
 });
 
 test("email change sends the gateway code first and commits with the same session and explicit token", async () => {
-  const f = await fixture();
+  const f = await demoFixture();
   f.set("emailCurrent", EMAIL); f.set("emailNew", "new@example.test"); f.set("emailPassword", PASSWORD);
   await f.click("submitEmail");
   assert.match(f.text("resultEmail"), /Send the verification code.*first/); assert.equal(f.requests.length, 0);
@@ -126,7 +126,7 @@ test("email change sends the gateway code first and commits with the same sessio
 
 test("TOTP uses password-authenticated setup and a fresh enabled-state proof when disabling", async () => {
   let enabled = false, proofNumber = 0;
-  const f = await fixture((request, { json }) => {
+  const f = await demoFixture((request, { json }) => {
     if (request.path === "/api/two-factor/get-authenticator") {
       assert.equal(typeof request.body.masterPasswordHash, "string");
       return json({ enabled, key: "JBSWY3DPEHPK3PXPJBSWY3DPEHPK3PXP", userVerificationToken: `proof-${++proofNumber}` });
@@ -153,13 +153,80 @@ test("TOTP uses password-authenticated setup and a fresh enabled-state proof whe
 });
 
 test("usage requires a bearer and server errors never echo response credentials", async () => {
-  const f = await fixture();
+  const f = await demoFixture();
   f.set("usageEmail", EMAIL); f.set("usagePassword", PASSWORD); await f.click("usageRefresh");
   const usage = f.requests.find(request => request.path === "/api/d1/usage");
   assert.ok(usage, f.text("resultUsage")); assert.equal(usage.method, "GET");
   assert.equal(usage.headers.Authorization, `Bearer ${f.token.access_token}`);
-  const failure = await fixture((request, { json }) => request.path === "/api/accounts/prelogin" ? json({ error_description: "sensitive-password-hash sensitive-access-token" }, 500) : null);
+  const failure = await demoFixture((request, { json }) => request.path === "/api/accounts/prelogin" ? json({ error_description: "sensitive-password-hash sensitive-access-token" }, 500) : null);
   failure.set("usageEmail", EMAIL); failure.set("usagePassword", PASSWORD); await failure.click("usageRefresh");
   assert.match(failure.text("resultUsage"), /HTTP 500/); failure.noCredentialOutput();
   assert.ok(!failure.text("resultUsage").includes("sensitive-password-hash"));
+});
+
+const origin = "https://vault.test";
+const vaultScript = await readFile(new URL("../static/overrides/raywarden.js", import.meta.url), "utf8");
+const verifyPage = await readFile(new URL("../static/turnstile-verify.html", import.meta.url), "utf8");
+const verifyScript = verifyPage.match(/<script>([\s\S]*?)<\/script>/)[1];
+
+async function visitVault(hash, status) {
+  const requests = [], redirects = [];
+  vm.runInNewContext(vaultScript, {
+    location: { hash, pathname: "/", search: "", replace: url => redirects.push(url) },
+    window: { addEventListener() {} },
+    fetch: async url => {
+      requests.push(url);
+      return { ok: true, json: async () => status };
+    },
+  });
+  await new Promise(resolve => setImmediate(resolve));
+  return { requests, redirects };
+}
+
+function visitVerification(url) {
+  const { hash, search, pathname, origin: pageOrigin } = new URL(url, origin);
+  const cleaned = [];
+  const target = vm.runInNewContext(`${verifyScript}\ntarget;`, {
+    URL, URLSearchParams,
+    location: { hash, search, pathname, origin: pageOrigin },
+    history: { replaceState(_state, _title, path) { cleaned.push(path); } },
+  });
+  return { target, cleaned };
+}
+
+test("Send verification keeps the decryption key in the fragment through the round trip", async () => {
+  const hash = "#/send/access-id/encryption-key";
+  const { requests, redirects } = await visitVault(hash, { enabled: true, valid: false });
+  assert.deepEqual(requests, ["/api/send-verify/status"]);
+  assert.equal(redirects.length, 1);
+  const verificationUrl = new URL(redirects[0], origin);
+  assert.equal(verificationUrl.origin, origin);
+  assert.equal(verificationUrl.pathname, "/send-verify");
+  assert.equal(verificationUrl.search, "");
+  assert.equal(decodeURIComponent(verificationUrl.hash.slice(1)), `/${hash}`);
+
+  const { target, cleaned } = visitVerification(verificationUrl);
+  assert.equal(target, `${origin}/${hash}`);
+  assert.deepEqual(cleaned, ["/send-verify"]);
+});
+
+test("verified, disabled and ordinary vault pages do not redirect", async () => {
+  const hash = "#/send/id/key";
+  assert.deepEqual((await visitVault(hash, { enabled: true, valid: true })).redirects, []);
+  assert.deepEqual((await visitVault(hash, { enabled: false, valid: false })).redirects, []);
+  assert.deepEqual(await visitVault("#/vault", { enabled: true, valid: false }), { requests: [], redirects: [] });
+});
+
+test("external return addresses cannot turn verification into an open redirect", () => {
+  for (const target of ["https://evil.example/steal", "//evil.example/steal", "javascript:alert(1)"]) {
+    assert.equal(visitVerification(`/send-verify#${encodeURIComponent(target)}`).target, "/");
+  }
+});
+
+test("query return parameters do not carry or select the decryption key", () => {
+  assert.equal(visitVerification("/send-verify?return=https://evil.example/steal").target, `${origin}/`);
+});
+
+test("malformed fragment encoding returns safely to the vault", () => {
+  assert.equal(visitVerification("/send-verify#%bad%").target, `${origin}/`);
 });
