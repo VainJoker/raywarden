@@ -27,7 +27,7 @@ jobs:
           ref: ${{ github.sha }}
           persist-credentials: false
       - name: Download the validated release artifact
-        uses: actions/download-artifact@v7
+        uses: actions/download-artifact@v8
         with:
           name: raywarden-release-production-${{ github.sha }}
           path: .
