@@ -46,7 +46,7 @@ jobs:
         run: just artifact
       - name: Upload validated release artifact
         if: startsWith(github.ref, 'refs/tags/v')
-        uses: actions/upload-artifact@v6
+        uses: actions/upload-artifact@v7
         with:
           name: raywarden-release-production-${{ github.sha }}
           overwrite: true
@@ -81,7 +81,7 @@ jobs:
       - name: Collect host Rust library coverage
         run: just coverage
       - name: Upload LCOV report
-        uses: actions/upload-artifact@v6
+        uses: actions/upload-artifact@v7
         with:
           name: rust-library-coverage
           overwrite: true
