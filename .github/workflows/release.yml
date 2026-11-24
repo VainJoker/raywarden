@@ -24,7 +24,7 @@ jobs:
           RELEASE_PLZ_TOKEN: ${{ secrets.RELEASE_PLZ_TOKEN }}
         run: |
           if [ -z "$RELEASE_PLZ_TOKEN" ]; then
-            echo '::error::Set repository secret RELEASE_PLZ_TOKEN with Contents and Pull requests read/write access. See docs/deployment.md.'
+            echo '::error::Set repository secret RELEASE_PLZ_TOKEN with Contents and Pull requests read/write access. See DEPLOYMENT.md.'
             exit 1
           fi
       - name: Check out complete release history

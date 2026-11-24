@@ -1,44 +1,106 @@
 # Raywarden
 
-Raywarden is a Bitwarden-compatible server for Cloudflare Workers. It uses Rust/WASM, Axum, D1, R2 with optional KV storage, and a pinned prebuilt Web Vault. Clients encrypt vault contents. The server stores ciphertext, authentication material, and file metadata.
+Raywarden is a lightweight, Bitwarden-compatible password manager server built for **Cloudflare Workers**. Written in Rust and compiled to WebAssembly, it pairs a pinned Bitwarden Web Vault with Cloudflare D1, R2 (or KV), and Durable Objects.
 
-The project supports personal vaults for multiple independent accounts and multiple devices per account. Registration requires an exact email address in `ALLOWED_EMAILS` and private authorization through `/setup`. Adding an address grants eligibility and leaves account creation to the client. Existing accounts can still sign in after allowlist changes.
+All vault data is encrypted and decrypted locally by official Bitwarden clients. The server stores only ciphertext, authentication verifiers, and file metadata.
 
-Supported features include V1/V2 account encryption, vault items and folders, attachments, Text and File Send, and authentication with TOTP, email, or Passkey where configured. Attachments and File Send use separate metadata and data uploads. Clients using the older one-step uploads or the legacy three-route TOTP setup flow need to use the current protocols. Organizations, enterprise sharing, SSO, and emergency access are outside the personal-vault scope. See the [architecture and client compatibility notes](docs/architecture.md#客户端兼容范围).
+## Features
 
-## Local development
+- **Personal Vaults**: Full support for logins, secure notes, cards, identities, SSH keys, folders, favorites, archiving, trash auto-cleanup, and vault imports/exports.
+- **Multiple Accounts & Devices**: Supports multiple independent personal accounts and multiple logged-in devices per account with strict data isolation.
+- **Private Enrollment**: Public sign-ups are disabled. Creating an account requires both an exact email match in `ALLOWED_EMAILS` and owner authorization via `/setup`.
+- **Modern Cryptography**: Supports PBKDF2-SHA256 and Argon2id client KDFs, account encryption, key rotation, and per-account server password verifiers.
+- **Attachments & Bitwarden Send**: Streaming file uploads and downloads for vault attachments and Text/File Sends, backed by R2 multipart storage and automatic orphan cleanup.
+- **Multi-Factor & Passwordless Auth**: Supports TOTP authenticator apps, email verification codes, WebAuthn/FIDO2 security keys, 2FA recovery codes, Passkey login (with PRF support), and login approval requests from trusted devices.
+- **Real-Time Sync**: Push notifications over WebSockets keep connected clients in sync.
 
-Install Node as pinned in `.node-version`, npm, rustup, and the just version in `package.json`. SQL tests use Python 3. Bash, curl, and tar are used for tool and frontend preparation.
+> **Scope:** Raywarden is designed for personal and family use. Enterprise features such as organizations, shared collections, SSO, and emergency access are intentionally omitted.
+
+## Architecture
+
+- **Worker & Axum Router (`src/api/`)**: Serves the API, enforces security headers and CORS, and routes static assets to the prebuilt Web Vault.
+- **Durable Objects (`src/api/edge/`)**:
+  - `notifydo`: Manages SignalR WebSocket connections and broadcasts real-time sync events.
+  - `heavydo`: Offloads CPU-intensive authentication requests and streaming file uploads.
+- **Database (`src/models/`, `sql/migrations/`)**: Uses Cloudflare D1 (SQLite) with atomic batch transactions and optimistic concurrency guards.
+- **Object Storage (`src/infra/storage.rs`)**: Stores encrypted attachments and File Sends in Cloudflare R2 (with optional Workers KV fallback).
+
+## Quick Start (Local Development)
+
+### Prerequisites
+
+- **Node.js** (v24+, see `.node-version`) and **npm**
+- **Rust** via `rustup` (automatically selects the toolchain and `wasm32-unknown-unknown` target from `rust-toolchain.toml`)
+- **just** command runner
+- **Python 3** (for SQL schema and query tests)
+- Standard shell tools: `bash`, `curl`, `tar`
+
+### Run Locally
 
 ```bash
 just dev
 ```
 
-This prepares missing tools, updates the pinned frontend, applies migrations to local D1, and starts the Worker at `https://localhost:8787`. To create accounts locally, set `OWNER_SETUP_TOKEN` in the ignored `.dev.vars` file and visit `/setup`. Local D1 and R2 use separate development resources.
+This command installs required build tools, downloads and patches the Web Vault into `static/web-vault`, applies D1 migrations locally, and starts the development server at `https://localhost:8787`.
 
-| Command | Purpose |
+To register a local account (`owner@example.test` is allowed by default in `wrangler.jsonc`):
+
+1. Create a `.dev.vars` file in the project root with a setup token (32–512 characters):
+   ```dotenv
+   OWNER_SETUP_TOKEN="replace-with-output-of-openssl-rand-hex-32"
+   ```
+2. Restart `just dev`, visit `https://localhost:8787/setup`, enter your token, and create your account in the Web Vault.
+
+### Development Commands
+
+| Command | Description |
 | --- | --- |
-| `just setup` | Prepare the pinned tools and locked dependencies |
-| `just ci` | Run format, Rust, JavaScript, SQL, and WASM checks |
-| `just build` | Build the Worker with the pinned worker-build |
-| `just test-worker` | Run the built WASM with workerd and temporary SQLite |
-| `just ui-offline` | Refresh overrides in an existing pinned Web Vault |
-| `just ui-download` / `just ui-archive PATH` | Install the pinned release from a download or a local archive |
-| `just db-migrate` | Apply pending migrations to local D1 |
+| `just dev` | Start the local HTTPS server (`https://localhost:8787`) |
+| `just setup` | Install pinned toolchains, `worker-build`, and dependencies |
+| `just ci` | Run formatting checks, unit/SQL/JS tests, and Clippy lints |
+| `just build` | Build the release Worker bundle |
+| `just test-worker` | Run end-to-end tests against the compiled WASM Worker in `workerd` |
+| `just test-d1` | Test D1 migrations and R2 file lifecycles in a local Wrangler instance |
+| `just ui` | Download or refresh the pinned Web Vault assets |
+| `just db-migrate` | Apply pending migrations to the local D1 database |
+| `just clean` | Remove build artifacts and temporary caches |
 
-The files in [sql/migrations](sql/migrations/README.md) define the database structure. Existing instances with an older migration history need a separately planned data transfer. `sql/schema.sql` is a generated reference for reviewing the schema. Keep an independent backup of the application data and wrapping secret before a migration or rollback.
+## Configuration
 
-## Deployment and maintenance
+Runtime configuration is defined in [wrangler.jsonc](wrangler.jsonc). Sensitive values are configured as Worker Secrets (or in `.dev.vars` for local development).
 
-Follow the [deployment guide](docs/deployment.md) for Cloudflare resources, GitHub Secrets, and first account creation. The Cloudflare workflow starts on `v*` tag pushes, reuses Integration to verify and build the Worker, then deploys the verified artifact from the same run. For a local production preflight, use `just dry-run`. Use `just db-migrate production` for a standalone production migration.
+### Required Secrets
 
-Production requires `ALLOWED_EMAILS`, `KEY_ENCRYPTION_KEY`, and `DOMAIN`. The deploy script derives `DOMAIN` from the configured public endpoint. Configure `OWNER_SETUP_TOKEN` to authorize registration and store the wrapping key separately from the D1 backup.
+| Secret | Description |
+| --- | --- |
+| `ALLOWED_EMAILS` | Comma- or newline-separated list of email addresses allowed to register |
+| `KEY_ENCRYPTION_KEY` | 32-byte key (43-character unpadded `base64url`) used to encrypt server signing keys in D1 |
+| `OWNER_SETUP_TOKEN` | Secret token (32–512 characters) used at `/setup` to authorize account registration |
+| `DOMAIN` | Public HTTPS origin of the service (set automatically by the deploy script) |
 
-- [Architecture and source layout](docs/architecture.md)
-- [Runtime configuration and limits](docs/runtime-config.md)
-- [Backup and recovery](docs/db-backup-recovery.md)
-- [Naming and migration compatibility](docs/naming-conventions.md)
+### Common Optional Variables
+
+| Variable | Default | Description |
+| --- | --- | --- |
+| `JWT_DURATION_SECONDS` | `3600` | Access token lifetime in seconds |
+| `TWO_FACTOR_REMEMBER_DAYS` | `30` | "Remember this device" duration in days (`1`–`90`) |
+| `TRASH_AUTO_DELETE_DAYS` | `30` | Days before soft-deleted items are permanently purged (`<= 0` disables) |
+| `ATTACHMENT_MAX_BYTES` | Unlimited | Maximum size in bytes for a single attachment |
+| `ATTACHMENT_TOTAL_LIMIT_KB` | Unlimited | Per-user attachment storage quota in KiB |
+| `SEND_MAX_BYTES` | `99614720` (95 MiB) | Maximum size in bytes for a File Send (KV fallback max is 25 MiB) |
+| `USER_SEND_LIMIT_KB` | Unlimited | Per-user File Send storage quota in KiB |
+| `CORS_ALLOWED_ORIGINS` | `*` | Comma-separated list of allowed CORS origins |
+| `WEBAUTHN_ALLOWED_ORIGINS` | `DOMAIN` | Additional allowed origins for browser extension or mobile WebAuthn |
+| `MAIL_WEBHOOK_URL` / `MAIL_WEBHOOK_TOKEN` | Unset | Webhook endpoint and bearer token for sending verification emails |
+| `NOTIFY_EVENTS` / `NOTIFY_LEVEL` | `none` / `info` | Admin event notifications via Telegram or WeCom webhooks |
+| `TURNSTILE_SITE_KEY` / `TURNSTILE_SECRET_KEY` | Unset | Cloudflare Turnstile keys for public Send access protection |
+| `HIBP_API_KEY` | Unset | Have I Been Pwned API key for password breach checks |
+| `DISABLE_ICON_DOWNLOAD` | `false` | Disable fetching website icons |
+
+## Deployment
+
+See **[DEPLOYMENT.md](DEPLOYMENT.md)** for instructions on provisioning Cloudflare resources, configuring GitHub Actions or CLI deployments, creating your first account, and backing up your data.
 
 ## License
 
-[MIT](LICENSE).
+[MIT](LICENSE)

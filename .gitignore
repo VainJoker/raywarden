@@ -39,6 +39,3 @@ Thumbs.db
 
 # Jujutsu workspace metadata
 .jj/
-
-# Local project documentation
-/docs/
