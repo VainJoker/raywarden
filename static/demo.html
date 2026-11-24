@@ -1,0 +1,609 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Raywarden - Bitwarden Compatible Server</title>
+    <style>
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+            display: flex;
+            flex-direction: column;
+            justify-content: center;
+            align-items: center;
+            min-height: 100vh;
+            margin: 0;
+            background-color: #f5f5f5;
+            color: #333;
+        }
+        .container {
+            text-align: center;
+            background: white;
+            padding: 3rem;
+            border-radius: 12px;
+            box-shadow: 0 4px 20px rgba(0,0,0,0.08);
+            max-width: 500px;
+            width: 90%;
+        }
+        h1 {
+            color: #175ddc;
+            margin-bottom: 1rem;
+        }
+        p {
+            color: #666;
+            margin-bottom: 2rem;
+            line-height: 1.6;
+        }
+        .warning {
+            color: #d32f2f;
+            background-color: #ffebee;
+            padding: 1rem;
+            border-radius: 6px;
+            margin-top: 1.5rem;
+            font-size: 0.9rem;
+            text-align: left;
+        }
+        .btn {
+            display: inline-block;
+            background-color: #175ddc;
+            color: white;
+            padding: 0.85rem 2rem;
+            border-radius: 6px;
+            text-decoration: none;
+            font-weight: 500;
+            transition: background-color 0.2s;
+        }
+        .btn:hover {
+            background-color: #134dbb;
+        }
+        .footer {
+            margin-top: 2rem;
+            font-size: 0.85rem;
+            color: #999;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>Raywarden</h1>
+        <p>
+            This is a Bitwarden compatible server running on Cloudflare Workers.<br>
+            You can connect to this server using the official Bitwarden clients.
+        </p>
+        
+        <div class="warning">
+            <strong>Demo limitations</strong><br>
+            This page only supports V1 accounts using PBKDF2 and type 2 user keys. For Argon2, V2, passkeys, or email two-step login, use an official Bitwarden client.<br>
+            All requests go to this site. Credentials are kept only in this page’s memory and cleared on refresh. If TOTP is enabled, enter your current code here when logging in again.
+            <input id="loginTotp" type="text" inputmode="numeric" autocomplete="one-time-code" maxlength="6" placeholder="Current 6-digit TOTP login code (leave blank if disabled)" style="width: 100%; padding: 0.6rem; box-sizing: border-box; margin-top: 0.75rem;">
+        </div>
+
+        <div class="warning">
+            <strong>About changing your master password</strong><br>
+            When changing a master password in Bitwarden/Vaultwarden on the web, plaintext passwords are used only for calculations in the browser. The server receives only the derived hash and the newly protected master key.<br>
+            Export a backup before making changes to avoid losing access to encrypted data if something goes wrong.
+        </div>
+
+        <div class="warning" style="margin-top: 1rem;">
+            <strong>Change master password on the web</strong><br>
+            Enter your email address, old password, and new password (plaintext is used only in this browser).<br><br>
+            <div style="margin-top: 0.75rem;">
+                <div style="margin-bottom: 0.4rem; font-weight: 600;">Email address</div>
+                <input id="email" type="text" placeholder="user@example.com" style="width: 100%; padding: 0.6rem; border-radius: 6px; border: 1px solid #ddd; box-sizing: border-box;">
+            </div>
+            <div style="margin-top: 0.75rem;">
+                <div style="margin-bottom: 0.4rem; font-weight: 600;">Old master password</div>
+                <input id="oldPassword" type="password" placeholder="Old master password" style="width: 100%; padding: 0.6rem; border-radius: 6px; border: 1px solid #ddd; box-sizing: border-box;">
+            </div>
+            <div style="margin-top: 0.75rem;">
+                <div style="margin-bottom: 0.4rem; font-weight: 600;">New master password</div>
+                <input id="newPassword" type="password" placeholder="New master password" style="width: 100%; padding: 0.6rem; border-radius: 6px; border: 1px solid #ddd; box-sizing: border-box;">
+            </div>
+            <div style="margin-top: 0.75rem;">
+                <div style="margin-bottom: 0.4rem; font-weight: 600;">Master password hint (optional)</div>
+                <input id="hint" type="text" placeholder="masterPasswordHint" style="width: 100%; padding: 0.6rem; border-radius: 6px; border: 1px solid #ddd; box-sizing: border-box;">
+            </div>
+            <div style="margin-top: 0.75rem;">
+                <a class="btn" href="#" id="submit">Change master password</a>
+            </div>
+            <div id="result" style="margin-top: 0.75rem; white-space: pre-wrap; font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, 'Liberation Mono', 'Courier New', monospace;"></div>
+        </div>
+
+        <div class="warning" style="margin-top: 1rem;">
+            <strong>Change email address on the web</strong><br>
+            Enter your current email address, new email address, and master password. Send a verification code, then enter the code received at the new address to submit the change. The site’s email gateway must be available, and the new address must be on the site allowlist.<br><br>
+            <div style="margin-top: 0.75rem;">
+                <div style="margin-bottom: 0.4rem; font-weight: 600;">Current email address</div>
+                <input id="emailCurrent" type="text" placeholder="current@example.com" style="width: 100%; padding: 0.6rem; border-radius: 6px; border: 1px solid #ddd; box-sizing: border-box;">
+            </div>
+            <div style="margin-top: 0.75rem;">
+                <div style="margin-bottom: 0.4rem; font-weight: 600;">New email address</div>
+                <input id="emailNew" type="text" placeholder="new@example.com" style="width: 100%; padding: 0.6rem; border-radius: 6px; border: 1px solid #ddd; box-sizing: border-box;">
+            </div>
+            <div style="margin-top: 0.75rem;">
+                <div style="margin-bottom: 0.4rem; font-weight: 600;">Master password</div>
+                <input id="emailPassword" type="password" placeholder="Master password" style="width: 100%; padding: 0.6rem; border-radius: 6px; border: 1px solid #ddd; box-sizing: border-box;">
+            </div>
+            <div style="margin-top: 0.75rem;">
+                <a class="btn" href="#" id="sendEmailToken">Send verification code to new email</a>
+            </div>
+            <div style="margin-top: 0.75rem;">
+                <input id="emailCode" type="text" inputmode="numeric" autocomplete="one-time-code" maxlength="6" placeholder="6-digit code sent to the new email address" style="width: 100%; padding: 0.6rem; box-sizing: border-box;">
+            </div>
+            <div style="margin-top: 0.75rem;">
+                <a class="btn" href="#" id="submitEmail">Verify and change email</a>
+            </div>
+            <div id="resultEmail" style="margin-top: 0.75rem; white-space: pre-wrap; font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, 'Liberation Mono', 'Courier New', monospace;"></div>
+        </div>
+
+        <div class="warning" style="margin-top: 1rem;">
+            <strong>Two-step login (TOTP)</strong><br>
+            When enabled, Bitwarden clients will require a 6-digit code at login.<br><br>
+            <div style="margin-top: 0.75rem;">
+                <div style="margin-bottom: 0.4rem; font-weight: 600;">Email address</div>
+                <input id="totpEmail" type="text" placeholder="user@example.com" style="width: 100%; padding: 0.6rem; border-radius: 6px; border: 1px solid #ddd; box-sizing: border-box;">
+            </div>
+            <div style="margin-top: 0.75rem;">
+                <div style="margin-bottom: 0.4rem; font-weight: 600;">Master password</div>
+                <input id="totpPassword" type="password" placeholder="Master password" style="width: 100%; padding: 0.6rem; border-radius: 6px; border: 1px solid #ddd; box-sizing: border-box;">
+            </div>
+            <div style="margin-top: 0.75rem;">
+                <a class="btn" href="#" id="totpRequest">Generate key</a>
+            </div>
+            <div style="margin-top: 0.75rem;">
+                <div style="margin-bottom: 0.4rem; font-weight: 600;">Secret</div>
+                <input id="totpSecret" type="text" readonly style="width: 100%; padding: 0.6rem; border-radius: 6px; border: 1px solid #ddd; box-sizing: border-box;">
+            </div>
+            <div style="margin-top: 0.75rem;">
+                <div style="margin-bottom: 0.4rem; font-weight: 600;">otpauth</div>
+                <textarea id="totpOtpauth" rows="3" readonly style="width: 100%; padding: 0.6rem; border-radius: 6px; border: 1px solid #ddd; box-sizing: border-box; font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, 'Liberation Mono', 'Courier New', monospace;"></textarea>
+            </div>
+            <div style="margin-top: 0.75rem;">Enter the secret manually in your authenticator app. This page does not generate or upload QR codes.</div>
+            <div style="margin-top: 0.75rem;">
+                <div style="margin-bottom: 0.4rem; font-weight: 600;">Verification code</div>
+                <input id="totpCode" type="text" placeholder="6-digit code for the newly generated key" style="width: 100%; padding: 0.6rem; border-radius: 6px; border: 1px solid #ddd; box-sizing: border-box;">
+            </div>
+            <div style="margin-top: 0.75rem; display: flex; gap: 0.75rem; justify-content: center; flex-wrap: wrap;">
+                <a class="btn" href="#" id="totpEnable">Enable</a>
+                <a class="btn" href="#" id="totpDisable" style="background-color: #777;">Disable</a>
+            </div>
+            <div id="resultTotp" style="margin-top: 0.75rem; white-space: pre-wrap; font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, 'Liberation Mono', 'Courier New', monospace;"></div>
+        </div>
+
+        <div class="warning" style="margin-top: 1rem;">
+            <strong>D1 usage</strong><br>
+            After login, view estimated text storage usage for the current account by category. This does not indicate the database capacity limit.<br><br>
+            <input id="usageEmail" type="text" placeholder="Email address" style="width: 100%; padding: 0.6rem; box-sizing: border-box;">
+            <input id="usagePassword" type="password" placeholder="Master password" style="width: 100%; padding: 0.6rem; box-sizing: border-box; margin-top: 0.75rem;">
+            <div style="margin-top: 0.75rem;">
+                <a class="btn" href="#" id="usageRefresh">Refresh usage</a>
+            </div>
+            <div id="resultUsage" style="margin-top: 0.75rem; white-space: pre-wrap; font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, 'Liberation Mono', 'Courier New', monospace;"></div>
+        </div>
+        
+        <div class="footer">
+            Powered by Raywarden
+        </div>
+    </div>
+
+    <script>
+        const submitBtn = document.getElementById('submit');
+        const submitEmailBtn = document.getElementById('submitEmail');
+        const emailInput = document.getElementById('email');
+        const oldPasswordInput = document.getElementById('oldPassword');
+        const newPasswordInput = document.getElementById('newPassword');
+        const hintInput = document.getElementById('hint');
+        const resultEl = document.getElementById('result');
+        const emailCurrentInput = document.getElementById('emailCurrent');
+        const emailNewInput = document.getElementById('emailNew');
+        const emailPasswordInput = document.getElementById('emailPassword');
+        const resultEmailEl = document.getElementById('resultEmail');
+        const totpEmailInput = document.getElementById('totpEmail');
+        const totpPasswordInput = document.getElementById('totpPassword');
+        const totpRequestBtn = document.getElementById('totpRequest');
+        const totpEnableBtn = document.getElementById('totpEnable');
+        const totpDisableBtn = document.getElementById('totpDisable');
+        const totpSecretInput = document.getElementById('totpSecret');
+        const totpOtpauthInput = document.getElementById('totpOtpauth');
+        const totpCodeInput = document.getElementById('totpCode');
+        const resultTotpEl = document.getElementById('resultTotp');
+        const usageRefreshBtn = document.getElementById('usageRefresh');
+        const resultUsageEl = document.getElementById('resultUsage');
+
+        const loginCodeInput = document.getElementById('loginTotp');
+        const sendEmailTokenBtn = document.getElementById('sendEmailToken');
+        const emailCodeInput = document.getElementById('emailCode');
+        const usageEmailInput = document.getElementById('usageEmail');
+        const usagePasswordInput = document.getElementById('usagePassword');
+
+        const encoder = new TextEncoder();
+
+        function concatBytes(a, b) {
+            const out = new Uint8Array(a.length + b.length);
+            out.set(a, 0);
+            out.set(b, a.length);
+            return out;
+        }
+
+        function b64encode(bytes) {
+            let binary = '';
+            const chunkSize = 0x8000;
+            for (let i = 0; i < bytes.length; i += chunkSize) {
+                const chunk = bytes.subarray(i, i + chunkSize);
+                binary += String.fromCharCode(...chunk);
+            }
+            return btoa(binary);
+        }
+
+        function b64decode(str) {
+            const binary = atob(str);
+            const out = new Uint8Array(binary.length);
+            for (let i = 0; i < binary.length; i++) {
+                out[i] = binary.charCodeAt(i);
+            }
+            return out;
+        }
+
+        function pkcs7Pad(bytes, blockSize) {
+            const padLen = blockSize - (bytes.length % blockSize);
+            const out = new Uint8Array(bytes.length + padLen);
+            out.set(bytes, 0);
+            out.fill(padLen, bytes.length);
+            return out;
+        }
+
+        function pkcs7Unpad(bytes) {
+            if (bytes.length === 0) throw new Error('Invalid padding');
+            const padLen = bytes[bytes.length - 1];
+            if (padLen <= 0 || padLen > 16) throw new Error('Invalid padding');
+            for (let i = bytes.length - padLen; i < bytes.length; i++) {
+                if (bytes[i] !== padLen) throw new Error('Invalid padding');
+            }
+            return bytes.subarray(0, bytes.length - padLen);
+        }
+
+        function formatBytes(bytes) {
+            if (!Number.isFinite(bytes)) return String(bytes);
+            if (bytes < 1024) return `${bytes} B`;
+            const kb = bytes / 1024;
+            if (kb < 1024) return `${kb.toFixed(1)} KB`;
+            const mb = kb / 1024;
+            if (mb < 1024) return `${mb.toFixed(1)} MB`;
+            const gb = mb / 1024;
+            return `${gb.toFixed(2)} GB`;
+        }
+
+        async function pbkdf2Sha256(passwordBytes, saltBytes, iterations, lengthBytes) {
+            const keyMaterial = await crypto.subtle.importKey(
+                'raw',
+                passwordBytes,
+                'PBKDF2',
+                false,
+                ['deriveBits']
+            );
+            const bits = await crypto.subtle.deriveBits(
+                {
+                    name: 'PBKDF2',
+                    salt: saltBytes,
+                    iterations,
+                    hash: 'SHA-256'
+                },
+                keyMaterial,
+                lengthBytes * 8
+            );
+            return new Uint8Array(bits);
+        }
+
+        async function hkdfExpandSha256(prkBytes, infoBytes, lengthBytes) {
+            if (lengthBytes > 32) {
+                throw new Error('HKDF-Expand length too large for this implementation');
+            }
+            const infoWithCounter = concatBytes(infoBytes, new Uint8Array([1]));
+            const okm = await hmacSha256(prkBytes, infoWithCounter);
+            return okm.subarray(0, lengthBytes);
+        }
+
+        async function stretchMasterKey(masterKeyBytes) {
+            const encKey = await hkdfExpandSha256(masterKeyBytes, encoder.encode('enc'), 32);
+            const macKey = await hkdfExpandSha256(masterKeyBytes, encoder.encode('mac'), 32);
+            return { encKey, macKey };
+        }
+
+        async function hmacSha256(macKeyBytes, dataBytes) {
+            const key = await crypto.subtle.importKey(
+                'raw',
+                macKeyBytes,
+                { name: 'HMAC', hash: 'SHA-256' },
+                false,
+                ['sign', 'verify']
+            );
+            const sig = await crypto.subtle.sign('HMAC', key, dataBytes);
+            return new Uint8Array(sig);
+        }
+
+        async function hmacVerifySha256(macKeyBytes, dataBytes, signatureBytes) {
+            const key = await crypto.subtle.importKey(
+                'raw',
+                macKeyBytes,
+                { name: 'HMAC', hash: 'SHA-256' },
+                false,
+                ['verify']
+            );
+            return await crypto.subtle.verify('HMAC', key, signatureBytes, dataBytes);
+        }
+
+        async function aesCbcEncrypt(encKeyBytes, ivBytes, plainBytes) {
+            const key = await crypto.subtle.importKey('raw', encKeyBytes, { name: 'AES-CBC' }, false, ['encrypt']);
+            const ct = await crypto.subtle.encrypt({ name: 'AES-CBC', iv: ivBytes }, key, plainBytes);
+            return new Uint8Array(ct);
+        }
+
+        async function aesCbcDecrypt(encKeyBytes, ivBytes, cipherBytes) {
+            const key = await crypto.subtle.importKey('raw', encKeyBytes, { name: 'AES-CBC' }, false, ['decrypt']);
+            const pt = await crypto.subtle.decrypt({ name: 'AES-CBC', iv: ivBytes }, key, cipherBytes);
+            return new Uint8Array(pt);
+        }
+
+        async function decryptEncString(encString, encKeyBytes, macKeyBytes) {
+            const parts = encString.split('.', 2);
+            if (parts.length !== 2) throw new Error('Invalid encString');
+            const encType = parts[0];
+            if (encType !== '2') throw new Error(`Unsupported encType: ${encType}`);
+            const payload = parts[1].split('|');
+            if (payload.length !== 3) throw new Error('Invalid encString payload');
+            const iv = b64decode(payload[0]);
+            const ct = b64decode(payload[1]);
+            const mac = b64decode(payload[2]);
+            const dataToMac = concatBytes(iv, ct);
+            const ok = await hmacVerifySha256(macKeyBytes, dataToMac, mac);
+            if (!ok) throw new Error('MAC verification failed (the old master password may be incorrect)');
+            const raw = await aesCbcDecrypt(encKeyBytes, iv, ct);
+            try {
+                return { plainBytes: pkcs7Unpad(raw), usedPadding: true, ivLen: iv.length, ctLen: ct.length, macLen: mac.length };
+            } catch {
+                return { plainBytes: raw, usedPadding: false, ivLen: iv.length, ctLen: ct.length, macLen: mac.length };
+            }
+        }
+
+        async function encryptEncString(plainBytes, encKeyBytes, macKeyBytes, usePadding) {
+            const iv = crypto.getRandomValues(new Uint8Array(16));
+            const input = usePadding ? pkcs7Pad(plainBytes, 16) : plainBytes;
+            const ct = await aesCbcEncrypt(encKeyBytes, iv, input);
+            const mac = await hmacSha256(macKeyBytes, concatBytes(iv, ct));
+            return `2.${b64encode(iv)}|${b64encode(ct)}|${b64encode(mac)}`;
+        }
+
+        async function deriveMasterKey(email, password, kdfIterations) {
+            const salt = encoder.encode(email.toLowerCase());
+            const pw = encoder.encode(password);
+            return await pbkdf2Sha256(pw, salt, kdfIterations, 32);
+        }
+
+        async function deriveMasterPasswordHash(masterKeyBytes, password) {
+            const pw = encoder.encode(password);
+            const hash = await pbkdf2Sha256(masterKeyBytes, pw, 1, 32);
+            return b64encode(hash);
+        }
+
+        const deviceIdentifier = crypto.randomUUID();
+        const demoVersion = '2026.7.0'; // V1-only demo, not an implementation of V2.
+        const unsupported = 'This page only supports V1 accounts using PBKDF2. For V2, Argon2, or unknown key formats, use an official client.';
+        let activeSession = null;
+        let totpSetup = null;
+        let emailChange = null;
+        let busy = false;
+
+        function clearTotpSetup() {
+            totpSetup = null;
+            totpSecretInput.value = '';
+            totpOtpauthInput.value = '';
+        }
+        function clearSession() {
+            activeSession = null;
+            emailChange = null;
+            clearTotpSetup();
+        }
+        async function requestJson(path, { method = 'POST', token, body, form } = {}) {
+            if (!path.startsWith('/') || path.startsWith('//')) throw new Error('Only requests to this site are allowed');
+            const headers = {};
+            if (token) headers.Authorization = `Bearer ${token}`;
+            if (body !== undefined) headers['Content-Type'] = 'application/json';
+            if (form) {
+                headers['Content-Type'] = 'application/x-www-form-urlencoded';
+                headers['Bitwarden-Client-Version'] = demoVersion;
+                headers['device-type'] = '14';
+            }
+            const response = await fetch(path, { method, headers, credentials: 'same-origin', cache: 'no-store', redirect: 'error',
+                body: form ? form.toString() : body === undefined ? undefined : JSON.stringify(body) });
+            let data = {};
+            const text = await response.text();
+            if (text) {
+                try { data = JSON.parse(text); }
+                catch { throw new Error(`Unsupported server response format (HTTP ${response.status}). Use an official client.`); }
+            }
+            if (!response.ok) {
+                if (response.status === 401 || response.status === 403) clearSession();
+                if (data.error === 'invalid_client_version' || data.error === 'version_header_missing') throw new Error(unsupported);
+                if (data.TwoFactorProviders || data.twoFactorProviders || /two factor required/i.test(data.error_description || '')) {
+                    throw new Error('Two-step login is required. TOTP users should enter the current login code at the top of this page; use an official client for other factors.');
+                }
+                // Never echo a response body: it may contain a token or a credential.
+                throw new Error(`Request failed (HTTP ${response.status}). Check your credentials, verification code, session, and site configuration.`);
+            }
+            return data;
+        }
+        async function prelogin(email) {
+            const data = await requestJson('/api/accounts/prelogin', { body: { email } });
+            if (data.kdf !== 0 || !Number.isSafeInteger(data.kdfIterations) || data.kdfIterations <= 0 ||
+                (data.salt !== undefined && (typeof data.salt !== 'string' || data.salt.toLowerCase() !== email.toLowerCase()))) throw new Error(unsupported);
+            return data.kdfIterations;
+        }
+        function requireLegacyV1(data, iterations) {
+            const keys = data.AccountKeys ?? data.accountKeys;
+            if (data.Kdf !== 0 || data.KdfIterations !== iterations || !keys ||
+                keys.securityState != null || keys.signatureKeyPair != null ||
+                typeof data.Key !== 'string' || !data.Key.startsWith('2.') ||
+                (data.PrivateKey && !data.PrivateKey.startsWith('2.'))) throw new Error(unsupported);
+            if (typeof data.access_token !== 'string' || !data.access_token) throw new Error('The login response is missing session credentials');
+        }
+        async function login(email, masterPasswordHash, iterations) {
+            const form = new URLSearchParams({ grant_type: 'password', username: email, password: masterPasswordHash,
+                deviceIdentifier, deviceName: 'Raywarden Demo', deviceType: '14' });
+            const code = loginCodeInput.value.trim();
+            if (code) {
+                if (!/^\d{6}$/.test(code)) throw new Error('The current TOTP login code must contain 6 digits');
+                form.set('twoFactorProvider', '0'); form.set('twoFactorToken', code);
+            }
+            const data = await requestJson('/identity/connect/token', { form });
+            requireLegacyV1(data, iterations);
+            clearSession();
+            loginCodeInput.value = '';
+            activeSession = { email, masterPasswordHash, iterations, accessToken: data.access_token,
+                protectedKey: data.Key, expiresAt: Date.now() + Number(data.expires_in || 0) * 1000 };
+            return activeSession;
+        }
+        async function authenticate(email, password) {
+            const iterations = await prelogin(email);
+            const masterKey = await deriveMasterKey(email, password, iterations);
+            const masterPasswordHash = await deriveMasterPasswordHash(masterKey, password);
+            const session = activeSession && activeSession.email === email &&
+                activeSession.masterPasswordHash === masterPasswordHash && activeSession.iterations === iterations &&
+                activeSession.expiresAt > Date.now() + 5000 ? activeSession : await login(email, masterPasswordHash, iterations);
+            await verifyCurrentAccount(session);
+            return { session, masterKey };
+        }
+        async function verifyCurrentAccount(session) {
+            const profile = await requestJson('/api/accounts/profile', { method: 'GET', token: session.accessToken });
+            requireLegacyV1({ Kdf: profile.kdf, KdfIterations: profile.kdfIterations,
+                AccountKeys: profile.accountKeys, Key: profile.key, PrivateKey: profile.privateKey,
+                access_token: session.accessToken }, session.iterations);
+            if (profile.key !== session.protectedKey) {
+                clearSession();
+                throw new Error('The account key has changed. Log in again or use an official client.');
+            }
+        }
+        function credentials(emailField, passwordField) {
+            const email = emailField.value.trim().toLowerCase();
+            const password = passwordField.value;
+            if (!email || !password) throw new Error('Enter your email address and master password');
+            return { email, password };
+        }
+        function bind(button, output, action) {
+            button.addEventListener('click', async event => {
+                event.preventDefault();
+                if (busy) { output.textContent = 'Wait for the current operation to finish'; return; }
+                busy = true; output.textContent = 'Working...';
+                try { output.textContent = await action(); }
+                catch (error) { output.textContent = error instanceof Error ? error.message : 'The operation failed. Use an official client.'; }
+                finally { busy = false; }
+            });
+        }
+
+        bind(submitBtn, resultEl, async () => {
+            const { email, password } = credentials(emailInput, oldPasswordInput);
+            const nextPassword = newPasswordInput.value;
+            if (!nextPassword || nextPassword === password) throw new Error('Enter a different new master password');
+            const { session, masterKey } = await authenticate(email, password);
+            const oldStretched = await stretchMasterKey(masterKey);
+            const decrypted = await decryptEncString(session.protectedKey, oldStretched.encKey, oldStretched.macKey);
+            const nextKey = await deriveMasterKey(email, nextPassword, session.iterations);
+            const nextHash = await deriveMasterPasswordHash(nextKey, nextPassword);
+            const stretched = await stretchMasterKey(nextKey);
+            const protectedKey = await encryptEncString(decrypted.plainBytes, stretched.encKey, stretched.macKey, decrypted.usedPadding);
+            await requestJson('/api/accounts/password', { token: session.accessToken, body: {
+                masterPasswordHash: session.masterPasswordHash, newMasterPasswordHash: nextHash,
+                masterPasswordHint: hintInput.value.trim() || null, key: protectedKey } });
+            clearSession(); oldPasswordInput.value = ''; newPasswordInput.value = '';
+            return 'Your master password has been changed. Log in again with an official client and confirm that you can decrypt your data.';
+        });
+
+        bind(sendEmailTokenBtn, resultEmailEl, async () => {
+            emailChange = null;
+            const { email, password } = credentials(emailCurrentInput, emailPasswordInput);
+            const nextEmail = emailNewInput.value.trim().toLowerCase();
+            if (!nextEmail || nextEmail === email) throw new Error('Enter a different new email address');
+            const { session, masterKey } = await authenticate(email, password);
+            await requestJson('/api/accounts/email-token', { token: session.accessToken,
+                body: { newEmail: nextEmail, masterPasswordHash: session.masterPasswordHash } });
+            emailChange = { email, nextEmail, session, masterKey };
+            emailCodeInput.value = '';
+            return 'A verification code has been sent to the new email address. Enter the code and click "Verify and change email". Keep the email addresses and password unchanged until then.';
+        });
+        bind(submitEmailBtn, resultEmailEl, async () => {
+            const context = emailChange;
+            if (!context || context.session !== activeSession || context.email !== emailCurrentInput.value.trim().toLowerCase() ||
+                context.nextEmail !== emailNewInput.value.trim().toLowerCase()) throw new Error('Send the verification code to the new email address first');
+            const code = emailCodeInput.value.trim();
+            if (!/^\d{6}$/.test(code)) throw new Error('Enter the 6-digit code sent to the new email address');
+            const password = emailPasswordInput.value;
+            if (await deriveMasterPasswordHash(context.masterKey, password) !== context.session.masterPasswordHash) {
+                emailChange = null;
+                throw new Error('The password has changed. Send a new email verification code');
+            }
+            await verifyCurrentAccount(context.session);
+            const oldStretched = await stretchMasterKey(context.masterKey);
+            const decrypted = await decryptEncString(context.session.protectedKey, oldStretched.encKey, oldStretched.macKey);
+            const nextKey = await deriveMasterKey(context.nextEmail, password, context.session.iterations);
+            const nextHash = await deriveMasterPasswordHash(nextKey, password);
+            const stretched = await stretchMasterKey(nextKey);
+            const protectedKey = await encryptEncString(decrypted.plainBytes, stretched.encKey, stretched.macKey, decrypted.usedPadding);
+            await requestJson('/api/accounts/email', { token: context.session.accessToken, body: {
+                masterPasswordHash: context.session.masterPasswordHash, newMasterPasswordHash: nextHash,
+                newEmail: context.nextEmail, key: protectedKey, token: code, kdf: 0, kdfIterations: context.session.iterations } });
+            clearSession(); emailPasswordInput.value = ''; emailCodeInput.value = '';
+            return 'Your email address has been changed. Log in again with the new address in an official client and confirm that you can decrypt your data.';
+        });
+        for (const field of [emailCurrentInput, emailNewInput, emailPasswordInput]) {
+            field.addEventListener('input', () => { emailChange = null; });
+        }
+
+        async function currentTotpSetup() {
+            const { email, password } = credentials(totpEmailInput, totpPasswordInput);
+            const { session } = await authenticate(email, password);
+            const data = await requestJson('/api/two-factor/get-authenticator', { token: session.accessToken,
+                body: { masterPasswordHash: session.masterPasswordHash } });
+            if (typeof data.key !== 'string' || !data.key || typeof data.userVerificationToken !== 'string' || !data.userVerificationToken) {
+                throw new Error('The authenticator response is incomplete. Use an official client.');
+            }
+            return { session, key: data.key, proof: data.userVerificationToken, enabled: data.enabled, created: Date.now() };
+        }
+        bind(totpRequestBtn, resultTotpEl, async () => {
+            clearTotpSetup();
+            const setup = await currentTotpSetup(); totpSetup = setup;
+            totpSecretInput.value = setup.key;
+            totpOtpauthInput.value = `otpauth://totp/${encodeURIComponent('Raywarden:' + setup.session.email)}?secret=${encodeURIComponent(setup.key)}&issuer=Raywarden&algorithm=SHA1&digits=6&period=30`;
+            return setup.enabled ? 'TOTP is enabled. Disabling it will request fresh verification credentials for its current state.' : 'Enter the secret in your authenticator app, then enter a code for the new key and enable TOTP.';
+        });
+        bind(totpEnableBtn, resultTotpEl, async () => {
+            const setup = totpSetup;
+            if (!setup || setup.session !== activeSession || Date.now() - setup.created > 240000) throw new Error('Request the TOTP key again first');
+            if (setup.enabled) throw new Error('TOTP is already enabled');
+            const code = totpCodeInput.value.trim();
+            if (!/^\d{6}$/.test(code)) throw new Error('Enter the 6-digit code for the new key');
+            await requestJson('/api/two-factor/authenticator', { token: setup.session.accessToken,
+                body: { key: setup.key, token: code, userVerificationToken: setup.proof } });
+            clearTotpSetup(); totpCodeInput.value = '';
+            return 'TOTP has been enabled. For new logins, enter the current TOTP code at the top of this page.';
+        });
+        bind(totpDisableBtn, resultTotpEl, async () => {
+            // Do not reuse the proof issued before activation or another state change.
+            const setup = await currentTotpSetup();
+            if (!setup.enabled) { clearTotpSetup(); return 'TOTP is currently disabled.'; }
+            await requestJson('/api/two-factor/authenticator', { method: 'DELETE', token: setup.session.accessToken,
+                body: { type: 0, key: setup.key, userVerificationToken: setup.proof } });
+            clearTotpSetup(); totpCodeInput.value = '';
+            return 'TOTP has been disabled.';
+        });
+        for (const field of [totpEmailInput, totpPasswordInput]) field.addEventListener('input', clearTotpSetup);
+
+        bind(usageRefreshBtn, resultUsageEl, async () => {
+            const { email, password } = credentials(usageEmailInput, usagePasswordInput);
+            const { session } = await authenticate(email, password);
+            const data = await requestJson('/api/d1/usage', { method: 'GET', token: session.accessToken });
+            const lines = [`Total text storage for this account (estimated): ${formatBytes(data.totalBytes)}`, ''];
+            for (const item of data.items || []) lines.push(`${item.name || item.key}: ${formatBytes(item.bytes)}`);
+            return lines.join('\n');
+        });
+    </script>
+</body>
+</html>

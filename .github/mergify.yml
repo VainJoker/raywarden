@@ -1,0 +1,18 @@
+pull_request_rules:
+  - name: Automatic merge for Dependabot pull requests
+    conditions:
+      - author=dependabot[bot]
+      - base=main
+      - "check-success = @github-actions/Linux Rust, JavaScript, SQL and Worker build"
+      - "check-success = @github-actions/Host Rust library coverage"
+    actions:
+      merge:
+        method: squash
+
+  - name: Automatic update to the main branch for pull requests
+    conditions:
+      - -conflict 
+      - -draft
+      - -author=dependabot[bot]
+    actions:
+      update:
