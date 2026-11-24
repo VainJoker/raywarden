@@ -111,7 +111,7 @@ export function readTargetConfig({ configPath = resolve(PROJECT_ROOT, "wrangler.
 
 const ACCOUNT_ID = /^[0-9a-f]{32}$/i;
 export class CloudflareApiError extends Error {
-  constructor(message, status) { super(message); this.name = "CloudflareApiError"; this.status = status; }
+  constructor(message, status, codes = []) { super(message); this.name = "CloudflareApiError"; this.status = status; this.codes = codes; }
 }
 
 export class CloudflareApi {
@@ -130,7 +130,7 @@ export class CloudflareApi {
     catch { throw new CloudflareApiError(`Cloudflare returned invalid JSON (HTTP ${response.status})`, response.status); }
     if (!response.ok || payload?.success === false) {
       const message = payload?.errors?.map((e) => e.message).filter(Boolean).join("; ");
-      throw new CloudflareApiError(message || `Cloudflare HTTP ${response.status}`, response.status);
+      throw new CloudflareApiError(message || `Cloudflare HTTP ${response.status}`, response.status, payload?.errors?.map(e => e.code) ?? []);
     }
     return payload;
   }
@@ -393,13 +393,28 @@ export async function deployArtifact(options = {}, runner = runWrangler, head = 
   // Invalid supplied values fail before network calls or temporary secret files.
   // Omitted optional values inherit the existing encrypted Worker bindings.
   const secrets = configuredSecrets(environment);
-  let domain = target.domain;
-  if (!domain) {
-    const api = new CloudflareApi(environment.CLOUDFLARE_API_TOKEN, fetchImpl);
-    const accountId = await resolveAccountId(api, environment.CLOUDFLARE_ACCOUNT_ID || target.accountId);
-    domain = await resolveWorkerUrl(target, api, accountId);
+  const api = new CloudflareApi(environment.CLOUDFLARE_API_TOKEN, fetchImpl);
+  const accountId = await resolveAccountId(api, environment.CLOUDFLARE_ACCOUNT_ID || target.accountId);
+  let hasPreviousVersion;
+  try {
+    const { result } = await api.request(`/accounts/${accountId}/workers/scripts/${encodeURIComponent(target.name)}/versions`);
+    if (!Array.isArray(result?.items)) throw new Error("Cloudflare did not return a Worker version list");
+    hasPreviousVersion = result.items.length > 0;
+  } catch (error) {
+    // Only a missing Worker is a first deployment; permission/network errors abort.
+    if (!(error instanceof CloudflareApiError) || error.status !== 404 || !error.codes.includes(10007)) throw error;
+    hasPreviousVersion = false;
   }
-  secrets.DOMAIN = domain;
+  secrets.DOMAIN = await resolveWorkerUrl(target, api, accountId);
+  const config = compiledConfig(target, manifest);
+  if (!hasPreviousVersion) {
+    const missing = (config.secrets?.required ?? []).filter(name => !Object.hasOwn(secrets, name));
+    if (missing.length) throw new Error(`First deployment requires supplied Secrets: ${missing.join(", ")}; configure them in GitHub production environment secrets`);
+    // Wrangler 4.166 always sends keep_bindings for secrets, even on creation.
+    // Override that upload metadata only when no previous version exists.
+    config.keep_vars = false;
+    config.unsafe = { ...config.unsafe, metadata: { ...config.unsafe?.metadata, keep_bindings: [] } };
+  }
   const tempRoot = resolve(target.projectDir, ".wrangler");
   mkdirSync(tempRoot, { recursive: true });
   const temp = mkdtempSync(resolve(tempRoot, "compiled-config-"));
@@ -407,7 +422,7 @@ export async function deployArtifact(options = {}, runner = runWrangler, head = 
     chmodSync(temp, 0o700);
     const configPath = resolve(temp, "wrangler.json");
     const secretsPath = resolve(temp, "secrets.json");
-    writeFileSync(configPath, JSON.stringify(compiledConfig(target, manifest), null, 2));
+    writeFileSync(configPath, JSON.stringify(config, null, 2));
     writeFileSync(secretsPath, JSON.stringify(secrets), { mode: 0o600 });
     // --no-bundle skips Wrangler's internal compiler. Removing build above also
     // prevents the separate custom command from invoking worker-build/Cargo.

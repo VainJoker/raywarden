@@ -19,7 +19,7 @@ import {
   artifactReleaseId,
   checkHealth,
   createArtifactManifest,
-  deployArtifact,
+  deployArtifact as deployArtifactImpl,
   main as deployMain,
   parseDeployArgs,
   parseJsonc,
@@ -31,6 +31,13 @@ import {
 import { databaseId as uuid, productionConfig } from "./script-fixtures.mjs";
 
 const account = "a".repeat(32);
+// Most deployment tests model an existing release; individual tests override the API.
+const deployedWorker = async () => response({ items: [{ id: "existing-version" }] });
+function deployArtifact(options, runner, head, environment = {}, fetchImpl = deployedWorker) {
+  return deployArtifactImpl(options, runner, head, {
+    CLOUDFLARE_API_TOKEN: "fake-token", CLOUDFLARE_ACCOUNT_ID: account, ...environment,
+  }, fetchImpl);
+}
 function fixture(t, transform = (value) => value) {
   const dir = mkdtempSync(join(tmpdir(), "raywarden-deployment-test-"));
   t.after(() => rmSync(dir, { recursive: true, force: true }));
@@ -587,6 +594,75 @@ test("first upload supplies private owner secrets and the selected origin withou
   assert.equal(existsSync(dirname(temporary)), false);
 });
 
+test("first deployment with no Worker or an empty version list disables inheritance and supplies every required secret", async t => {
+  for (const missingWorker of [true, false]) {
+    const { options, config, write } = artifactFixture(t);
+    config.keep_vars = true;
+    config.secrets.required.push("ALLOWED_EMAILS");
+    config.unsafe = { metadata: { annotations: { "workers/message": "first release" } } };
+    write("wrangler.jsonc", JSON.stringify(config));
+    await createArtifactManifest(options, head);
+    let uploads = 0;
+    await deployArtifact(options, args => {
+      uploads++;
+      const uploaded = JSON.parse(readFileSync(args[args.indexOf("--config") + 1], "utf8"));
+      const secrets = JSON.parse(readFileSync(args[args.indexOf("--secrets-file") + 1], "utf8"));
+      assert.equal(uploaded.keep_vars, false);
+      assert.deepEqual(uploaded.unsafe.metadata.keep_bindings, []);
+      assert.deepEqual(uploaded.unsafe.metadata.annotations, config.unsafe.metadata.annotations);
+      for (const name of config.secrets.required) assert.ok(secrets[name]);
+      assert.deepEqual(uploaded.durable_objects, config.durable_objects);
+      assert.deepEqual(uploaded.migrations, config.migrations);
+    }, head, {
+      ALLOWED_EMAILS: "owner@example.test",
+      KEY_ENCRYPTION_KEY: "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8",
+    }, async url => {
+      assert.equal(url, `https://api.cloudflare.com/client/v4/accounts/${account}/workers/scripts/artifact-worker/versions`);
+      return missingWorker
+        ? Response.json({ success: false, errors: [{ code: 10007, message: "Worker not found" }] }, { status: 404 })
+        : response({ items: [] });
+    });
+    assert.equal(uploads, 1);
+    assert.deepEqual(JSON.parse(readFileSync(options.configPath, "utf8")), config);
+  }
+});
+
+test("first deployment rejects missing secrets before creating upload files", async t => {
+  const { options, config, dir, write } = artifactFixture(t);
+  config.secrets.required.push("ALLOWED_EMAILS");
+  write("wrangler.jsonc", JSON.stringify(config));
+  await createArtifactManifest(options, head);
+  await assert.rejects(deployArtifact(options, () => assert.fail("must not upload"), head, {}, async () => response({ items: [] })), /First deployment requires supplied Secrets: KEY_ENCRYPTION_KEY, ALLOWED_EMAILS/);
+  assert.equal(readdirSync(join(dir, ".wrangler")).some(name => name.startsWith("compiled-config-")), false);
+});
+
+test("existing versions retain binding inheritance, including secrets omitted from this deployment", async t => {
+  const { options, config, write } = artifactFixture(t);
+  config.keep_vars = true;
+  write("wrangler.jsonc", JSON.stringify(config));
+  await createArtifactManifest(options, head);
+  await deployArtifact(options, args => {
+    const uploaded = JSON.parse(readFileSync(args[args.indexOf("--config") + 1], "utf8"));
+    assert.equal(uploaded.keep_vars, true);
+    assert.equal(uploaded.unsafe, undefined);
+    assert.deepEqual(JSON.parse(readFileSync(args[args.indexOf("--secrets-file") + 1], "utf8")), { DOMAIN: "https://vault.example.test" });
+  }, head, {});
+});
+
+test("version discovery never treats permission, service, transport or malformed responses as a first deployment", async t => {
+  const { options } = artifactFixture(t);
+  await createArtifactManifest(options, head);
+  for (const fetchImpl of [
+    async () => Response.json({ success: false, errors: [{ code: 10007, message: "denied" }] }, { status: 403 }),
+    async () => Response.json({ success: false, errors: [{ code: 99999, message: "unknown resource" }] }, { status: 404 }),
+    async () => response(null, 500),
+    async () => response({}),
+    async () => { throw new Error("network unavailable"); },
+  ]) {
+    await assert.rejects(deployArtifact(options, () => assert.fail("must not upload"), head, {}, fetchImpl));
+  }
+});
+
 test("release identity changes when the same source produces a different bundle", async t => {
   const { options, write } = artifactFixture(t);
   const before = await createArtifactManifest(options, head);
@@ -663,7 +739,7 @@ test("setup token limits count Unicode characters while preserving the original 
   }
 });
 
-test("workers.dev first upload resolves the account subdomain before supplying DOMAIN", async (t) => {
+test("workers.dev redeployment resolves the account subdomain before supplying DOMAIN", async (t) => {
   const { options, write, config } = artifactFixture(t);
   delete config.routes;
   config.workers_dev = true;
@@ -674,13 +750,14 @@ test("workers.dev first upload resolves the account subdomain before supplying D
     assert.deepEqual(JSON.parse(readFileSync(args[args.indexOf("--secrets-file") + 1], "utf8")), { DOMAIN: "https://artifact-worker.my-account.workers.dev" });
   }, head, { CLOUDFLARE_API_TOKEN: "fake-token", CLOUDFLARE_ACCOUNT_ID: account }, async (url, request) => {
     calls.push(url);
+    if (url.endsWith("/versions")) return response({ items: [{ id: "previous" }] });
     assert.equal(url, `https://api.cloudflare.com/client/v4/accounts/${account}/workers/subdomain`);
     assert.equal(request.method ?? "GET", "GET");
     assert.equal(request.headers.Authorization, "Bearer fake-token");
     return Response.json({ success: true, result: { subdomain: "my-account" } });
   });
-  assert.equal(calls.length, 1);
-  await assert.rejects(deployArtifact(options, () => assert.fail("must not upload"), head, {}), /CLOUDFLARE_API_TOKEN is required/);
+  assert.equal(calls.length, 2);
+  await assert.rejects(deployArtifactImpl(options, () => assert.fail("must not upload"), head, {}), /CLOUDFLARE_API_TOKEN is required/);
 });
 
 test("Wrangler process failure propagates and removes both temporary deployment files", async (t) => {
