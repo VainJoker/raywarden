@@ -3,7 +3,8 @@ import json
 import sqlite3
 import unittest
 
-from sql_regression import apply_migrations, statement, statements
+from sql_fixtures import apply_migrations
+from sql_source import statement, statements
 
 
 class GlobalDomainsCacheSql(unittest.TestCase):

@@ -1,26 +1,12 @@
 //! Private enrollment for a small set of explicitly allowed accounts.
-use axum::http::{
-    HeaderMap,
-    header,
-};
-use serde::{
-    Deserialize,
-    Serialize,
-};
-use sha2::{
-    Digest,
-    Sha256,
-};
-use worker::Env;
+use axum::http::{HeaderMap, header};
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+use worker::{D1Database, Env};
 
 use crate::{
-    app::AppContext,
-    config::normalize_account_email,
-    errors::{
-        AppError,
-        AppResult,
-    },
-    infra::jwt,
+    errors::{AppError, AppResult},
+    infra::{config::Config, jwt},
     models::identity::user::UserRow,
     utils::constant_time_eq,
 };
@@ -33,25 +19,20 @@ const PURPOSE: &str = "owner-setup";
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct SetupClaims {
-    sub:     String,
-    aud:     String,
+    sub: String,
+    aud: String,
     purpose: String,
-    exp:     i64,
-    nbf:     i64,
-    iat:     i64,
+    exp: i64,
+    nbf: i64,
+    iat: i64,
 }
 
-fn allowed_emails(state: &AppContext) -> AppResult<&[String]> {
-    state
-        .config
+fn allowed_emails(config: &Config) -> AppResult<&[String]> {
+    config
         .allowed_emails
         .as_deref()
         .filter(|emails| !emails.is_empty())
-        .ok_or_else(|| {
-            AppError::bad_request(
-                "ALLOWED_EMAILS must specify allowed account emails",
-            )
-        })
+        .ok_or_else(|| AppError::bad_request("ALLOWED_EMAILS must specify allowed account emails"))
 }
 
 fn registration_scope(emails: &[String]) -> String {
@@ -59,27 +40,21 @@ fn registration_scope(emails: &[String]) -> String {
 }
 
 fn valid_setup_secret(value: &str) -> bool {
-    (32..=512).contains(&value.chars().count()) &&
-        !value.chars().any(char::is_control) &&
-        value == value.trim()
+    (32..=512).contains(&value.chars().count())
+        && !value.chars().any(char::is_control)
+        && value == value.trim()
 }
 
 fn verify_secret(env: &Env, supplied: &str) -> AppResult<()> {
     // No ordinary-variable fallback and no normalization of secret bytes.
-    let expected = env
-        .secret("OWNER_SETUP_TOKEN")
-        .map_err(|_error| {
-            AppError::bad_request("Owner setup is not configured")
-        })?
-        .to_string();
+    let expected = crate::infra::config::owner_setup_secret(env)?;
     if !valid_setup_secret(&expected) {
         return Err(AppError::bad_request(
             "OWNER_SETUP_TOKEN must contain 32 to 512 characters without \
              surrounding whitespace or control characters",
         ));
     }
-    if !valid_setup_secret(supplied) ||
-        !constant_time_eq(expected.as_bytes(), supplied.as_bytes())
+    if !valid_setup_secret(supplied) || !constant_time_eq(expected.as_bytes(), supplied.as_bytes())
     {
         return Err(AppError::setup_authorization_required());
     }
@@ -120,27 +95,18 @@ fn cookie_value(headers: &HeaderMap) -> AppResult<Option<&str>> {
     Ok(token)
 }
 
-fn verify_cookie(
-    token: &str,
-    secret: &str,
-    owner: &str,
-    domain: &str,
-) -> AppResult<()> {
-    let claims = jwt::decode::<SetupClaims>(
-        token,
-        secret.as_bytes(),
-        &jwt::ValidationOptions {
-            leeway_seconds: 0,
-            validate_issued_at: true,
-            expected_audience: Some(domain.into()),
-            ..Default::default()
-        },
-    )
+fn verify_cookie(token: &str, secret: &str, owner: &str, domain: &str) -> AppResult<()> {
+    let claims = jwt::decode::<SetupClaims>(token, secret.as_bytes(), &jwt::ValidationOptions {
+        leeway_seconds: 0,
+        validate_issued_at: true,
+        expected_audience: Some(domain.into()),
+        ..Default::default()
+    })
     .map_err(|_error| AppError::setup_authorization_required())?;
-    if claims.purpose != PURPOSE ||
-        claims.sub != owner ||
-        claims.exp.checked_sub(claims.iat) != Some(TTL_SECONDS) ||
-        claims.nbf != claims.iat
+    if claims.purpose != PURPOSE
+        || claims.sub != owner
+        || claims.exp.checked_sub(claims.iat) != Some(TTL_SECONDS)
+        || claims.nbf != claims.iat
     {
         return Err(AppError::setup_authorization_required());
     }
@@ -148,33 +114,31 @@ fn verify_cookie(
 }
 
 fn verify_credential(
-    state: &AppContext,
+    env: &Env,
+    domain: &str,
+    access_secret: &str,
     headers: &HeaderMap,
     owner: &str,
 ) -> AppResult<()> {
-    check_origin(state.domain(), headers)?;
+    check_origin(domain, headers)?;
     if let Some(token) = headers.get(TOKEN_HEADER) {
         return verify_secret(
-            &state.env,
+            env,
             token
                 .to_str()
                 .map_err(|_error| AppError::setup_authorization_required())?,
         );
     }
     verify_cookie(
-        cookie_value(headers)?
-            .ok_or_else(AppError::setup_authorization_required)?,
-        &state.jwt_keys.access_secret,
+        cookie_value(headers)?.ok_or_else(AppError::setup_authorization_required)?,
+        access_secret,
         owner,
-        state.domain(),
+        domain,
     )
 }
 
-async fn require_available(
-    state: &AppContext,
-    emails: &[String],
-) -> AppResult<()> {
-    if !UserRow::has_available_email(state.database(), emails).await? {
+async fn require_available(db: &D1Database, emails: &[String]) -> AppResult<()> {
+    if !UserRow::has_available_email(db, emails).await? {
         return Err(AppError::conflict("All allowed accounts already exist"));
     }
     Ok(())
@@ -192,69 +156,100 @@ fn cookie(origin: &str, token: &str, max_age: i64) -> String {
     )
 }
 
-pub(crate) async fn issue_cookie(
-    state: &AppContext,
-    headers: &HeaderMap,
-    token: &str,
-) -> AppResult<String> {
-    check_origin(state.domain(), headers)?;
-    let emails = allowed_emails(state)?;
-    require_available(state, emails).await?;
-    let scope = registration_scope(emails);
-    verify_secret(&state.env, token)?;
-    let now = crate::utils::time::now_seconds();
-    let proof = SetupClaims {
-        sub:     scope,
-        aud:     state.domain().into(),
-        purpose: PURPOSE.into(),
-        exp:     now.checked_add(TTL_SECONDS).ok_or(AppError::Internal)?,
-        nbf:     now,
-        iat:     now,
-    };
-    let signed = jwt::encode(&proof, state.jwt_keys.access_secret.as_bytes())?;
-    Ok(cookie(state.domain(), &signed, TTL_SECONDS))
+pub(crate) struct SetupGuard<'a> {
+    pub db: &'a D1Database,
+    pub env: &'a Env,
+    pub config: &'a Config,
+    pub access_secret: &'a str,
 }
 
-pub(crate) async fn authorize_registration(
-    state: &AppContext,
-    headers: &HeaderMap,
-    requested_email: &str,
-) -> AppResult<String> {
-    let emails = allowed_emails(state)?;
-    verify_credential(state, headers, &registration_scope(emails))?;
-    let address = normalize_account_email(requested_email)?;
-    if !emails.contains(&address) {
-        return Err(AppError::setup_authorization_required());
+impl SetupGuard<'_> {
+    pub(crate) async fn issue_cookie(&self, headers: &HeaderMap, token: &str) -> AppResult<String> {
+        let Self {
+            db,
+            env,
+            config,
+            access_secret,
+        } = *self;
+        check_origin(config.domain.as_str(), headers)?;
+        let emails = allowed_emails(config)?;
+        verify_secret(env, token)?;
+        require_available(db, emails).await?;
+        let scope = registration_scope(emails);
+        let now = crate::utils::time::now_seconds();
+        let proof = SetupClaims {
+            sub: scope,
+            aud: config.domain.as_str().into(),
+            purpose: PURPOSE.into(),
+            exp: now.checked_add(TTL_SECONDS).ok_or(AppError::Internal)?,
+            nbf: now,
+            iat: now,
+        };
+        let signed = jwt::encode(&proof, access_secret.as_bytes())?;
+        Ok(cookie(config.domain.as_str(), &signed, TTL_SECONDS))
     }
-    if !UserRow::has_available_email(
-        state.database(),
-        std::slice::from_ref(&address),
-    )
-    .await?
-    {
-        return Err(AppError::conflict(
-            "An account with this email already exists",
-        ));
+
+    pub(crate) async fn authorize_registration(
+        &self,
+        headers: &HeaderMap,
+        requested_email: &str,
+    ) -> AppResult<String> {
+        let Self {
+            db,
+            env,
+            config,
+            access_secret,
+        } = *self;
+        let emails = allowed_emails(config)?;
+        verify_credential(
+            env,
+            &config.domain,
+            access_secret,
+            headers,
+            &registration_scope(emails),
+        )?;
+        // Allowlist parsing accepts ordinary spaces around addresses.
+        let requested_email = requested_email.trim_matches(' ');
+        let address = emails
+            .iter()
+            .find(|address| address.eq_ignore_ascii_case(requested_email))
+            .ok_or_else(AppError::setup_authorization_required)?;
+        if !UserRow::has_available_email(db, std::slice::from_ref(address)).await? {
+            return Err(AppError::conflict(
+                "An account with this email already exists",
+            ));
+        }
+        Ok(address.clone())
     }
-    Ok(address)
+
+    pub(crate) async fn registration_enabled(&self, headers: &HeaderMap) -> AppResult<bool> {
+        let Self {
+            db,
+            env,
+            config,
+            access_secret,
+        } = *self;
+        if !headers.contains_key(TOKEN_HEADER) && cookie_value(headers)?.is_none() {
+            return Ok(false);
+        }
+        let emails = allowed_emails(config)?;
+        if verify_credential(
+            env,
+            &config.domain,
+            access_secret,
+            headers,
+            &registration_scope(emails),
+        )
+        .is_err()
+        {
+            return Ok(false);
+        }
+        UserRow::has_available_email(db, emails).await
+    }
 }
 
-pub(crate) async fn registration_enabled(
-    state: &AppContext,
-    headers: &HeaderMap,
-) -> AppResult<bool> {
-    if !headers.contains_key(TOKEN_HEADER) && cookie_value(headers)?.is_none() {
-        return Ok(false);
-    }
-    let emails = allowed_emails(state)?;
-    if verify_credential(state, headers, &registration_scope(emails)).is_err() {
-        return Ok(false);
-    }
-    UserRow::has_available_email(state.database(), emails).await
-}
-
-pub(crate) fn clear_cookie(state: &AppContext) -> String {
-    cookie(state.domain(), "", 0)
+pub(crate) fn clear_cookie(domain: &str) -> String {
+    cookie(domain, "", 0)
 }
 
 #[cfg(test)]
@@ -282,29 +277,21 @@ mod tests {
         let secret = "test-signing-key";
         let now = crate::utils::time::now_seconds();
         let mut proof = SetupClaims {
-            sub:     "owner@example.test".into(),
-            aud:     "https://vault.test".into(),
+            sub: "owner@example.test".into(),
+            aud: "https://vault.test".into(),
             purpose: PURPOSE.into(),
-            exp:     now + TTL_SECONDS,
-            nbf:     now,
-            iat:     now,
+            exp: now + TTL_SECONDS,
+            nbf: now,
+            iat: now,
         };
-        let signed = jwt::encode(&proof, secret.as_bytes())
-            .expect("valid setup fixture");
+        let signed = jwt::encode(&proof, secret.as_bytes()).expect("valid setup fixture");
         assert!(verify_cookie(&signed, secret, &proof.sub, &proof.aud).is_ok());
-        assert!(
-            verify_cookie(&signed, secret, "other@example.test", &proof.aud)
-                .is_err()
-        );
-        assert!(
-            verify_cookie(&signed, secret, &proof.sub, "https://other.test")
-                .is_err()
-        );
+        assert!(verify_cookie(&signed, secret, "other@example.test", &proof.aud).is_err());
+        assert!(verify_cookie(&signed, secret, &proof.sub, "https://other.test").is_err());
         proof.purpose = "email-factor".into();
         assert!(
             verify_cookie(
-                &jwt::encode(&proof, secret.as_bytes())
-                    .expect("valid setup fixture"),
+                &jwt::encode(&proof, secret.as_bytes()).expect("valid setup fixture"),
                 secret,
                 &proof.sub,
                 &proof.aud
@@ -317,8 +304,7 @@ mod tests {
         proof.exp = now;
         assert!(
             verify_cookie(
-                &jwt::encode(&proof, secret.as_bytes())
-                    .expect("valid setup fixture"),
+                &jwt::encode(&proof, secret.as_bytes()).expect("valid setup fixture"),
                 secret,
                 &proof.sub,
                 &proof.aud
@@ -330,9 +316,7 @@ mod tests {
     #[test]
     fn cookie_security_follows_the_configured_origin_and_rejects_duplicates() {
         assert!(cookie("https://vault.test", "test", 600).contains("; Secure"));
-        assert!(
-            !cookie("http://localhost:8787", "test", 600).contains("; Secure")
-        );
+        assert!(!cookie("http://localhost:8787", "test", 600).contains("; Secure"));
         let mut headers = HeaderMap::new();
         headers.insert(
             header::COOKIE,

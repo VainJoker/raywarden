@@ -1,34 +1,25 @@
 //! Atomic D1 assertions and writes with a monotonic vault revision.
+use serde::Deserialize;
 use wasm_bindgen::JsValue;
-use worker::{
-    D1Database,
-    D1PreparedStatement,
-};
+use worker::{D1Database, D1PreparedStatement};
 
 use crate::{
-    errors::{
-        AppError,
-        AppResult,
-        DatabaseError,
-    },
+    errors::{AppError, AppResult, DatabaseError, DbSentinel},
     infra::db,
     models::{
-        identity::{
-            account_keys::AccountSnapshot,
-            device::SessionSnapshot,
-        },
+        identity::{account_keys::AccountSnapshot, device::SessionSnapshot},
         vault::cipher::CipherRow,
     },
 };
 
-pub const CONFLICT_SENTINEL: &str = "RAY_VAULT_WRITE_CONFLICT";
-const SESSION_SENTINEL: &str = "RAY_VAULT_WRITE_SESSION";
-pub(crate) const ATTACHMENT_QUOTA_SENTINEL: &str =
-    "RAY_ATTACHMENT_QUOTA_EXCEEDED";
-pub(crate) const NEXT_USER_REVISION_SQL: &str =
-    "CASE WHEN julianday(updated_at) >= julianday(?1) THEN \
+pub(crate) const NEXT_USER_REVISION_SQL: &str = "CASE WHEN julianday(updated_at) >= julianday(?1) THEN \
      strftime('%Y-%m-%dT%H:%M:%fZ', julianday(updated_at) + 1.0 / 86400000) \
      ELSE ?1 END";
+
+#[derive(Deserialize)]
+pub(super) struct RevisionRow {
+    pub(super) updated_at: String,
+}
 
 /// Use the same monotonic cursor expression with an existing bind position.
 pub(crate) fn next_user_revision_sql(parameter: usize) -> String {
@@ -40,10 +31,10 @@ pub fn guard(
     predicate: &str,
     values: &[JsValue],
 ) -> AppResult<D1PreparedStatement> {
+    let abort = DbSentinel::VaultWriteConflict.sql_abort_expr();
     Ok(db
         .prepare(format!(
-            "SELECT CASE WHEN ({predicate}) THEN 1 ELSE json_extract('[]', \
-             '{CONFLICT_SENTINEL}') END"
+            "SELECT CASE WHEN ({predicate}) THEN 1 ELSE {abort} END"
         ))
         .bind(values)?)
 }
@@ -52,27 +43,24 @@ pub(crate) fn cipher_snapshot_guard(
     db: &D1Database,
     row: &CipherRow,
 ) -> AppResult<D1PreparedStatement> {
-    fn optional(value: Option<&str>) -> JsValue {
-        value.map_or(JsValue::NULL, JsValue::from_str)
-    }
     guard(
         db,
         "EXISTS(SELECT 1 FROM ciphers WHERE id=?1 AND user_id=?2 AND \
          organization_id IS ?3 AND cipher_type IS ?4 AND data IS ?5 AND \
          is_favorite IS ?6 AND folder_id IS ?7 AND deleted_at IS ?8 AND \
          archived_at IS ?9 AND created_at IS ?10 AND updated_at IS ?11)",
-        &[
-            row.id.clone().into(),
-            row.user_id.clone().into(),
-            optional(row.organization_id.as_deref()),
-            row.cipher_type.into(),
-            row.data.clone().into(),
-            row.is_favorite.into(),
-            optional(row.folder_id.as_deref()),
-            optional(row.deleted_at.as_deref()),
-            optional(row.archived_at.as_deref()),
-            row.created_at.clone().into(),
-            row.updated_at.clone().into(),
+        &db::d1_params![
+            row.id,
+            row.user_id,
+            row.organization_id,
+            row.cipher_type,
+            row.data,
+            row.is_favorite,
+            row.folder_id,
+            row.deleted_at,
+            row.archived_at,
+            row.created_at,
+            row.updated_at,
         ],
     )
 }
@@ -86,7 +74,7 @@ pub(crate) fn folder_guard(
         db,
         "?1 IS NULL OR EXISTS(SELECT 1 FROM folders WHERE id=?1 AND \
          user_id=?2)",
-        &[folder.map_or(JsValue::NULL, JsValue::from_str), user.into()],
+        &db::d1_params![folder, user],
     )
 }
 pub async fn account_snapshot_guard(
@@ -100,7 +88,7 @@ pub async fn account_snapshot_guard(
             "EXISTS(SELECT 1 FROM users WHERE id = ?1 AND ({}))",
             AccountSnapshot::matches_sql(2)
         ),
-        &[user_id.into(), snapshot.to_json()?.into()],
+        &db::d1_params![user_id, snapshot.to_json()?],
     )?;
     Ok((snapshot, assertion))
 }
@@ -111,19 +99,20 @@ pub async fn commit_session(
     guards: Vec<D1PreparedStatement>,
     writes: Vec<D1PreparedStatement>,
 ) -> AppResult<String> {
+    let abort = DbSentinel::VaultWriteSession.sql_abort_expr();
     let session = db
         .prepare(format!(
             "SELECT CASE WHEN EXISTS(
         SELECT 1 FROM users u JOIN devices d ON d.user_id=u.id
         WHERE u.id=?1 AND u.security_stamp IS ?2 AND d.device_id=?3 AND \
              d.session_token=?4
-    ) THEN 1 ELSE json_extract('[]', '{SESSION_SENTINEL}') END"
+    ) THEN 1 ELSE {abort} END"
         ))
-        .bind(&[
-            snapshot.user_id.into(),
-            snapshot.security_stamp.into(),
-            snapshot.device_id.into(),
-            snapshot.session_token.into(),
+        .bind(&db::d1_params![
+            snapshot.user_id,
+            snapshot.security_stamp,
+            snapshot.device_id,
+            snapshot.session_token,
         ])?;
     let mut guards = guards;
     guards.insert(0, session);
@@ -147,17 +136,16 @@ pub async fn commit(
             "UPDATE users SET updated_at = {NEXT_USER_REVISION_SQL} WHERE id \
              = ?2 RETURNING updated_at"
         ))
-        .bind(&[crate::utils::time::now_rfc3339().into(), user_id.into()])?,
+        .bind(&db::d1_params![crate::utils::time::now_rfc3339(), user_id])?,
     );
     let results = db.batch(statements).await.map_err(map_database_error)?;
     results
         .last()
         .ok_or(AppError::Internal)?
-        .results::<serde_json::Value>()?
-        .first()
-        .and_then(|row| row.get("updated_at"))
-        .and_then(serde_json::Value::as_str)
-        .map(str::to_owned)
+        .results::<RevisionRow>()?
+        .into_iter()
+        .next()
+        .map(|row| row.updated_at)
         .ok_or(AppError::Internal)
 }
 
@@ -183,10 +171,5 @@ pub(super) async fn batch_count_last_write(
 }
 
 pub fn map_database_error(error: worker::Error) -> AppError {
-    DatabaseError::vault_write(
-        error,
-        SESSION_SENTINEL,
-        CONFLICT_SENTINEL,
-        ATTACHMENT_QUOTA_SENTINEL,
-    )
+    DatabaseError::vault_write(error)
 }

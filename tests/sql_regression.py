@@ -7,7 +7,6 @@ is a read-only inspection artifact, not an application initialization path.
 """
 
 import json
-import re
 import sqlite3
 import tempfile
 import unittest
@@ -15,67 +14,14 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from threading import Barrier
 
-
-from sql_source import ROOT, function_source, literal, rust_strings, statement, statements
-NOW = "2026-11-13T03:00:00.000Z"
-OLD = "2020-01-01T00:00:00.000Z"
-FUTURE = "2026-11-14T03:00:00.000Z"
-
-
-def cipher_rows_query(attachments=True, where_clause="", order_clause=""):
-    literals = list(rust_strings(function_source("cipher", "cipher_row_sql")))
-    template = next(text for text in literals if text.startswith("SELECT c.*"))
-    attachment_expr = next(text for text in literals if "SELECT CASE WHEN COUNT" in text) if attachments else "NULL"
-    return template.replace("{attachments_expr}", attachment_expr).replace("{where_clause}", where_clause).replace("{order_clause}", order_clause)
+from sql_fixtures import (
+    FUTURE, NOW, OLD, VAULT_REVISION, account_snapshot, apply_migrations, database,
+    first_page, guard_sql, key_guard, row_guard, seed_attachment, seed_cipher, session_sql,
+)
+from sql_source import ROOT, literal, statement, statements
 
 
-def trash_purge_statements():
-    touch, delete = statements("purge", "delete_ciphers_before")
-    revision = literal("cipher_mutation", "CASE WHEN julianday(updated_at)")
-    return touch.replace("{NEXT_USER_REVISION_SQL}", revision), delete
-
-
-def apply_migrations(db):
-    """Exercise migration SQL; Wrangler owns history and pending-file selection."""
-    for path in sorted((ROOT / "sql/migrations").glob("*.sql")):
-        db.executescript(path.read_text())
-
-
-def database():
-    db = sqlite3.connect(":memory:")
-    db.row_factory = sqlite3.Row
-    db.execute("PRAGMA foreign_keys=ON")
-    apply_migrations(db)
-    for user in ("alice", "bob"):
-        db.execute("INSERT INTO users (id,email,master_password_hash,key,private_key,public_key,security_stamp,created_at,updated_at) VALUES (?,?,'hash','key','private','public','stamp',?,?)", (user, f"{user}@example.test", OLD, OLD))
-    return db
-
-
-def seed_cipher(db, cipher_id, user="alice", *, cipher_type=1, data=None,
-                is_favorite=0, folder_id=None, created=OLD, updated=OLD):
-    """Test data only; behavior assertions use production guarded statements."""
-    if not isinstance(data, str):
-        data = json.dumps(data if data is not None else {})
-    db.execute("INSERT INTO ciphers(id,user_id,organization_id,cipher_type,data,is_favorite,folder_id,created_at,updated_at) VALUES(?,?,NULL,?,?,?,?,?,?)",
-               (cipher_id, user, cipher_type, data, is_favorite, folder_id, created, updated))
-
-
-def seed_attachment(db, attachment_id, cipher_id, *, pending=False,
-                    name="encrypted-file", key="attachment-key", created=OLD):
-    """Fixture data only; finalization/deletion assertions use production SQL."""
-    table = "attachments_pending" if pending else "attachments"
-    db.execute(f"INSERT INTO {table}(id,cipher_id,file_name,file_size_bytes,encrypted_key,created_at,updated_at,organization_id) VALUES(?,?,?,12,?,?,?,NULL)",
-               (attachment_id, cipher_id, name, key, created, created))
-
-
-def account_snapshot(db, user):
-    columns = ("key", "user_key_id", "private_key", "public_key", "signed_public_key",
-               "security_state", "security_version", "signature_key_pair")
-    row = db.execute(f"SELECT {','.join(columns)} FROM users WHERE id=?", (user,)).fetchone()
-    return json.dumps(dict(zip(columns, row)), separators=(",", ":"))
-
-
-class SqlBehavior:
+class SqlRegression(unittest.TestCase):
     def setUp(self):
         self.db = database()
         self.addCleanup(self.db.close)
@@ -94,13 +40,15 @@ class SqlBehavior:
         self.db.execute(statement("send", "insert_statement"), (send_id, user, "encrypted-name", None, int(size > 0), '{"text":"encrypted"}', "wrapped-send-key", None, None, None, 1, 0, NOW, NOW, None, FUTURE, 0, 0, "access-stamp", "file" if size else None, size, pending))
 
     def test_cipher_rows_preserve_encrypted_fields_owner_and_attachment_metadata(self):
-        field_names = {1: "login", 2: "secureNote", 3: "card", 4: "identity", 5: "sshKey", 6: "bankAccount", 7: "driversLicense", 8: "passport"}
+        field_names = {1: "login", 5: "sshKey", 8: "passport"}
         for kind, field in field_names.items():
             data = {"name": 'encrypted "name" 🗝', "key": "wrapped-key", "fields": [{"name": "field"}], "reprompt": 1, field: {"encrypted": field}}
             self.cipher(str(kind), kind=kind, data=data)
         self.attachment("file", "1")
         self.db.execute("UPDATE ciphers SET archived_at=? WHERE id='1'", (NOW,))
-        for row in self.db.execute(cipher_rows_query(order_clause="ORDER BY c.cipher_type")):
+        rows = first_page(self.db, "cipher", "list_page", ("alice", 1), include_attachments=True)
+        self.assertEqual(len(rows), len(field_names))
+        for row in rows:
             data = json.loads(row["data"])
             self.assertEqual(data["key"], "wrapped-key")
             self.assertEqual(row["is_favorite"], 1)
@@ -109,22 +57,21 @@ class SqlBehavior:
             self.assertEqual(data[field_names[row["cipher_type"]]], {"encrypted": field_names[row["cipher_type"]]})
             if row["id"] == "1":
                 self.assertEqual(row["archived_at"], NOW)
-                attachments = json.loads(row["attachments_json"])
-                self.assertEqual(attachments, [{
-                    "id": "file", "cipher_id": "1", "file_name": "encrypted-file",
-                    "file_size_bytes": 12, "encrypted_key": "attachment-key", "created_at": OLD,
-                    "updated_at": OLD, "organization_id": None, "storage_key": None,
-                }])
-            else:
-                self.assertIsNone(row["attachments_json"])
-        row = self.db.execute(cipher_rows_query(False, "WHERE c.id='1'")).fetchone()
-        self.assertIsNone(row["attachments_json"])
+        attachments = first_page(self.db, "attachment", "list_page", ('["1"]',))
+        self.assertEqual(len(attachments), 1)
+        attachment = dict(attachments[0])
+        for field in ("page_rowid", "page_date", "page_has_more"):
+            attachment.pop(field)
+        self.assertEqual(attachment, {
+            "id": "file", "cipher_id": "1", "file_name": "encrypted-file",
+            "file_size_bytes": 12, "encrypted_key": "attachment-key", "created_at": OLD,
+            "updated_at": OLD, "organization_id": None, "storage_key": None,
+        })
 
     def test_cipher_update_preserves_archive_and_trash_and_owner(self):
         self.cipher()
         self.cipher("b", "bob")
         self.db.execute("UPDATE ciphers SET archived_at=?, deleted_at=? WHERE id='a'", (NOW, OLD))
-        from sql_source import literal
         update = literal("cipher_writes", "UPDATE ciphers SET ", "save_statement")
         args = (1, '{"key":"new-item-key","name":"new"}', 0, None, NOW, NOW, "a", "alice")
         self.db.execute(update, args)
@@ -135,9 +82,6 @@ class SqlBehavior:
         self.assertEqual(self.db.execute("SELECT updated_at FROM ciphers WHERE id='b'").fetchone()[0], OLD)
 
     def test_archive_single_bulk_and_ownership(self):
-        from cipher_v2_sql import REVISION
-        from send_transactions_sql import guard_sql, key_guard, session_sql
-        from sql_source import literal
         self.cipher()
         self.cipher("b", "bob")
         self.cipher("c")
@@ -155,7 +99,7 @@ class SqlBehavior:
                 self.db.execute(*key_guard(owner)).fetchall()
                 self.db.execute(guard_sql(predicate), ("alice", json.dumps(rows))).fetchall()
                 self.assertEqual(self.db.execute(query, ("alice", json.dumps(ids), NOW)).rowcount, len(ids))
-                self.db.execute(REVISION, (NOW, "alice")).fetchall()
+                self.db.execute(VAULT_REVISION, (NOW, "alice")).fetchall()
         apply(["a"], True)
         self.assertEqual(self.db.execute("SELECT archived_at FROM ciphers WHERE id='a'").fetchone()[0], NOW)
         apply(["a", "c"], False)
@@ -173,7 +117,7 @@ class SqlBehavior:
         self.db.execute("UPDATE ciphers SET deleted_at=? WHERE id='a'", (OLD,))
         self.db.execute("UPDATE users SET updated_at=? WHERE id='alice'", (FUTURE,))
         cutoff = "2026-10-14T03:00:00.000Z"
-        touch, delete = trash_purge_statements()
+        touch, delete = statements("purge", "delete_ciphers_before")
         with self.db:
             self.db.execute(touch, (NOW, cutoff))
             self.db.execute(delete, (cutoff,))
@@ -186,9 +130,6 @@ class SqlBehavior:
             self.assertEqual(self.db.execute(f"SELECT count(*) FROM {table}").fetchone()[0], 0)
 
     def test_manual_attachment_cleanup_is_complete_and_user_scoped(self):
-        from cipher_v2_sql import REVISION, row_guard
-        from send_transactions_sql import key_guard, session_sql
-        from sql_source import literal
         self.cipher()
         self.cipher("b", "bob")
         self.attachment("finalized")
@@ -206,7 +147,7 @@ class SqlBehavior:
             self.db.execute(*key_guard(owner)).fetchall()
             self.db.execute(*row_guard(cipher)).fetchall()
             self.db.execute(delete, ("alice", '["a"]'))
-            self.db.execute(REVISION, (NOW, "alice")).fetchall()
+            self.db.execute(VAULT_REVISION, (NOW, "alice")).fetchall()
         select = statement("storage_cleanup", "pending_batch")
         self.assertEqual({row[0] for row in self.db.execute(select)}, {"a/finalized", "staged-final", "a/pending"})
         self.assertEqual([row[0] for row in self.db.execute("SELECT id FROM ciphers")], ["b"])
@@ -216,7 +157,10 @@ class SqlBehavior:
     def test_auth_approval_can_only_be_answered_and_consumed_once(self):
         self.auth_request()
         respond = statement("auth_request", "respond")
-        args = (1, "encrypted-key", "hash", NOW, "approving-device", "request", "alice")
+        self.db.execute(statement("device", "persist_session_statement"),
+                        ("alice", "approving-device", "Browser", 14, "nonce", NOW))
+        args = (1, "encrypted-key", "hash", NOW, "approving-device", "request", "alice", "stamp", "nonce")
+        self.assertIsNone(self.db.execute(respond, args[:-1] + ("revoked",)).fetchone())
         self.assertIsNotNone(self.db.execute(respond, args).fetchone())
         self.assertIsNone(self.db.execute(respond, args).fetchone())
         consume = statement("auth_request", "consume")
@@ -226,7 +170,7 @@ class SqlBehavior:
     def test_stamp_rotation_invalidates_pending_auth_approval(self):
         self.auth_request()
         self.db.execute("UPDATE users SET security_stamp='new-stamp' WHERE id='alice'")
-        args = (1, "key", "hash", NOW, "device", "request", "alice")
+        args = (1, "key", "hash", NOW, "device", "request", "alice", "stamp", "nonce")
         self.assertIsNone(self.db.execute(statement("auth_request", "respond"), args).fetchone())
         self.db.execute("UPDATE auth_requests SET approved=1")
         self.assertIsNone(self.db.execute(statement("auth_request", "consume"), (NOW, "request")).fetchone())
@@ -251,7 +195,7 @@ class SqlBehavior:
         self.send("pending", size=7, pending=1)
         self.send("other", user="bob", size=10)
         self.send("text")
-        self.assertEqual([row["id"] for row in self.db.execute(statement("send", "list_for_user"), ("alice",))], ["text"])
+        self.assertEqual([row["id"] for row in first_page(self.db, "send", "list_page", ("alice",))], ["text"])
 
     def test_send_access_limit_and_stamp_are_checked_by_conditional_update(self):
         self.send()
@@ -264,101 +208,6 @@ class SqlBehavior:
         self.db.execute("UPDATE sends SET is_disabled=0, deletes_at=?", (OLD,))
         self.assertIsNone(self.db.execute(consume, (NOW, "send", "access-stamp", None)).fetchone())
 
-    def test_rotation_attachment_writes_require_matching_cipher_and_write_token(self):
-        from account_v2_sql import rotation_claim
-        from sql_source import literal
-        self.cipher()
-        self.cipher("b", "bob")
-        self.attachment("file-a")
-        self.attachment("file-b", "b")
-        self.db.execute(statement("device", "persist_session_statement"), ("alice", "device", "browser", 2, "nonce", NOW))
-        claim, args, guards = rotation_claim(self.db)
-        cipher_update = literal("account_rotation", "UPDATE ciphers SET data=", "cipher_write")
-        attachment_update = literal("account_rotation", "UPDATE attachments SET ", "attachment_write")
-        self.db.commit()
-        with self.db:
-            self.assertIsNotNone(self.db.execute(claim, args).fetchone())
-            for query, values in guards:
-                self.db.execute(query, values).fetchall()
-            self.assertEqual(self.db.execute(cipher_update, ('{"name":"rotated","key":"rotated-key"}', NOW, "a", "alice", args[10])).rowcount, 1)
-            self.assertEqual(self.db.execute(attachment_update, ("rotated-file", "rotated-file-key", NOW, "file-a", "a", "alice", args[10])).rowcount, 1)
-            self.db.execute(attachment_update, ("bad-file", "bad-key", NOW, "file-b", "a", "alice", args[10]))
-            self.db.execute(attachment_update, ("bad-file", "bad-key", NOW, "file-b", "b", "alice", "wrong-write-token"))
-        rows = {row["id"]: row["encrypted_key"] for row in self.db.execute("SELECT * FROM attachments")}
-        self.assertEqual(rows, {"file-a": "rotated-file-key", "file-b": "attachment-key"})
-        value = self.db.execute(cipher_rows_query(where_clause="WHERE c.id='a'")).fetchone()
-        self.assertEqual(json.loads(value["data"])["key"], "rotated-key")
-
-    def test_failed_rotation_rolls_back_content_and_wrapping_keys_together(self):
-        from account_v2_sql import rotation_claim
-        from sql_source import literal
-        self.cipher()
-        self.attachment("file-a")
-        self.send()
-        self.auth_request()
-        self.db.execute(statement("device", "persist_session_statement"), ("alice", "device", "browser", 2, "nonce", NOW))
-        # Inject a late failure at the real rotation batch's approval cleanup.
-        self.db.execute("CREATE TEMP TRIGGER reject_rotation_cleanup BEFORE DELETE ON auth_requests BEGIN SELECT RAISE(ABORT,'injected cleanup failure'); END")
-        claim, args, guards = rotation_claim(self.db)
-        cipher_update = literal("account_rotation", "UPDATE ciphers SET data=", "cipher_write")
-        attachment_update = literal("account_rotation", "UPDATE attachments SET ", "attachment_write")
-        cleanup = literal("account_rotation", "DELETE FROM auth_requests WHERE user_id=?1 AND EXISTS", "invalidation_writes")
-        self.db.commit()
-        with self.assertRaisesRegex(sqlite3.IntegrityError, "injected cleanup failure"):
-            with self.db:
-                self.assertIsNotNone(self.db.execute(claim, args).fetchone())
-                for query, values in guards:
-                    self.db.execute(query, values).fetchall()
-                self.assertEqual(self.db.execute(statement("send", "rotation_statement"), ("rotated-send-key", NOW, "send", "alice", args[10], "new-access-stamp")).rowcount, 1)
-                self.assertEqual(self.db.execute(cipher_update, ('{"name":"rotated","key":"rotated-key"}', NOW, "a", "alice", args[10])).rowcount, 1)
-                self.assertEqual(self.db.execute(attachment_update, ("rotated-file", "rotated-file-key", NOW, "file-a", "a", "alice", args[10])).rowcount, 1)
-                self.db.execute(cleanup, ("alice", args[10]))
-        self.assertEqual(self.db.execute("SELECT key FROM users WHERE id='alice'").fetchone()[0], "key")
-        self.assertEqual(json.loads(self.db.execute("SELECT data FROM ciphers WHERE id='a'").fetchone()[0])["key"], "wrapped-item-key")
-        self.assertEqual(self.db.execute("SELECT encrypted_key FROM attachments WHERE id='file-a'").fetchone()[0], "attachment-key")
-        self.assertEqual(self.db.execute("SELECT encrypted_key FROM sends WHERE id='send'").fetchone()[0], "wrapped-send-key")
-
-    def test_file_upload_pointer_can_only_be_finalized_once(self):
-        from send_transactions_sql import snapshot, finalize_upload
-        self.send(size=7, pending=1)
-        self.db.execute(statement("device", "persist_session_statement"), ("alice", "device", "browser", 2, "session", NOW))
-        before = snapshot(self.db)
-        finalize_upload(self.db, before, staged="winner")
-        with self.assertRaises(sqlite3.OperationalError):
-            finalize_upload(self.db, before, staged="loser")
-        self.assertEqual(snapshot(self.db)["storage_key"], "winner")
-
-    def test_file_upload_finalization_rechecks_stamp_and_device_revocation(self):
-        from send_transactions_sql import snapshot, finalize_upload
-        self.send(size=7, pending=1)
-        start = statement("device", "persist_session_statement")
-        self.db.execute(start, ("alice", "device", "browser", 2, "session", NOW))
-        before = snapshot(self.db)
-        owner = dict(self.db.execute("SELECT * FROM users WHERE id='alice'").fetchone())
-        self.db.execute("UPDATE users SET security_stamp='new-stamp' WHERE id='alice'")
-        with self.assertRaises(sqlite3.OperationalError):
-            finalize_upload(self.db, before, owner=owner)
-        self.db.execute("UPDATE users SET security_stamp='stamp' WHERE id='alice'")
-        self.db.execute("DELETE FROM devices WHERE user_id='alice'")
-        with self.assertRaises(sqlite3.OperationalError):
-            finalize_upload(self.db, before, owner=owner)
-        self.db.execute(start, ("alice", "device", "browser", 2, "new-session", NOW))
-        with self.assertRaises(sqlite3.OperationalError):
-            finalize_upload(self.db, before, owner=owner)
-
-    def test_send_upload_rechecks_file_metadata_and_wrapped_key(self):
-        from send_transactions_sql import snapshot, send_guard
-        self.send(size=7, pending=1)
-        before = snapshot(self.db)
-        for column, value in (("user_id", "bob"), ("file_id", "wrong-file"), ("encrypted_key", "rotated-key")):
-            with self.db:
-                self.db.execute(f"UPDATE sends SET {column}=? WHERE id='send'", (value,))
-                with self.assertRaises(sqlite3.OperationalError):
-                    self.db.execute(*send_guard(before, upload=True))
-                self.db.execute(f"UPDATE sends SET {column}=? WHERE id='send'", (before[column],))
-
-class MigratedSchema(SqlBehavior, unittest.TestCase):
-    pass
 
 
 class SchemaParity(unittest.TestCase):

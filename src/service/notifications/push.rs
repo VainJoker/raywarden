@@ -1,90 +1,48 @@
-use std::sync::{
-    Mutex,
-    OnceLock,
-};
+use std::sync::{Mutex, OnceLock};
 
 use serde::Deserialize;
-use serde_json::{
-    Value,
-    json,
-};
-use sha2::{
-    Digest as _,
-    Sha256,
-};
-use worker::{
-    Env,
-    Fetch,
-    Method,
-    Request,
-    RequestInit,
-    wasm_bindgen::JsValue,
-};
+use serde_json::{Value, json};
+use sha2::{Digest as _, Sha256};
+use worker::{Env, Method, Request, RequestInit, RequestRedirect, wasm_bindgen::JsValue};
 
-use super::UpdateType;
+use super::{UpdateType, send_delivery_request};
 use crate::{
-    errors::{
-        AppError,
-        AppResult,
-        ConfigError,
+    errors::{AppError, AppResult},
+    infra::{
+        config::{EnvReader, env_bool},
+        db,
     },
-    infra::db,
-    models::identity::device::{
-        PushDeviceRow,
-        PushStore,
-    },
+    models::identity::push::{self as push_model, PushDeviceRow},
 };
 
 #[derive(Debug, Clone)]
 struct PushConfig {
-    relay_uri:        String,
-    identity_uri:     String,
-    installation_id:  String,
+    relay_uri: String,
+    identity_uri: String,
+    installation_id: String,
     installation_key: String,
 }
 
 impl PushConfig {
     fn from_env(env: &Env) -> AppResult<Option<Self>> {
-        let enabled = env.var("PUSH_ENABLED").is_ok_and(|v| {
-            matches!(
-                v.to_string().trim().to_lowercase().as_str(),
-                "1" | "true" | "yes" | "on"
-            )
-        });
-        if !enabled {
+        if !env_bool(env, "PUSH_ENABLED", false) {
             return Ok(None);
         }
-        let get_secret = |name: &str| {
-            env.secret(name)
-                .map(|value| value.to_string())
-                .map_err(|_error| {
-                    AppError::Config(ConfigError::Missing(name.to_string()))
-                })
-        };
-        let relay_uri = env.var("PUSH_RELAY_URI").map_or_else(
-            |_| "https://push.bitwarden.com".to_string(),
-            |v| v.to_string(),
-        );
-        let identity_uri = env.var("PUSH_IDENTITY_URI").map_or_else(
-            |_| "https://identity.bitwarden.com".to_string(),
-            |v| v.to_string(),
-        );
-        if !relay_uri.starts_with("https://") ||
-            !identity_uri.starts_with("https://")
-        {
+        let reader = EnvReader(env);
+        let relay_uri = reader.value_or("PUSH_RELAY_URI", "https://push.bitwarden.com");
+        let identity_uri = reader.value_or("PUSH_IDENTITY_URI", "https://identity.bitwarden.com");
+        if !relay_uri.starts_with("https://") || !identity_uri.starts_with("https://") {
             return Err(AppError::bad_request(
                 "Push relay and identity URLs must use HTTPS",
             ));
         }
         let config = Self {
-            relay_uri:        relay_uri.trim_end_matches('/').to_string(),
-            identity_uri:     identity_uri.trim_end_matches('/').to_string(),
-            installation_id:  get_secret("PUSH_INSTALLATION_ID")?,
-            installation_key: get_secret("PUSH_INSTALLATION_KEY")?,
+            relay_uri: relay_uri.trim_end_matches('/').to_string(),
+            identity_uri: identity_uri.trim_end_matches('/').to_string(),
+            installation_id: reader.required_secret("PUSH_INSTALLATION_ID")?,
+            installation_key: reader.required_secret("PUSH_INSTALLATION_KEY")?,
         };
-        if config.installation_id.is_empty() ||
-            config.installation_key.is_empty()
-        {
+        if config.installation_id.is_empty() || config.installation_key.is_empty() {
             return Err(AppError::bad_request(
                 "Push installation credentials must not be empty",
             ));
@@ -108,28 +66,24 @@ impl PushConfig {
 #[derive(Clone)]
 struct CachedToken {
     fingerprint: String,
-    token:       String,
-    expires_at:  i64,
+    token: String,
+    expires_at: i64,
 }
 static TOKEN_CACHE: OnceLock<Mutex<Option<CachedToken>>> = OnceLock::new();
 
 #[derive(Deserialize)]
 struct TokenResponse {
     access_token: String,
-    expires_in:   i64,
+    expires_in: i64,
 }
 
 fn form_encode(value: &str) -> String {
     let mut result = String::new();
     for byte in value.bytes() {
         match byte {
-            b'A'..=b'Z' |
-            b'a'..=b'z' |
-            b'0'..=b'9' |
-            b'-' |
-            b'_' |
-            b'.' |
-            b'~' => result.push(char::from(byte)),
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                result.push(char::from(byte));
+            }
             _ => {
                 use std::fmt::Write as _;
                 let _ = write!(result, "%{byte:02X}");
@@ -143,9 +97,9 @@ async fn relay_token(config: &PushConfig) -> AppResult<String> {
     let fingerprint = config.fingerprint();
     let cache = TOKEN_CACHE.get_or_init(|| Mutex::new(None));
     let cached = cache.lock().ok().and_then(|value| value.clone());
-    if let Some(cached) = cached &&
-        cached.fingerprint == fingerprint &&
-        cached.expires_at > crate::utils::time::now_seconds()
+    if let Some(cached) = cached
+        && cached.fingerprint == fingerprint
+        && cached.expires_at > crate::utils::time::now_seconds()
     {
         return Ok(cached.token);
     }
@@ -157,15 +111,14 @@ async fn relay_token(config: &PushConfig) -> AppResult<String> {
     );
     let mut init = RequestInit::new();
     init.with_method(Method::Post)
+        .with_redirect(RequestRedirect::Manual)
         .with_body(Some(JsValue::from_str(&body)));
-    let mut request = Request::new_with_init(
-        &format!("{}/connect/token", config.identity_uri),
-        &init,
-    )?;
+    let mut request =
+        Request::new_with_init(&format!("{}/connect/token", config.identity_uri), &init)?;
     request
         .headers_mut()?
         .set("content-type", "application/x-www-form-urlencoded")?;
-    let mut response = Fetch::Request(request).send().await?;
+    let mut response = send_delivery_request(request).await?;
     if !(200..300).contains(&response.status_code()) {
         return Err(AppError::Internal);
     }
@@ -185,11 +138,7 @@ async fn relay_token(config: &PushConfig) -> AppResult<String> {
     Ok(token.access_token)
 }
 
-async fn post(
-    config: &PushConfig,
-    path: &str,
-    payload: Option<&Value>,
-) -> AppResult<()> {
+async fn post(config: &PushConfig, path: &str, payload: Option<&Value>) -> AppResult<()> {
     let token = relay_token(config).await?;
     let body = payload
         .map(serde_json::to_string)
@@ -197,16 +146,16 @@ async fn post(
         .map_err(AppError::internal_error)?;
     let mut init = RequestInit::new();
     init.with_method(Method::Post)
+        .with_redirect(RequestRedirect::Manual)
         .with_body(body.as_deref().map(JsValue::from_str));
-    let mut request =
-        Request::new_with_init(&format!("{}{path}", config.relay_uri), &init)?;
+    let mut request = Request::new_with_init(&format!("{}{path}", config.relay_uri), &init)?;
     request
         .headers_mut()?
         .set("authorization", &format!("Bearer {token}"))?;
     request
         .headers_mut()?
         .set("content-type", "application/json")?;
-    let response = Fetch::Request(request).send().await?;
+    let response = send_delivery_request(request).await?;
     if !(200..300).contains(&response.status_code()) {
         return Err(AppError::Internal);
     }
@@ -215,16 +164,12 @@ async fn post(
 
 /// Push registration failure is reported to the caller so an enabled but
 /// misconfigured relay does not pretend that mobile delivery works.
-pub async fn register_device(
-    env: &Env,
-    user_id: &str,
-    device_id: &str,
-) -> AppResult<()> {
+pub async fn register_device(env: &Env, user_id: &str, device_id: &str) -> AppResult<()> {
     let Some(config) = PushConfig::from_env(env)? else {
         return Ok(());
     };
     let db = db::binding(env)?;
-    let device = PushStore::find_for_user(&db, user_id, device_id)
+    let device = push_model::find_for_user(&db, user_id, device_id)
         .await?
         .ok_or_else(|| AppError::not_found("Device"))?;
     if !matches!(device.device_type, 0 | 1) {
@@ -237,63 +182,54 @@ pub async fn register_device(
     else {
         return Ok(());
     };
-    let Some(id) = crate::service::notifications::push::ensure_push_id(
-        &db, user_id, device_id,
-    )
-    .await?
+    let Some(id) =
+        crate::service::notifications::push::ensure_push_id(&db, user_id, device_id).await?
     else {
         return Err(AppError::not_found("Device"));
     };
-    post(&config,"/push/register",Some(&json!({
-        "deviceId":id,"pushToken":token,"userId":user_id,"type":device.device_type,
-        "identifier":device_id,"installationId":config.installation_id
-    }))).await
+    post(
+        &config,
+        "/push/register",
+        Some(&json!({
+            "deviceId":id,"pushToken":token,"userId":user_id,"type":device.device_type,
+            "identifier":device_id,"installationId":config.installation_id
+        })),
+    )
+    .await
 }
 
-pub async fn unregister_device(
-    env: &Env,
-    user_id: &str,
-    device_id: &str,
-) -> AppResult<()> {
+pub async fn unregister_device(env: &Env, user_id: &str, device_id: &str) -> AppResult<()> {
     let Some(config) = PushConfig::from_env(env)? else {
         return Ok(());
     };
     let db = db::binding(env)?;
-    let Some(device) =
-        PushStore::find_for_user(&db, user_id, device_id).await?
-    else {
+    let Some(device) = push_model::find_for_user(&db, user_id, device_id).await? else {
         return Ok(());
     };
     unregister(&config, &device).await
 }
 
-async fn unregister(
-    config: &PushConfig,
-    device: &PushDeviceRow,
-) -> AppResult<()> {
+async fn unregister(config: &PushConfig, device: &PushDeviceRow) -> AppResult<()> {
     if let Some(id) = &device.push_id {
-        post(config, &format!("/push/delete/{}", form_encode(id)), None)
-            .await?;
+        post(config, &format!("/push/delete/{}", form_encode(id)), None).await?;
     }
     Ok(())
 }
 
-/// Call before deleting device rows. Relay failure must not prevent local
-/// logout/account deletion, so cleanup is best effort and logged.
-pub async fn unregister_user(env: &Env, user_id: &str) {
-    let result = async {
-        let Some(config) = PushConfig::from_env(env)? else {
-            return Ok::<(), AppError>(());
-        };
-        let db = db::binding(env)?;
-        for device in PushStore::list_for_user(&db, user_id).await? {
-            unregister(&config, &device).await?;
+/// Unregister relay IDs captured in the committed session-revocation batch.
+pub async fn unregister_devices(env: &Env, devices: &[PushDeviceRow]) {
+    let config = match PushConfig::from_env(env) {
+        Ok(Some(config)) => config,
+        Ok(None) => return,
+        Err(error) => {
+            log::warn!("Push configuration rejected after session revocation: {error}");
+            return;
         }
-        Ok(())
-    }
-    .await;
-    if let Err(error) = result {
-        log::warn!("Push device cleanup failed: {error}");
+    };
+    for device in devices {
+        if let Err(error) = unregister(&config, device).await {
+            log::warn!("Push device cleanup failed: {error}");
+        }
     }
 }
 
@@ -308,9 +244,8 @@ pub async fn send_update(
         return Ok(());
     };
     let db = db::binding(env)?;
-    let devices = PushStore::list_for_user(&db, user_id).await?;
-    send_update_to(&config, &devices, user_id, update_type, payload, context_id)
-        .await
+    let devices = push_model::list_for_user(&db, user_id).await?;
+    send_update_to(&config, &devices, user_id, update_type, payload, context_id).await
 }
 
 async fn send_update_to(
@@ -321,13 +256,13 @@ async fn send_update_to(
     payload: &Value,
     context_id: Option<&str>,
 ) -> AppResult<()> {
-    if !devices.iter().any(|device| {
-        device.push_token.is_some() && matches!(device.device_type, 0 | 1)
-    }) {
+    if !devices
+        .iter()
+        .any(|device| device.push_token.is_some() && matches!(device.device_type, 0 | 1))
+    {
         return Ok(());
     }
-    let current = context_id
-        .and_then(|id| devices.iter().find(|device| device.device_id == id));
+    let current = context_id.and_then(|id| devices.iter().find(|device| device.device_id == id));
     post(
         config,
         "/push/send",
@@ -353,9 +288,7 @@ pub(super) async fn logout_deleted_user(
         Ok(Some(config)) => config,
         Ok(None) => return,
         Err(error) => {
-            log::warn!(
-                "Push configuration rejected for deleted account: {error}"
-            );
+            log::warn!("Push configuration rejected for deleted account: {error}");
             return;
         }
     };
@@ -384,13 +317,7 @@ pub async fn ensure_push_id(
     user_id: &str,
     device_id: &str,
 ) -> AppResult<Option<String>> {
-    PushStore::assign_uuid(
-        db,
-        user_id,
-        device_id,
-        &uuid::Uuid::new_v4().to_string(),
-    )
-    .await
+    push_model::assign_uuid(db, user_id, device_id, &uuid::Uuid::new_v4().to_string()).await
 }
 
 #[cfg(test)]

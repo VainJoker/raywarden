@@ -1,35 +1,15 @@
 //! Coordinate scheduled maintenance across application features.
 
-use jiff::{
-    SignedDuration,
-    Timestamp,
-};
-use worker::{
-    D1Database,
-    Env,
-};
+use jiff::{SignedDuration, Timestamp};
+use worker::{D1Database, Env};
 
-use super::{
-    send,
-    storage_cleanup,
-    vault::domains,
-};
+use super::{send, storage_cleanup, vault::domains};
 use crate::{
-    errors::{
-        AppResult,
-        ConfigError,
-    },
-    infra::db,
+    errors::{AppResult, ConfigError},
+    infra::{config::trash_retention_days, db},
     models::{
-        identity::{
-            auth_request::AuthRequestRow,
-            email::EmailStore,
-            webauthn::WebauthnChallengeRow,
-        },
-        vault::{
-            attachment::AttachmentRow,
-            cipher::CipherRow,
-        },
+        identity::{auth_request::AuthRequestRow, email, webauthn::WebauthnChallengeRow},
+        vault::{attachment::AttachmentRow, cipher::CipherRow},
     },
 };
 
@@ -50,23 +30,21 @@ pub(crate) async fn run_maintenance(env: &Env) {
         "soft-deleted ciphers",
         purge_deleted_ciphers(env, &db).await,
     );
-    log_purge_result(
-        "expired sends",
-        send::purge_expired_sends(env, &db).await,
-    );
+    log_purge_result("expired sends", send::purge_expired_sends(env, &db).await);
     log_purge_result(
         "expired auth requests",
         AuthRequestRow::purge_expired(&db).await,
     );
+    if let Err(error) = storage_cleanup::expire_stages(&db).await {
+        log::error!("Staged file expiry failed: {error}");
+    }
     if let Err(error) = storage_cleanup::process_batch(env, &db).await {
         log::error!("Deferred file cleanup failed: {error}");
     }
     if let Err(error) = domains::refresh_global_domains(&db).await {
         log::warn!("Global domains refresh failed; keeping cache: {error}");
     }
-    if let Err(error) =
-        EmailStore::purge(&db, crate::utils::time::now_seconds()).await
-    {
+    if let Err(error) = email::purge(&db, crate::utils::time::now_seconds()).await {
         log::error!("Verification cleanup failed: {error}");
     }
     if let Err(error) = WebauthnChallengeRow::purge(&db).await {
@@ -82,39 +60,23 @@ fn log_purge_result(name: &str, result: AppResult<u32>) {
 }
 
 /// Default number of days to keep soft-deleted items before purging
-const DEFAULT_TRASH_RETENTION_DAYS: i64 = 30;
 /// Retain pending attachments for at most this many days before cleanup
 const PENDING_RETENTION_DAYS: i64 = 1;
 
 /// Get the purge threshold days from environment variable or use default
-fn trash_retention_days(env: &Env) -> i64 {
-    env.var("TRASH_AUTO_DELETE_DAYS")
-        .ok()
-        .and_then(|v| v.to_string().parse::<i64>().ok())
-        .unwrap_or(DEFAULT_TRASH_RETENTION_DAYS)
-}
-
 fn retention_cutoff(now: Timestamp, days: i64) -> Option<String> {
     days.checked_mul(86_400)
-        .and_then(|seconds| {
-            now.checked_sub(SignedDuration::from_secs(seconds)).ok()
-        })
+        .and_then(|seconds| now.checked_sub(SignedDuration::from_secs(seconds)).ok())
         .map(crate::utils::time::format_millis)
 }
 
 /// Purge pending attachments older than the retention window.
-async fn purge_stale_pending_attachments(
-    env: &Env,
-    db: &D1Database,
-) -> AppResult<u32> {
+async fn purge_stale_pending_attachments(env: &Env, db: &D1Database) -> AppResult<u32> {
     let now = crate::utils::time::now();
     let pending_cutoff_str = retention_cutoff(now, PENDING_RETENTION_DAYS)
-        .ok_or_else(|| {
-            ConfigError::Invalid("Invalid pending retention".into())
-        })?;
+        .ok_or_else(|| ConfigError::Invalid("Invalid pending retention".into()))?;
 
-    let pending_count =
-        AttachmentRow::purge_pending_before(db, &pending_cutoff_str).await?;
+    let pending_count = AttachmentRow::purge_pending_before(db, &pending_cutoff_str).await?;
 
     if let Err(error) = storage_cleanup::process_batch(env, db).await {
         log::warn!("Pending attachment object cleanup deferred: {error}");
@@ -132,20 +94,15 @@ async fn purge_deleted_ciphers(env: &Env, db: &D1Database) -> AppResult<u32> {
     }
 
     let now = crate::utils::time::now();
-    let cutoff_str =
-        retention_cutoff(now, retention_days).ok_or_else(|| {
-            ConfigError::Invalid(
-                "TRASH_AUTO_DELETE_DAYS exceeds the supported date range"
-                    .into(),
-            )
-        })?;
+    let cutoff_str = retention_cutoff(now, retention_days).ok_or_else(|| {
+        ConfigError::Invalid("TRASH_AUTO_DELETE_DAYS exceeds the supported date range".into())
+    })?;
     let now_str = crate::utils::time::format_millis(now);
 
-    let count =
-        CipherRow::delete_ciphers_before(db, &cutoff_str, &now_str).await?;
+    let count = CipherRow::delete_ciphers_before(db, &cutoff_str, &now_str).await?;
 
-    if count > 0 &&
-        let Err(error) = storage_cleanup::process_batch(env, db).await
+    if count > 0
+        && let Err(error) = storage_cleanup::process_batch(env, db).await
     {
         log::warn!("Purged cipher object cleanup deferred: {error}");
     }
@@ -161,8 +118,7 @@ mod tests {
 
     #[test]
     fn excessive_retention_returns_none_without_panicking() {
-        let now = crate::utils::time::parse("2026-11-13T03:00:00Z")
-            .expect("valid timestamp");
+        let now = crate::utils::time::parse("2026-11-13T03:00:00Z").expect("valid timestamp");
         assert_eq!(retention_cutoff(now, i64::MAX), None);
         assert_eq!(retention_cutoff(now, i64::MIN), None);
     }
@@ -172,8 +128,7 @@ mod tests {
             "2026-11-13T11:00:00.123+08:00",
             "2026-11-12T22:00:00.123-05:00",
         ] {
-            let now = crate::utils::time::parse(raw)
-                .expect("valid maintenance fixture");
+            let now = crate::utils::time::parse(raw).expect("valid maintenance fixture");
             assert_eq!(
                 retention_cutoff(now, 30).as_deref(),
                 Some("2026-10-14T03:00:00.123Z")

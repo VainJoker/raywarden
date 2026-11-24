@@ -1,16 +1,9 @@
 // Administrative events from the compiled Rust handlers. Only the synthetic
 // HTTPS sink is intercepted; no actual webhook or external network is used.
-function equal(actual, expected, label = "value") {
-  if (actual !== expected) throw new Error(`${label}: expected ${expected}, received ${actual}`);
-}
-function ok(value, label) { if (!value) throw new Error(label); }
+import { bearerJsonHeaders, equal, expectJson, expectStatus, ok } from "./runtime-assertions.mjs";
 
 export async function runAdminNotificationCompatibility({ fixture, check, accessToken, USER, sql }) {
-  async function status(response, expected) {
-    equal(response.status, expected, await response.clone().text());
-    return response;
-  }
-  const owner = async () => ({ Authorization: `Bearer ${await accessToken()}`, "Content-Type": "application/json" });
+  const owner = async () => bearerJsonHeaders(await accessToken());
   const login = (f, password = "hash") => f.fetch("/identity/connect/token", {
     method: "POST", headers: { "Content-Type": "application/x-www-form-urlencoded", "Bitwarden-Client-Version": "2026.10.2" },
     body: new URLSearchParams({ grant_type: "password", username: "owner@example.test", password,
@@ -27,6 +20,7 @@ export async function runAdminNotificationCompatibility({ fixture, check, access
       const request = input instanceof Request ? input : new Request(input, init);
       if (new URL(request.url).origin !== "https://notify.runtime.test") throw new Error("Unexpected outbound URL in administrative-event test");
       equal(request.method, "POST", "webhook method");
+      equal(request.redirect, "manual", "webhook redirect policy");
       const body = await request.json();
       equal(body.msgtype, "text", "WeWork payload");
       const text = body.text.content;
@@ -46,6 +40,65 @@ export async function runAdminNotificationCompatibility({ fixture, check, access
   };
   const event = text => text.split("\n")[0].slice("raywarden: ".length);
 
+  await check("mail webhooks reject redirects and release the undelivered code", async () => {
+    const f = fixture(), previous = globalThis.fetch;
+    const webhook = "https://mail.runtime.test/send";
+    f.env.MAIL_WEBHOOK_URL = webhook;
+    let calls = 0;
+    globalThis.fetch = async (input, init) => {
+      const request = input instanceof Request ? input : new Request(input, init);
+      calls++;
+      equal(request.url, webhook);
+      equal(request.redirect, "manual");
+      return new Response(null, { status: 307, headers: { Location: "https://other.runtime.test/send" } });
+    };
+    try {
+      await expectStatus(await f.fetch("/api/accounts/request-otp", { method: "POST", headers: await owner() }), 503);
+      equal(calls, 1);
+      equal(sql.exec("SELECT count(*) AS n FROM verification_codes").one().n, 0);
+    } finally {
+      globalThis.fetch = previous;
+    }
+  });
+
+  await check("webhook deadlines release stalled login and mail requests", async () => {
+    const f = fixture(), previous = globalThis.fetch;
+    configure(f, "login");
+    f.env.MAIL_WEBHOOK_URL = "https://mail.runtime.test/send";
+    const aborted = [];
+    globalThis.fetch = async (input, init) => {
+      const request = new Request(input, init);
+      return new Promise((_, reject) => {
+        const onAbort = () => {
+          clearTimeout(guard);
+          aborted.push(new URL(request.url).hostname);
+          reject(request.signal.reason);
+        };
+        const guard = setTimeout(() => {
+          request.signal.removeEventListener("abort", onAbort);
+          reject(new Error("notification request lacked a working deadline"));
+        }, 8_000);
+        if (request.signal.aborted) onAbort();
+        else request.signal.addEventListener("abort", onAbort, { once: true });
+      });
+    };
+    try {
+      const headers = await owner();
+      const [loggedIn, mail] = await Promise.all([
+        login(f), f.fetch("/api/accounts/request-otp", { method: "POST", headers }),
+      ]);
+      const tokens = await expectJson(loggedIn, 200);
+      equal((await expectJson(mail, 503)).code, 12);
+      equal(aborted.sort().join(","), "mail.runtime.test,notify.runtime.test");
+      equal(sql.exec("SELECT count(*) AS n FROM verification_codes").one().n, 0);
+      await expectStatus(await f.fetch("/api/accounts/profile", {
+        headers: { Authorization: `Bearer ${tokens.access_token}` },
+      }), 200);
+    } finally {
+      globalThis.fetch = previous;
+    }
+  });
+
   await check("administrative Send events follow successful commits and legacy filters do not double-send", async () => {
     const f = fixture(); configure(f, "vault-changed,send_create,send_delete");
     await sink(async captured => {
@@ -54,9 +107,9 @@ export async function runAdminNotificationCompatibility({ fixture, check, access
       ok(failed.status >= 400, "injected Send commit failed");
       equal(captured.length, 0, "failed transaction has no successful event");
       f.db.failBatch = false;
-      const send = await (await status(await createSend(f), 200)).json();
+      const send = await expectJson(await createSend(f), 200);
       equal(captured.length, 1); equal(event(captured[0]), "send_create");
-      await status(await f.fetch(`/api/sends/${send.id}`, { method: "DELETE", headers: await owner() }), 200);
+      await expectStatus(await f.fetch(`/api/sends/${send.id}`, { method: "DELETE", headers: await owner() }), 200);
       equal(captured.length, 2); equal(event(captured[1]), "send_delete");
     });
   });
@@ -64,17 +117,17 @@ export async function runAdminNotificationCompatibility({ fixture, check, access
   await check("administrative warning level reports failed login but not the normal two-factor challenge", async () => {
     const f = fixture(); configure(f, "all", "WARN");
     await sink(async captured => {
-      await status(await login(f, "wrong-password-secret"), 401);
+      await expectStatus(await login(f, "wrong-password-secret"), 401);
       equal(captured.length, 1); equal(event(captured[0]), "login_failed");
       ok(captured[0].includes("Level: warning"), "failure severity");
       sql.exec("INSERT INTO two_factors(id,user_id,provider_type,is_enabled,data,last_used_step) VALUES('admin-runtime-totp',?,0,1,'GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ',0)", USER);
-      const challenge = await (await status(await login(f), 400)).json();
+      const challenge = await expectJson(await login(f), 400);
       ok(challenge.TwoFactorProviders || challenge.TwoFactorProviders2, "actual two-factor challenge response");
       equal(captured.length, 1, "challenge is not a failed login");
     });
   });
 
-  await check("administrative login_failed excludes rate limiting and D1 failures masked as public credential errors", async () => {
+  await check("administrative login_failed excludes rate limiting and D1 outages", async () => {
     {
       const f = fixture(); configure(f, "login_failed", "warning");
       // workers-rs validates the constructor name before using a binding.
@@ -90,7 +143,7 @@ export async function runAdminNotificationCompatibility({ fixture, check, access
       const limiter = new Ratelimit();
       f.env.LOGIN_RATE_LIMITER = limiter;
       await sink(async captured => {
-        await status(await login(f, "wrong-password-secret"), 429);
+        await expectStatus(await login(f, "wrong-password-secret"), 429);
         equal(limiter.calls, 1, "actual SDK limiter binding was called");
         equal(captured.length, 0, "rate limiter does not emit login_failed");
       });
@@ -107,8 +160,10 @@ export async function runAdminNotificationCompatibility({ fixture, check, access
         return execute(query, values);
       };
       await sink(async captured => {
-        // The existing public response deliberately masks the lookup failure.
-        await status(await login(f), 401);
+        const response = await expectStatus(await login(f), 500);
+        const error = await response.text();
+        equal(error.includes("injected account lookup failure"), false);
+        equal(error.includes("SELECT"), false);
         ok(injected, "actual login account lookup failed");
         equal(captured.length, 0, "D1 failure does not emit login_failed");
       });
@@ -118,12 +173,12 @@ export async function runAdminNotificationCompatibility({ fixture, check, access
   await check("administrative login, refresh and sync events come from actual successful requests", async () => {
     const f = fixture(); configure(f, "login,token_refresh,sync");
     await sink(async captured => {
-      const tokens = await (await status(await login(f), 200)).json();
+      const tokens = await expectJson(await login(f), 200);
       equal(event(captured[0]), "login");
-      await status(await f.fetch("/identity/connect/token", { method: "POST", headers: { "Content-Type": "application/x-www-form-urlencoded", "Bitwarden-Client-Version": "2026.10.2" },
+      await expectStatus(await f.fetch("/identity/connect/token", { method: "POST", headers: { "Content-Type": "application/x-www-form-urlencoded", "Bitwarden-Client-Version": "2026.10.2" },
         body: new URLSearchParams({ grant_type: "refresh_token", refresh_token: tokens.refresh_token }) }), 200);
       equal(event(captured[1]), "token_refresh");
-      await status(await f.fetch("/api/sync?excludeDomains=true", { headers: { Authorization: `Bearer ${await accessToken()}` } }), 200);
+      await expectStatus(await f.fetch("/api/sync?excludeDomains=true", { headers: { Authorization: `Bearer ${await accessToken()}` } }), 200);
       equal(captured.length, 3); equal(event(captured[2]), "sync");
     });
   });
@@ -132,9 +187,9 @@ export async function runAdminNotificationCompatibility({ fixture, check, access
     const f = fixture(); configure(f, "all", "error");
     sql.exec("UPDATE users SET two_factor_recovery_code='private-admin-recovery-code' WHERE id=?", USER);
     await sink(async captured => {
-      await status(await f.fetch("/api/two-factor/get-recover", { method: "POST", headers: await owner(), body: JSON.stringify({ masterPasswordHash: "hash" }) }), 200);
+      await expectStatus(await f.fetch("/api/two-factor/get-recover", { method: "POST", headers: await owner(), body: JSON.stringify({ masterPasswordHash: "hash" }) }), 200);
       equal(captured.length, 0, "warning recovery-code view is below threshold");
-      await status(await f.fetch("/api/two-factor/recover", { method: "POST", headers: { "Content-Type": "application/json" },
+      await expectStatus(await f.fetch("/api/two-factor/recover", { method: "POST", headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ email: "owner@example.test", masterPasswordHash: "hash", recoveryCode: "private-admin-recovery-code" }) }), 200);
       equal(captured.length, 1); equal(event(captured[0]), "2fa_recover");
       ok(captured[0].includes("Level: error"), "recovery severity");
@@ -155,22 +210,22 @@ export async function runAdminNotificationCompatibility({ fixture, check, access
     };
     const noRemember = () => equal(sql.exec("SELECT COUNT(*) AS n FROM two_factors WHERE user_id=? AND provider_type=5", USER).one().n, 0, "Remember cleanup remains effective");
     await sink(async captured => {
-      await status(await disable(0), 200);
-      await status(await disable(1), 200);
-      await status(await disableEmail(), 200);
+      await expectStatus(await disable(0), 200);
+      await expectStatus(await disable(1), 200);
+      await expectStatus(await disableEmail(), 200);
       equal(captured.length, 0, "absent providers do not report disable");
       seed(0, "admin-disable-totp");
-      await status(await disable(0), 200); noRemember();
+      await expectStatus(await disable(0), 200); noRemember();
       equal(captured.length, 1); equal(event(captured[0]), "2fa_disable");
-      await status(await disable(0), 200);
+      await expectStatus(await disable(0), 200);
       equal(captured.length, 1, "repeated TOTP disable remains a no-op");
       seed(1, "admin-disable-email");
-      await status(await disableEmail(), 200); noRemember();
+      await expectStatus(await disableEmail(), 200); noRemember();
       equal(captured.length, 2); equal(event(captured[1]), "2fa_disable");
-      await status(await disableEmail(), 200);
+      await expectStatus(await disableEmail(), 200);
       equal(captured.length, 2, "repeated Email disable remains a no-op");
       seed(1, "admin-disable-email-generic");
-      await status(await disable(1), 200); noRemember();
+      await expectStatus(await disable(1), 200); noRemember();
       equal(captured.length, 3); equal(event(captured[2]), "2fa_disable");
     });
   });
@@ -185,7 +240,23 @@ export async function runAdminNotificationCompatibility({ fixture, check, access
       ok(failed.status >= 400, "actual revoke transaction failed");
       equal(captured.length, 0, "failed revoke does not report a successful security change");
       f.db.failBatch = false;
-      await status(await revoke(), 200);
+      const batch = f.db.batch.bind(f.db);
+      let raced = false;
+      f.db.batch = async statements => {
+        if (statements.some(stmt => stmt.sql.startsWith("UPDATE users SET security_stamp="))) {
+          raced = true;
+          sql.exec("UPDATE devices SET session_token='new-session' WHERE user_id=?", USER);
+          f.db.batch = batch;
+        }
+        return batch(statements);
+      };
+      await expectStatus(await revoke(), 409);
+      ok(raced, "revocation missed its guarded commit");
+      equal(captured.length, 0);
+      equal(sql.exec("SELECT security_stamp FROM users WHERE id=?", USER).one().security_stamp, "owner-stamp");
+      equal(sql.exec("SELECT session_token FROM devices WHERE user_id=?", USER).one().session_token, "new-session");
+      sql.exec("UPDATE devices SET session_token='session' WHERE user_id=?", USER);
+      await expectStatus(await revoke(), 200);
       equal(captured.length, 1); equal(event(captured[0]), "account-security-changed");
       equal(sql.exec("SELECT COUNT(*) AS n FROM devices WHERE user_id=?", USER).one().n, 0, "devices actually revoked");
     });

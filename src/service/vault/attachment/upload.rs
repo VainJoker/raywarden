@@ -1,41 +1,23 @@
 //! Attachment upload limits, mutable-source checks and publication lifecycle.
-use std::fmt::Display;
-
 use bytes::Bytes;
-use futures_util::Stream;
-use uuid::Uuid;
-use worker::{
-    D1Database,
-    D1PreparedStatement,
-    Env,
-};
+use futures_util::{Stream, StreamExt as _};
+use worker::{D1Database, D1PreparedStatement, Env};
 
 use crate::{
-    app::AppContext,
-    config::files::{
-        attachment_max_bytes,
-        attachment_quota_bytes,
+    errors::{AppError, AppResult},
+    infra::{
+        config::{attachment_max_bytes, attachment_quota_bytes},
+        storage::Storage,
     },
-    errors::{
-        AppError,
-        AppResult,
-    },
-    infra::storage::Storage,
     models::{
         mutation::commit as commit_capability,
-        vault::{
-            attachment::AttachmentRow,
-            cipher::CipherRow,
-        },
+        vault::{attachment::AttachmentRow, cipher::CipherRow},
     },
     service::{
         identity::session::Claims,
         notifications,
-        notifications::{
-            UpdateType,
-            admin as admin_notify,
-            admin::Event,
-        },
+        notifications::{UpdateType, admin as admin_notify, admin::Event},
+        storage_cleanup::{self, StagedObject},
         vault_write,
     },
 };
@@ -45,7 +27,7 @@ pub(crate) enum UploadAuthorization<'a> {
     Session(&'a Claims),
     Capability {
         user_id: &'a str,
-        device:  Option<&'a str>,
+        device: Option<&'a str>,
     },
 }
 
@@ -58,41 +40,53 @@ impl UploadAuthorization<'_> {
     }
 }
 
+pub(crate) struct AttachmentUploadSpec<'a> {
+    pub row: AttachmentRow,
+    pub is_replacement: bool,
+    pub owner: UploadAuthorization<'a>,
+    pub max_bytes: u64,
+    pub guards: Vec<D1PreparedStatement>,
+}
+
 /// One object write and its guarded publication.
 #[must_use]
 pub(crate) struct AttachmentUpload<'a> {
-    state:          &'a AppContext,
-    row:            AttachmentRow,
+    db: &'a D1Database,
+    env: &'a Env,
+    row: AttachmentRow,
     is_replacement: bool,
-    owner:          UploadAuthorization<'a>,
-    storage:        Storage,
-    staged_key:     String,
-    max_bytes:      u64,
-    guards:         Vec<D1PreparedStatement>,
-    written_bytes:  Option<u64>,
+    owner: UploadAuthorization<'a>,
+    storage: Storage,
+    staged: StagedObject<'a>,
+    max_bytes: u64,
+    guards: Vec<D1PreparedStatement>,
 }
 
 impl<'a> AttachmentUpload<'a> {
     pub(crate) fn new(
-        state: &'a AppContext,
-        row: AttachmentRow,
-        is_replacement: bool,
-        owner: UploadAuthorization<'a>,
+        db: &'a D1Database,
+        env: &'a Env,
         storage: Storage,
-        max_bytes: u64,
-        guards: Vec<D1PreparedStatement>,
+        spec: AttachmentUploadSpec<'a>,
     ) -> Self {
-        let staged_key = staged_key(&row.cipher_id, &row.id);
+        let AttachmentUploadSpec {
+            row,
+            is_replacement,
+            owner,
+            max_bytes,
+            guards,
+        } = spec;
+        let staged = StagedObject::new(db, env, "attachments", &row.cipher_id, &row.id);
         Self {
-            state,
+            db,
+            env,
             row,
             is_replacement,
             owner,
             storage,
-            staged_key,
+            staged,
             max_bytes,
             guards,
-            written_bytes: None,
         }
     }
 
@@ -103,22 +97,12 @@ impl<'a> AttachmentUpload<'a> {
     ) -> AppResult<()>
     where
         S: Stream<Item = Result<Bytes, E>>,
-        E: Display,
     {
-        if self.written_bytes.is_some() {
-            return Err(AppError::Internal);
-        }
-        self.written_bytes = Some(
-            self.storage
-                .put_stream(
-                    &self.staged_key,
-                    stream,
-                    self.max_bytes,
-                    content_type,
-                )
-                .await?,
-        );
-        Ok(())
+        let stream = stream
+            .map(|chunk| chunk.map_err(|_error| AppError::bad_request("Invalid upload body")));
+        self.staged
+            .write(&self.storage, stream, self.max_bytes, content_type)
+            .await
     }
 
     pub(crate) async fn finish(
@@ -126,10 +110,10 @@ impl<'a> AttachmentUpload<'a> {
         encrypted_key: Option<String>,
         content_length: Option<u64>,
     ) -> AppResult<()> {
-        let db = self.state.database();
+        let db = self.db;
         let writes = async {
             let row = &mut self.row;
-            let size = self.written_bytes.ok_or(AppError::Internal)?;
+            let size = self.staged.size()?;
             if content_length.is_some_and(|expected| expected != size) {
                 return Err(AppError::bad_request(
                     "Content-Length does not match uploaded size",
@@ -138,26 +122,25 @@ impl<'a> AttachmentUpload<'a> {
             let size = checked_attachment_size_bytes(size)?;
             validate_declared_attachment_size(row, size)?;
             let user_id = self.owner.user_id();
-            let usage_limit = enforce_attachment_size_limits(
-                db,
-                &self.state.env,
-                user_id,
-                size,
-                Some(&row.id),
-            )
-            .await?;
+            let usage_limit =
+                enforce_attachment_size_limits(db, self.env, user_id, size, Some(&row.id)).await?;
             if let Some(encrypted_key) = encrypted_key {
                 row.encrypted_key = Some(encrypted_key);
             }
-            if matches!(&self.owner, UploadAuthorization::Session(_)) &&
-                row.encrypted_key.is_none()
+            if matches!(&self.owner, UploadAuthorization::Session(_)) && row.encrypted_key.is_none()
             {
-                return Err(AppError::bad_request(
-                    "No attachment key provided",
-                ));
+                return Err(AppError::bad_request("No attachment key provided"));
             }
+            let domain = crate::infra::config::Config::from_env(self.env)?.domain;
+            super::enforce_cipher_attachment_metadata_budget(
+                db,
+                &domain,
+                row,
+                self.is_replacement.then_some(row.id.as_str()),
+            )
+            .await?;
             row.file_size_bytes = size;
-            row.storage_key = Some(self.staged_key.clone());
+            row.storage_key = Some(self.staged.key().to_owned());
             let now = crate::utils::time::now_rfc3339();
             if let Some(usage_limit) = usage_limit {
                 self.guards.push(AttachmentRow::quota_guard(
@@ -167,21 +150,22 @@ impl<'a> AttachmentUpload<'a> {
                     usage_limit,
                 )?);
             }
-            if self.is_replacement {
+            let mut writes = if self.is_replacement {
                 AttachmentRow::replace_upload(db, row, user_id, &now)
             } else {
                 AttachmentRow::finalize_upload(db, row, user_id, &now)
-            }
+            }?;
+            self.guards
+                .push(storage_cleanup::stage_guard(db, self.staged.key())?);
+            writes.push(storage_cleanup::remove_stage(db, self.staged.key())?);
+            Ok(writes)
         }
         .await;
         self.commit(writes).await
     }
 
-    async fn commit(
-        self,
-        writes: AppResult<Vec<D1PreparedStatement>>,
-    ) -> AppResult<()> {
-        let db = self.state.database();
+    async fn commit(self, writes: AppResult<Vec<D1PreparedStatement>>) -> AppResult<()> {
+        let db = self.db;
         let result = async {
             let writes = writes?;
             match &self.owner {
@@ -197,12 +181,7 @@ impl<'a> AttachmentUpload<'a> {
         let revision = match result {
             Ok(revision) => revision,
             Err(error) => {
-                crate::service::storage_cleanup::discard_staged_object(
-                    &self.state.env,
-                    db,
-                    &self.staged_key,
-                )
-                .await;
+                self.staged.discard_written().await;
                 return Err(error);
             }
         };
@@ -210,7 +189,7 @@ impl<'a> AttachmentUpload<'a> {
             UploadAuthorization::Session(claims) => claims.device(),
             UploadAuthorization::Capability { device, .. } => *device,
         };
-        let env = &self.state.env;
+        let env = self.env;
         let user_id = self.owner.user_id();
         notifications::publish_cipher_update(
             env,
@@ -222,27 +201,15 @@ impl<'a> AttachmentUpload<'a> {
         )
         .await;
         admin_notify::emit(env, Event::VaultChanged, user_id).await;
-        if let Err(error) =
-            crate::service::storage_cleanup::process_batch(env, db).await
-        {
+        if let Err(error) = storage_cleanup::process_batch(env, db).await {
             log::warn!("Completed attachment object cleanup deferred: {error}");
         }
         Ok(())
     }
 
     pub(crate) async fn abort(self) {
-        let db = self.state.database();
-        crate::service::storage_cleanup::discard_staged_object(
-            &self.state.env,
-            db,
-            &self.staged_key,
-        )
-        .await;
+        self.staged.discard_written().await;
     }
-}
-
-fn staged_key(cipher_id: &str, attachment_id: &str) -> String {
-    format!("attachments/{cipher_id}/{attachment_id}/{}", Uuid::new_v4())
 }
 
 pub(crate) async fn ensure_mutable_cipher(
@@ -264,24 +231,8 @@ pub(crate) async fn ensure_mutable_cipher(
     Ok(cipher)
 }
 
-pub(crate) async fn fetch_pending_attachment_for_cipher(
-    db: &D1Database,
-    cipher_id: &str,
-    attachment_id: &str,
-) -> AppResult<AttachmentRow> {
-    let pending =
-        AttachmentRow::fetch_pending_attachment(db, attachment_id).await?;
-    if pending.cipher_id != cipher_id {
-        return Err(AppError::bad_request(
-            "Attachment does not belong to cipher",
-        ));
-    }
-    Ok(pending)
-}
-
 pub(crate) fn checked_attachment_size_bytes(size: u64) -> AppResult<i64> {
-    i64::try_from(size)
-        .map_err(|_error| AppError::bad_request("Attachment size overflow"))
+    i64::try_from(size).map_err(|_error| AppError::bad_request("Attachment size overflow"))
 }
 
 pub(crate) async fn attachment_upload_limit_bytes(
@@ -291,14 +242,8 @@ pub(crate) async fn attachment_upload_limit_bytes(
     attachment: &AttachmentRow,
     expected_size: i64,
 ) -> AppResult<u64> {
-    let (limit, _) = attachment_limits(
-        db,
-        env,
-        user_id,
-        expected_size,
-        Some(&attachment.id),
-    )
-    .await?;
+    let (limit, _) =
+        attachment_limits(db, env, user_id, expected_size, Some(&attachment.id)).await?;
     let declared = u64::try_from(attachment.file_size_bytes)
         .map_err(|_error| AppError::bad_request("Invalid attachment size"))?;
     Ok(limit.min(declared + SIZE_LEEWAY_BYTES as u64))
@@ -314,8 +259,7 @@ pub(crate) async fn enforce_attachment_size_limits(
     exclude_attachment: Option<&str>,
 ) -> AppResult<Option<u64>> {
     let (_, usage_limit) =
-        attachment_limits(db, env, user_id, new_size, exclude_attachment)
-            .await?;
+        attachment_limits(db, env, user_id, new_size, exclude_attachment).await?;
     Ok(usage_limit)
 }
 
@@ -326,40 +270,31 @@ async fn attachment_limits(
     size: i64,
     exclude_attachment: Option<&str>,
 ) -> AppResult<(u64, Option<u64>)> {
-    let size = u64::try_from(size).map_err(|_error| {
-        AppError::Params("Attachment size cannot be negative".to_string())
-    })?;
+    let size = u64::try_from(size)
+        .map_err(|_error| AppError::Params("Attachment size cannot be negative".into()))?;
     let mut max_bytes = i64::MAX as u64;
-    if let Some(max) = Storage::max_bytes(env) {
+    if let Some(max) = Storage::from_env(env)?.max_bytes() {
         let max = max as u64;
         if size > max {
-            return Err(AppError::bad_request(
-                "File exceeds the 25 MiB KV limit",
-            ));
+            return Err(AppError::bad_request("File exceeds the 25 MiB KV limit"));
         }
         max_bytes = max_bytes.min(max);
     }
     if let Some(max) = attachment_max_bytes(env)? {
         if size > max {
-            return Err(AppError::Params(
-                "Attachment size exceeds limit".to_string(),
-            ));
+            return Err(AppError::Params("Attachment size exceeds limit".into()));
         }
         max_bytes = max_bytes.min(max);
     }
     let Some(total) = attachment_quota_bytes(env)? else {
         return Ok((max_bytes, None));
     };
-    let used =
-        AttachmentRow::user_attachment_usage(db, user_id, exclude_attachment)
-            .await?;
+    let used = AttachmentRow::user_attachment_usage(db, user_id, exclude_attachment).await?;
     let used = u64::try_from(used).map_err(AppError::internal_error)?;
     let usage_limit = total
         .checked_sub(size)
         .filter(|&limit| used <= limit)
-        .ok_or_else(|| {
-            AppError::Params("Attachment storage limit reached".to_string())
-        })?;
+        .ok_or_else(|| AppError::Params("Attachment storage limit reached".into()))?;
     Ok((max_bytes.min(total - used), Some(usage_limit)))
 }
 
@@ -370,21 +305,20 @@ fn validate_declared_attachment_size(
     let max_size = attachment
         .file_size_bytes
         .checked_add(SIZE_LEEWAY_BYTES)
-        .ok_or_else(|| {
-            AppError::Params("Attachment size overflow".to_string())
-        })?;
+        .ok_or_else(|| AppError::Params("Attachment size overflow".into()))?;
     let min_size = attachment
         .file_size_bytes
         .checked_sub(SIZE_LEEWAY_BYTES)
-        .ok_or_else(|| {
-            AppError::Params("Attachment size overflow".to_string())
-        })?;
+        .ok_or_else(|| AppError::Params("Attachment size overflow".into()))?;
 
     if actual_size < min_size || actual_size > max_size {
-        return Err(AppError::Params(format!(
-            "Attachment size mismatch (expected within [{min_size}, \
+        return Err(AppError::Params(
+            format!(
+                "Attachment size mismatch (expected within [{min_size}, \
              {max_size}], got {actual_size})"
-        )));
+            )
+            .into(),
+        ));
     }
 
     Ok(())
@@ -395,49 +329,26 @@ mod tests {
     use super::*;
     fn pending(size: i64) -> AttachmentRow {
         AttachmentRow {
-            id:              "attachment".to_string(),
-            cipher_id:       "cipher".to_string(),
-            file_name:       "encrypted".to_string(),
+            id: "attachment".to_string(),
+            cipher_id: "cipher".to_string(),
+            file_name: "encrypted".to_string(),
             file_size_bytes: size,
-            encrypted_key:   Some("wrapped-key".to_string()),
-            created_at:      String::new(),
-            updated_at:      String::new(),
+            encrypted_key: Some("wrapped-key".to_string()),
+            created_at: String::new(),
+            updated_at: String::new(),
             organization_id: None,
-            storage_key:     None,
+            storage_key: None,
         }
     }
 
     #[test]
     fn declared_size_leeway_is_inclusive_and_detects_overflow() {
         let attachment = pending(2 * SIZE_LEEWAY_BYTES);
-        assert!(
-            validate_declared_attachment_size(&attachment, SIZE_LEEWAY_BYTES)
-                .is_ok()
-        );
-        assert!(
-            validate_declared_attachment_size(
-                &attachment,
-                3 * SIZE_LEEWAY_BYTES
-            )
-            .is_ok()
-        );
-        assert!(
-            validate_declared_attachment_size(
-                &attachment,
-                SIZE_LEEWAY_BYTES - 1
-            )
-            .is_err()
-        );
-        assert!(
-            validate_declared_attachment_size(
-                &attachment,
-                3 * SIZE_LEEWAY_BYTES + 1
-            )
-            .is_err()
-        );
-        assert!(
-            validate_declared_attachment_size(&pending(i64::MAX), 1).is_err()
-        );
+        assert!(validate_declared_attachment_size(&attachment, SIZE_LEEWAY_BYTES).is_ok());
+        assert!(validate_declared_attachment_size(&attachment, 3 * SIZE_LEEWAY_BYTES).is_ok());
+        assert!(validate_declared_attachment_size(&attachment, SIZE_LEEWAY_BYTES - 1).is_err());
+        assert!(validate_declared_attachment_size(&attachment, 3 * SIZE_LEEWAY_BYTES + 1).is_err());
+        assert!(validate_declared_attachment_size(&pending(i64::MAX), 1).is_err());
         assert!(validate_declared_attachment_size(&pending(1), 0).is_ok());
     }
 }

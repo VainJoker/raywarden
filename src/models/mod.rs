@@ -3,7 +3,8 @@
 pub(crate) mod health;
 pub mod identity;
 pub mod mutation;
+pub(crate) mod page;
 pub mod send;
-pub mod storage_cleanup;
+pub mod storage;
 pub mod usage;
 pub mod vault;

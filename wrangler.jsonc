@@ -94,7 +94,7 @@
     {
       "binding": "DB",
       "database_name": "warden-db",
-      "database_id": "619ed8d2-2e40-4e96-a4e6-619cbe6c9447",
+      "database_id": "849abb49-78b2-4ce9-a901-840d6fd50172",
       "migrations_dir": "sql/migrations"
     }
   ],
@@ -116,12 +116,12 @@
   "durable_objects": {
     "bindings": [
       {
-        "name": "NOTIFY_DO",
-        "class_name": "NotifyDo"
+        "name": "notifydo",
+        "class_name": "notifydo"
       },
       {
-        "name": "HEAVY_DO",
-        "class_name": "HeavyDo"
+        "name": "heavydo",
+        "class_name": "heavydo"
       }
     ]
   },
@@ -130,8 +130,8 @@
     {
       "tag": "v1",
       "new_sqlite_classes": [
-        "NotifyDo",
-        "HeavyDo"
+        "notifydo",
+        "heavydo"
       ]
     }
   ],
@@ -259,12 +259,12 @@
       "durable_objects": {
         "bindings": [
           {
-            "name": "NOTIFY_DO",
-            "class_name": "NotifyDo"
+            "name": "notifydo",
+            "class_name": "notifydo"
           },
           {
-            "name": "HEAVY_DO",
-            "class_name": "HeavyDo"
+            "name": "heavydo",
+            "class_name": "heavydo"
           }
         ]
       },
@@ -273,8 +273,8 @@
         {
           "tag": "v1-notify-heavy",
           "new_sqlite_classes": [
-            "NotifyDo",
-            "HeavyDo"
+            "notifydo",
+            "heavydo"
           ]
         }
       ]

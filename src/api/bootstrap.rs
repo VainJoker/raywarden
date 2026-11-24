@@ -1,23 +1,21 @@
-//! Assemble the application stack shared by the Worker and `HeavyDo`.
-use axum::response::Response;
+//! Assemble the application stack shared by the Worker and `heavydo`.
+use std::sync::Arc;
+
+use axum::response::{IntoResponse as _, Response};
 use tower_service::Service as _;
-use worker::{
-    Env,
-    HttpRequest,
-};
+use worker::{Env, HttpRequest};
 
 use super::{
+    AppState,
     middleware::{
-        cors::CorsPolicy,
-        security_headers,
+        cors::{CorsContext, CorsPolicy},
+        headers,
     },
     routers,
 };
 use crate::{
-    app::AppContext,
-    config::Config,
-    errors::AppResult,
-    infra::db,
+    errors::{AppError, AppResult},
+    infra::{config::Config, db},
     service::identity::jwt_keys,
 };
 
@@ -27,16 +25,33 @@ pub(crate) async fn handle_request(
     cors: &CorsPolicy,
 ) -> AppResult<Response> {
     let path = request.uri().path().to_owned();
-    let database = db::binding(&env)?;
-    let config = Config::from_env(&env)?;
-    let keys = jwt_keys::load(&env, &database).await?;
-    let state =
-        super::AppState::new(AppContext::new(env, config, keys, database));
-    let mut app = routers::router().with_state(state).layer(cors.layer());
+    let router = if let Some(public) = routers::public_router(&path) {
+        public.with_state(env)
+    } else {
+        let database = db::binding(&env)?;
+        let config = Config::from_env(&env)?;
+        let jwt_keys = jwt_keys::load(&env, &database).await?;
+        routers::router().with_state(Arc::new(AppState {
+            env,
+            config,
+            jwt_keys,
+            database,
+        }))
+    };
+    let mut app = router.layer(cors.layer());
     let mut response = match app.call(request).await {
         Ok(response) => response,
         Err(infallible) => match infallible {},
     };
-    security_headers::apply_http(&path, &mut response);
+    headers::apply_http(&path, &mut response);
     Ok(response)
+}
+
+/// Render an application error that occurred before Axum applied CORS.
+pub(super) fn worker_error_response(
+    error: AppError,
+    cors: &CorsContext,
+) -> worker::Result<worker::Response> {
+    let response = error.into_response().try_into()?;
+    Ok(cors.apply(response)?)
 }

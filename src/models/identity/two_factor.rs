@@ -1,29 +1,19 @@
-use serde::{
-    Deserialize,
-    Serialize,
-};
+use serde::{Deserialize, Serialize};
 use uuid::Uuid;
-use worker::{
-    D1PreparedStatement,
-    query,
-    wasm_bindgen::JsValue,
-};
+use worker::{D1PreparedStatement, query};
 
 use super::{
-    email::EmailStore,
+    authorization::VerifiedAccountAction,
+    email::{self, VerifiedCode},
     webauthn::WebauthnCredentialRow,
 };
 use crate::{
-    errors::{
-        AppError,
-        AppResult,
-        DatabaseError,
-    },
+    errors::{AppError, AppResult, DatabaseError, DbSentinel},
     infra::db,
     models::identity::{
         account_keys::AccountSnapshot,
-        device::SessionSnapshot,
-        user::UserRow,
+        device::{DeviceRow, NewDeviceSession, SessionSnapshot},
+        user::{StoredPassword, UserRow},
     },
     utils::serde::bool_from_int,
 };
@@ -31,38 +21,80 @@ use crate::{
 pub(crate) const REMEMBER_PROVIDER: i32 = 5;
 const FIRST_INTERNAL_PROVIDER: i32 = 1000;
 
+/// The enabled factor configuration used to authorize a password login.
+/// Replay counters are checked by the proof that updates them.
+#[derive(Default, Serialize)]
+pub(crate) struct LoginMfaPolicy {
+    providers: Vec<(String, i32, String)>,
+    pub(crate) remembered: Option<(String, String)>,
+    pub(crate) webauthn_id: Option<String>,
+}
+
+impl LoginMfaPolicy {
+    pub(crate) fn from_providers(providers: &[&TwoFactorRow]) -> Self {
+        Self {
+            providers: providers
+                .iter()
+                .map(|factor| (factor.id.clone(), factor.provider_type, factor.data.clone()))
+                .collect(),
+            ..Self::default()
+        }
+    }
+
+    pub(super) fn matches_sql(parameter: usize) -> String {
+        let enabled = format!(
+            "user_id=?1 AND is_enabled=1 AND \
+             provider_type<>{REMEMBER_PROVIDER} AND \
+             provider_type<{FIRST_INTERNAL_PROVIDER}"
+        );
+        format!(
+            "((SELECT COUNT(*) FROM two_factors WHERE \
+             {enabled})=json_array_length(?{parameter},'$.providers') AND NOT \
+             EXISTS(SELECT 1 FROM json_each(?{parameter},'$.providers') p \
+             WHERE NOT EXISTS(SELECT 1 FROM two_factors WHERE {enabled} AND \
+             id=json_extract(p.value,'$[0]') AND \
+             provider_type=json_extract(p.value,'$[1]') AND \
+             data=json_extract(p.value,'$[2]'))) AND \
+             (json_extract(?{parameter},'$.remembered') IS NULL OR \
+             EXISTS(SELECT 1 FROM two_factors WHERE user_id=?1 AND \
+             is_enabled=1 AND provider_type={REMEMBER_PROVIDER} AND \
+             id=json_extract(?{parameter},'$.remembered[0]') AND \
+             data=json_extract(?{parameter},'$.remembered[1]'))) AND \
+             (json_extract(?{parameter},'$.webauthn_id') IS NULL OR \
+             EXISTS(SELECT 1 FROM webauthn_credentials WHERE user_id=?1 AND \
+             credential_use='2fa' AND \
+             id=json_extract(?{parameter},'$.webauthn_id'))))"
+        )
+    }
+}
+
 /// `TwoFactorRow` database model
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TwoFactorRow {
-    pub id:             String,
-    pub user_id:        String,
-    pub provider_type:  i32,
+    pub id: String,
+    pub user_id: String,
+    pub provider_type: i32,
     #[serde(with = "bool_from_int")]
-    pub is_enabled:     bool,
-    pub data:           String,
+    pub is_enabled: bool,
+    pub data: String,
     pub last_used_step: i64,
 }
 
 impl TwoFactorRow {
     /// List all 2FA records for a user (includes Remember tokens, excludes
     /// `provider_type >= 1000`).
-    pub async fn list_for_user(
-        db: &worker::D1Database,
-        user_id: &str,
-    ) -> AppResult<Vec<Self>> {
+    pub async fn list_for_user(db: &worker::D1Database, user_id: &str) -> AppResult<Vec<Self>> {
         db.prepare(format!(
             "SELECT * FROM two_factors WHERE user_id = ?1 AND provider_type < \
              {FIRST_INTERNAL_PROVIDER}"
         ))
-        .bind(&[user_id.to_string().into()])?
+        .bind(&db::d1_params![user_id])?
         .all()
         .await
         .map_err(|err| {
             DatabaseError::query(
-                format_args!(
-                    "Failed to query two_factors records for user {user_id}"
-                ),
-                err,
+                format_args!("Failed to query two_factors records for user {user_id}"),
+                &err,
             )
         })?
         .results::<Self>()
@@ -72,7 +104,7 @@ impl TwoFactorRow {
                     "Failed to deserialize two_factors records for user \
                      {user_id}"
                 ),
-                err,
+                &err,
             )
         })
     }
@@ -86,7 +118,7 @@ impl TwoFactorRow {
             "SELECT * FROM two_factors WHERE user_id = ?1 AND provider_type = \
              ?2",
         )
-        .bind(&[user_id.to_string().into(), provider_type.into()])?
+        .bind(&db::d1_params![user_id, provider_type])?
         .first(None)
         .await
         .map_err(|err| {
@@ -95,57 +127,73 @@ impl TwoFactorRow {
                     "Failed to fetch two_factors type {provider_type} for \
                      user {user_id}"
                 ),
-                err,
+                &err,
             )
         })?
-        .map(|value| {
-            serde_json::from_value(value).map_err(|error| {
-                DatabaseError::invalid_result(
-                    "Failed to deserialize two_factors record",
-                    error,
-                )
-            })
-        })
+        .map(|value| db::decode_row(value, "Failed to read two-factor provider"))
         .transpose()
     }
 
-    pub async fn disable_provider(
+    pub(crate) async fn disable_provider(
+        db: &worker::D1Database,
+        authorization: &VerifiedAccountAction<'_>,
+        provider_type: i32,
+        previous: Option<&Self>,
+        webauthn: Option<&[WebauthnCredentialRow]>,
+    ) -> AppResult<()> {
+        let user_id = authorization.session.user_id;
+        let mut writes = vec![
+            Self::snapshot_guard(db, user_id, provider_type, previous)?,
+            email::invalidate_user_statement(db, user_id)?,
+        ];
+        if let Some(keys) = webauthn {
+            writes.push(WebauthnCredentialRow::guard_second_factor_keys(
+                db, user_id, keys,
+            )?);
+            writes.push(WebauthnCredentialRow::purge_2fa_statement(db, user_id)?);
+        }
+        writes.push(query!(
+            db,
+            "DELETE FROM two_factors WHERE user_id=?1 AND provider_type IN (?2,?3)",
+            user_id,
+            provider_type,
+            REMEMBER_PROVIDER,
+        )?);
+        writes.push(Self::clear_recovery_statement(db, user_id, None)?);
+        authorization
+            .commit(db, writes, "Failed to delete two_factors entries")
+            .await?;
+        Ok(())
+    }
+
+    pub(super) fn snapshot_guard(
         db: &worker::D1Database,
         user_id: &str,
         provider_type: i32,
-    ) -> AppResult<()> {
-        db::run_query(
-            async {
-                let mut writes =
-                    vec![EmailStore::invalidate_user_statement(db, user_id)?];
-                if provider_type == 7 {
-                    writes.push(WebauthnCredentialRow::purge_2fa_statement(
-                        db, user_id,
-                    )?);
-                }
-                writes.push(query!(
-                    db,
-                    "DELETE FROM two_factors WHERE user_id=?1 AND \
-                     provider_type IN (?2,?3)",
-                    user_id,
-                    provider_type,
-                    REMEMBER_PROVIDER,
-                )?);
-                writes.push(Self::clear_recovery_statement(db, user_id, None)?);
-                db.batch(writes).await
-            },
-            "Failed to delete two_factors entries",
+        previous: Option<&Self>,
+    ) -> AppResult<D1PreparedStatement> {
+        let snapshot = previous
+            .map(serde_json::to_string)
+            .transpose()
+            .map_err(AppError::internal_error)?;
+        crate::models::mutation::guard(
+            db,
+            "CASE WHEN ?3 IS NULL THEN NOT EXISTS(SELECT 1 FROM two_factors \
+             WHERE user_id=?1 AND provider_type=?2) ELSE EXISTS(SELECT 1 FROM \
+             two_factors WHERE user_id=?1 AND provider_type=?2 AND \
+             id=json_extract(?3,'$.id') AND data=json_extract(?3,'$.data') AND \
+             is_enabled=json_extract(?3,'$.is_enabled') AND \
+             last_used_step=json_extract(?3,'$.last_used_step')) END",
+            &db::d1_params![user_id, provider_type, snapshot],
         )
-        .await?;
-        Ok(())
     }
 
     /// Keep legacy enabled providers in the login policy. Remember and internal
     /// records do not require a challenge or preserve a recovery code.
     pub(crate) const fn requires_login_challenge(&self) -> bool {
-        self.is_enabled &&
-            self.provider_type != REMEMBER_PROVIDER &&
-            self.provider_type < FIRST_INTERNAL_PROVIDER
+        self.is_enabled
+            && self.provider_type != REMEMBER_PROVIDER
+            && self.provider_type < FIRST_INTERNAL_PROVIDER
     }
 
     /// Evaluate the same provider policy as login inside the factor write.
@@ -169,33 +217,40 @@ impl TwoFactorRow {
         )
     }
 
-    pub async fn update_last_used_step(
+    fn update_last_used_step(
         db: &worker::D1Database,
         id: &str,
         last_used_step: i64,
-    ) -> AppResult<()> {
-        let result = query!(
+    ) -> worker::Result<D1PreparedStatement> {
+        query!(
             db,
             "UPDATE two_factors SET last_used_step = ?1 WHERE id = ?2 AND \
              is_enabled = 1 AND last_used_step < ?1",
             last_used_step,
             id
-        )?
-        .run()
-        .await?;
-        if result.meta()?.and_then(|meta| meta.changes).unwrap_or(0) != 1 {
-            return Err(crate::errors::AuthError::InvalidTotp.into());
-        }
-        Ok(())
+        )
     }
 
-    pub async fn replace_authenticator(
+    pub(crate) fn consume_totp(
+        db: &worker::D1Database,
+        id: &str,
+        step: i64,
+    ) -> worker::Result<[D1PreparedStatement; 2]> {
+        Ok([
+            Self::update_last_used_step(db, id, step)?,
+            email::require_changed_row(db, DbSentinel::TotpWriteConflict)?,
+        ])
+    }
+
+    pub(crate) async fn replace_authenticator(
         db: &worker::D1Database,
         session: &SessionSnapshot<'_>,
         previous: Option<&Self>,
         value: &Self,
         recovery_code: &str,
+        authorization: Option<&VerifiedCode>,
     ) -> AppResult<()> {
+        let abort = DbSentinel::TotpWriteConflict.sql_abort_expr();
         let previous = previous
             .map(serde_json::to_string)
             .transpose()
@@ -228,10 +283,9 @@ impl TwoFactorRow {
                 session.device_id,
                 session.session_token
             )?,
-            db.prepare(
-                "SELECT CASE WHEN changes()=1 THEN 1 ELSE json_extract('[]', \
-                 'RAY_TOTP_WRITE_CONFLICT') END",
-            ),
+            db.prepare(format!(
+                "SELECT CASE WHEN changes()=1 THEN 1 ELSE {abort} END"
+            )),
             query!(
                 db,
                 "DELETE FROM two_factors WHERE user_id=?1 AND provider_type=5 \
@@ -247,17 +301,14 @@ impl TwoFactorRow {
                 recovery_code
             )?,
         ];
-        let result = db
-            .batch(statements)
-            .await
-            .map_err(DatabaseError::totp_write)?;
-        if result
-            .first()
-            .and_then(|r| r.meta().ok().flatten())
-            .and_then(|m| m.changes)
-            .unwrap_or(0) !=
-            1
-        {
+        let result = VerifiedCode::batch_with_proofs(
+            db,
+            authorization,
+            statements,
+            DatabaseError::totp_write,
+        )
+        .await?;
+        if result.first().and_then(|row| db::changes_count(row).ok()) != Some(1) {
             return Err(AppError::conflict(
                 "Authenticator configuration changed; retry",
             ));
@@ -265,12 +316,14 @@ impl TwoFactorRow {
         Ok(())
     }
 
-    pub async fn delete_authenticator_snapshot(
+    pub(crate) async fn delete_authenticator_snapshot(
         db: &worker::D1Database,
-        session: &SessionSnapshot<'_>,
+        authorization: &VerifiedAccountAction<'_>,
         previous: &Self,
         clear_verification_codes: bool,
     ) -> AppResult<()> {
+        let session = &authorization.session;
+        let abort = DbSentinel::TotpWriteConflict.sql_abort_expr();
         let mut writes = vec![
             query!(
                 db,
@@ -289,10 +342,9 @@ impl TwoFactorRow {
                 session.device_id,
                 session.session_token
             )?,
-            db.prepare(
-                "SELECT CASE WHEN changes()=1 THEN 1 ELSE json_extract('[]', \
-                 'RAY_TOTP_WRITE_CONFLICT') END",
-            ),
+            db.prepare(format!(
+                "SELECT CASE WHEN changes()=1 THEN 1 ELSE {abort} END"
+            )),
             query!(
                 db,
                 "DELETE FROM two_factors WHERE user_id=?1 AND provider_type=5 \
@@ -303,91 +355,27 @@ impl TwoFactorRow {
             Self::clear_recovery_statement(db, session.user_id, None)?,
         ];
         if clear_verification_codes {
-            writes.push(EmailStore::invalidate_user_statement(
-                db,
-                session.user_id,
-            )?);
+            writes.push(email::invalidate_user_statement(db, session.user_id)?);
         }
-        let result =
-            db.batch(writes).await.map_err(DatabaseError::totp_write)?;
-        if result
-            .first()
-            .and_then(|r| r.meta().ok().flatten())
-            .and_then(|m| m.changes)
-            .unwrap_or(0) !=
-            1
-        {
-            return Err(AppError::conflict(
-                "Authenticator configuration changed; retry",
-            ));
-        }
+        authorization
+            .commit(db, writes, "Failed to disable authenticator")
+            .await?;
         Ok(())
     }
 
     /// Consume a verified recovery code and remove its second factors together.
     /// A changed credential snapshot leaves every factor untouched.
-    pub async fn recover_if_current(
-        db: &worker::D1Database,
-        user: &UserRow,
-    ) -> AppResult<()> {
+    pub async fn recover_if_current(db: &worker::D1Database, user: &UserRow) -> AppResult<()> {
         let marker = Uuid::new_v4().to_string();
         let results = db::run_query(
             async {
-                db.batch(vec![
-                    query!(
-                        db,
-                        "UPDATE users SET \
-                         two_factor_recovery_code=NULL,account_write_token=?1 \
-                         WHERE id=?2 AND security_stamp=?3 AND \
-                         master_password_hash=?4 AND password_salt IS ?5 AND \
-                         password_iterations=?6 AND two_factor_recovery_code \
-                         IS ?7 AND two_factor_recovery_code IS NOT NULL AND \
-                         two_factor_recovery_code<>'' AND email=?8",
-                        marker,
-                        user.id,
-                        user.security_stamp,
-                        user.master_password_hash,
-                        user.password_salt,
-                        user.password_iterations,
-                        user.two_factor_recovery_code,
-                        user.email
-                    )?,
-                    query!(
-                        db,
-                        "DELETE FROM verification_codes WHERE user_id=?1 AND \
-                         EXISTS (SELECT 1 FROM users WHERE id=?1 AND \
-                         account_write_token=?2)",
-                        user.id,
-                        marker
-                    )?,
-                    query!(
-                        db,
-                        "DELETE FROM webauthn_credentials WHERE user_id=?1 \
-                         AND credential_use='2fa' AND EXISTS (SELECT 1 FROM \
-                         users WHERE id=?1 AND account_write_token=?2)",
-                        user.id,
-                        marker
-                    )?,
-                    query!(
-                        db,
-                        "DELETE FROM two_factors WHERE user_id=?1 AND EXISTS \
-                         (SELECT 1 FROM users WHERE id=?1 AND \
-                         account_write_token=?2)",
-                        user.id,
-                        marker
-                    )?,
-                ])
-                .await
+                db.batch(Self::recovery_statements(db, user, &marker)?.into())
+                    .await
             },
             "Failed to recover second factors",
         )
         .await?;
-        let changed = results
-            .first()
-            .ok_or(AppError::Internal)?
-            .meta()?
-            .and_then(|meta| meta.changes)
-            .unwrap_or(0);
+        let changed = db::changes_count(results.first().ok_or(AppError::Internal)?)?;
         if changed != 1 {
             return Err(AppError::conflict(
                 "Account or recovery code changed; retry recovery",
@@ -396,13 +384,94 @@ impl TwoFactorRow {
         Ok(())
     }
 
-    pub async fn persist_remember_if_current(
+    pub(crate) async fn recover_and_start_session(
+        db: &worker::D1Database,
+        user: &UserRow,
+        session: &NewDeviceSession<'_>,
+        replacement: Option<&StoredPassword>,
+        approval: Option<&super::auth_request::AuthRequestRow>,
+    ) -> AppResult<()> {
+        let marker = Uuid::new_v4().to_string();
+        let recovery_conflict = DbSentinel::LoginRecoveryConflict.sql_abort_expr();
+        let [claim, otp, credentials, factors] = Self::recovery_statements(db, user, &marker)?;
+        let mut writes = vec![
+            DeviceRow::guard_current_login_account(db, user)?,
+            claim,
+            db.prepare(format!(
+                "SELECT CASE WHEN changes()=1 THEN 1 ELSE {recovery_conflict} END"
+            )),
+            otp,
+            credentials,
+            factors,
+        ];
+        if let Some(approval) = approval {
+            writes.extend(approval.consume_statements(db)?);
+        }
+        if let Some(password) = replacement {
+            writes.extend(DeviceRow::migrate_login_password(db, user, password)?);
+        }
+        writes.push(session.upsert_statement(db, &user.id)?);
+        db.batch(writes)
+            .await
+            .map_err(|error| DatabaseError::login_session(&error))?;
+        Ok(())
+    }
+
+    fn recovery_statements(
+        db: &worker::D1Database,
+        user: &UserRow,
+        marker: &str,
+    ) -> worker::Result<[D1PreparedStatement; 4]> {
+        Ok([
+            query!(
+                db,
+                "UPDATE users SET \
+                 two_factor_recovery_code=NULL,account_write_token=?1 WHERE \
+                 id=?2 AND security_stamp=?3 AND master_password_hash=?4 AND \
+                 password_salt IS ?5 AND password_iterations=?6 AND \
+                 two_factor_recovery_code IS ?7 AND two_factor_recovery_code \
+                 IS NOT NULL AND two_factor_recovery_code<>'' AND email=?8",
+                marker,
+                user.id,
+                user.security_stamp,
+                user.master_password_hash,
+                user.password_salt,
+                user.password_iterations,
+                user.two_factor_recovery_code,
+                user.email
+            )?,
+            query!(
+                db,
+                "DELETE FROM verification_codes WHERE user_id=?1 AND EXISTS \
+                 (SELECT 1 FROM users WHERE id=?1 AND account_write_token=?2)",
+                user.id,
+                marker
+            )?,
+            query!(
+                db,
+                "DELETE FROM webauthn_credentials WHERE user_id=?1 AND \
+                 credential_use='2fa' AND EXISTS (SELECT 1 FROM users WHERE \
+                 id=?1 AND account_write_token=?2)",
+                user.id,
+                marker
+            )?,
+            query!(
+                db,
+                "DELETE FROM two_factors WHERE user_id=?1 AND EXISTS (SELECT \
+                 1 FROM users WHERE id=?1 AND account_write_token=?2)",
+                user.id,
+                marker
+            )?,
+        ])
+    }
+
+    pub(crate) fn persist_remember_if_current(
         db: &worker::D1Database,
         user: &UserRow,
         verified_factor: &Self,
         previous: Option<&Self>,
         json_data: &str,
-    ) -> AppResult<()> {
+    ) -> AppResult<[D1PreparedStatement; 2]> {
         let sql = format!(
             "INSERT INTO two_factors \
              (id,user_id,provider_type,is_enabled,data,last_used_step) SELECT \
@@ -420,45 +489,23 @@ impl TwoFactorRow {
              DO UPDATE SET data=excluded.data,is_enabled=1 RETURNING id",
             AccountSnapshot::matches_sql(8),
         );
-        let changed: Option<String> = db::run_query(
-            async {
-                db.prepare(sql)
-                    .bind(&[
-                        Uuid::new_v4().to_string().into(),
-                        user.id.clone().into(),
-                        json_data.into(),
-                        user.security_stamp.clone().into(),
-                        user.master_password_hash.clone().into(),
-                        user.password_salt
-                            .clone()
-                            .map_or(JsValue::NULL, Into::into),
-                        user.password_iterations.into(),
-                        AccountSnapshot::from_user(user)
-                            .to_json()
-                            .map_err(worker::Error::from)?
-                            .into(),
-                        verified_factor.id.clone().into(),
-                        verified_factor.provider_type.into(),
-                        verified_factor.data.clone().into(),
-                        previous.map_or(JsValue::NULL, |factor| {
-                            factor.id.clone().into()
-                        }),
-                        previous.map_or(JsValue::NULL, |factor| {
-                            factor.data.clone().into()
-                        }),
-                    ])?
-                    .first(Some("id"))
-                    .await
-            },
-            "Failed to upsert remember token",
-        )
-        .await?;
-        if changed.is_none() {
-            return Err(AppError::conflict(
-                "Second-factor or account state changed during remembered \
-                 login",
-            ));
-        }
-        Ok(())
+        Ok([
+            db.prepare(sql).bind(&db::d1_params![
+                Uuid::new_v4().to_string(),
+                user.id,
+                json_data,
+                user.security_stamp,
+                user.master_password_hash,
+                user.password_salt,
+                user.password_iterations,
+                AccountSnapshot::json_from_user(user).map_err(worker::Error::from)?,
+                verified_factor.id,
+                verified_factor.provider_type,
+                verified_factor.data,
+                previous.map(|factor| factor.id.as_str()),
+                previous.map(|factor| factor.data.as_str()),
+            ])?,
+            email::require_changed_row(db, DbSentinel::LoginRememberConflict)?,
+        ])
     }
 }

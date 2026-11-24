@@ -3,13 +3,8 @@
 use serde_json::json;
 use worker::Env;
 
-use crate::{
-    errors::AppResult,
-    infra::{
-        delivery::post_json,
-        env::env_text,
-    },
-};
+use super::post_json;
+use crate::{errors::AppResult, infra::config::env_text};
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub(crate) enum Level {
@@ -41,175 +36,105 @@ impl Level {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum Event {
-    Login,
-    LoginFailed,
-    PasswordHint,
-    PasswordChange,
-    EmailChange,
-    KdfChange,
-    CipherCreate,
-    CipherUpdate,
-    CipherDelete,
-    Import,
-    SendCreate,
-    SendDelete,
-    TwoFactorEnable,
-    TwoFactorDisable,
-    TwoFactorRecoveryCodeView,
-    TwoFactorRecover,
-    TokenRefresh,
-    Sync,
-    AuthRequest,
-    AuthResponse,
-    WebauthnCredentialCreate,
-    WebauthnCredentialDelete,
-    WebauthnCredentialUpdate,
-    WebauthnLogin,
-    // Existing Ray events without an equivalent among the standard 24.
-    VaultChanged,
-    AccountSecurityChanged,
-    AccountSettingsChanged,
-    AccountDeleted,
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum EventFamily {
+    Vault,
+    AccountSecurity,
+}
+
+struct EventMeta {
+    key: &'static str,
+    aliases: &'static [&'static str],
+    level: Level,
+    family: Option<EventFamily>,
+}
+
+macro_rules! events {
+    ($($event:ident => ($key:literal, $aliases:expr, $level:ident, $family:expr)),+ $(,)?) => {
+        #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+        pub(crate) enum Event {
+            $($event),+
+        }
+
+        impl Event {
+            const fn meta(self) -> EventMeta {
+                match self {
+                    $(Self::$event => EventMeta {
+                        key: $key,
+                        aliases: $aliases,
+                        level: Level::$level,
+                        family: $family,
+                    }),+
+                }
+            }
+        }
+    };
+}
+
+events! {
+    Login => ("login", &[], Info, None),
+    LoginFailed => ("login_failed", &["login_fail", "loginfailed"], Warning, None),
+    PasswordHint => ("password_hint", &["password-hint"], Warning, None),
+    PasswordChange => ("password", &["password_change", "passwordchange"], Warning, Some(EventFamily::AccountSecurity)),
+    EmailChange => ("email", &["email_change", "emailchange", "account.email-changed"], Warning, Some(EventFamily::AccountSecurity)),
+    KdfChange => ("kdf", &["kdf_change", "kdfchange"], Warning, Some(EventFamily::AccountSecurity)),
+    CipherCreate => ("cipher_create", &["cipher.add", "cipher_add", "create_cipher"], Info, Some(EventFamily::Vault)),
+    CipherUpdate => ("cipher_update", &["cipher.update", "cipher_edit", "update_cipher"], Info, Some(EventFamily::Vault)),
+    CipherDelete => ("cipher_delete", &["cipher.del", "delete_cipher"], Warning, Some(EventFamily::Vault)),
+    Import => ("import", &[], Info, Some(EventFamily::Vault)),
+    SendCreate => ("send_create", &["send.create", "send_add"], Info, Some(EventFamily::Vault)),
+    SendDelete => ("send_delete", &["send.del", "send_remove"], Warning, Some(EventFamily::Vault)),
+    TwoFactorEnable => ("2fa_enable", &["two_factor_enable", "twofactor_enable", "two-factor.enabled"], Info, None),
+    TwoFactorDisable => ("2fa_disable", &["two_factor_disable", "twofactor_disable", "two-factor.disabled"], Warning, None),
+    TwoFactorRecoveryCodeView => ("2fa_recovery_code_view", &["two_factor_recovery_code_view"], Warning, None),
+    TwoFactorRecover => ("2fa_recover", &["two_factor_recover", "twofactor_recover"], Error, None),
+    TokenRefresh => ("token_refresh", &["unlock"], Info, None),
+    Sync => ("sync", &[], Info, None),
+    AuthRequest => ("auth_request", &["authrequest"], Info, None),
+    AuthResponse => ("auth_response", &["authresponse"], Info, None),
+    WebauthnCredentialCreate => ("webauthn_credential_create", &["webauthn_create", "passkey_create"], Info, None),
+    WebauthnCredentialDelete => ("webauthn_credential_delete", &["webauthn_delete", "passkey_delete"], Warning, None),
+    WebauthnCredentialUpdate => ("webauthn_credential_update", &["webauthn_update", "passkey_update"], Info, None),
+    WebauthnLogin => ("webauthn_login", &["passkey_login"], Info, None),
+    VaultChanged => ("vault-changed", &[], Info, Some(EventFamily::Vault)),
+    AccountSecurityChanged => ("account-security-changed", &[], Warning, Some(EventFamily::AccountSecurity)),
+    AccountSettingsChanged => ("account-settings-changed", &[], Info, None),
+    AccountDeleted => ("account.deleted", &[], Warning, None),
 }
 
 impl Event {
     pub(crate) const fn key(self) -> &'static str {
-        self.names().0
-    }
-
-    const fn names(self) -> (&'static str, &'static [&'static str]) {
-        match self {
-            Self::Login => ("login", &[]),
-            Self::LoginFailed => {
-                ("login_failed", &["login_fail", "loginfailed"])
-            }
-            Self::PasswordHint => ("password_hint", &["password-hint"]),
-            Self::PasswordChange => {
-                ("password", &["password_change", "passwordchange"])
-            }
-            Self::EmailChange => ("email", &[
-                "email_change",
-                "emailchange",
-                "account.email-changed",
-            ]),
-            Self::KdfChange => ("kdf", &["kdf_change", "kdfchange"]),
-            Self::CipherCreate => ("cipher_create", &[
-                "cipher.add",
-                "cipher_add",
-                "create_cipher",
-            ]),
-            Self::CipherUpdate => ("cipher_update", &[
-                "cipher.update",
-                "cipher_edit",
-                "update_cipher",
-            ]),
-            Self::CipherDelete => {
-                ("cipher_delete", &["cipher.del", "delete_cipher"])
-            }
-            Self::Import => ("import", &[]),
-            Self::SendCreate => ("send_create", &["send.create", "send_add"]),
-            Self::SendDelete => ("send_delete", &["send.del", "send_remove"]),
-            Self::TwoFactorEnable => ("2fa_enable", &[
-                "two_factor_enable",
-                "twofactor_enable",
-                "two-factor.enabled",
-            ]),
-            Self::TwoFactorDisable => ("2fa_disable", &[
-                "two_factor_disable",
-                "twofactor_disable",
-                "two-factor.disabled",
-            ]),
-            Self::TwoFactorRecoveryCodeView => {
-                ("2fa_recovery_code_view", &["two_factor_recovery_code_view"])
-            }
-            Self::TwoFactorRecover => {
-                ("2fa_recover", &["two_factor_recover", "twofactor_recover"])
-            }
-            Self::TokenRefresh => ("token_refresh", &["unlock"]),
-            Self::Sync => ("sync", &[]),
-            Self::AuthRequest => ("auth_request", &["authrequest"]),
-            Self::AuthResponse => ("auth_response", &["authresponse"]),
-            Self::WebauthnCredentialCreate => {
-                ("webauthn_credential_create", &[
-                    "webauthn_create",
-                    "passkey_create",
-                ])
-            }
-            Self::WebauthnCredentialDelete => {
-                ("webauthn_credential_delete", &[
-                    "webauthn_delete",
-                    "passkey_delete",
-                ])
-            }
-            Self::WebauthnCredentialUpdate => {
-                ("webauthn_credential_update", &[
-                    "webauthn_update",
-                    "passkey_update",
-                ])
-            }
-            Self::WebauthnLogin => ("webauthn_login", &["passkey_login"]),
-            Self::VaultChanged => ("vault-changed", &[]),
-            Self::AccountSecurityChanged => ("account-security-changed", &[]),
-            Self::AccountSettingsChanged => ("account-settings-changed", &[]),
-            Self::AccountDeleted => ("account.deleted", &[]),
-        }
+        self.meta().key
     }
 
     const fn level(self) -> Level {
-        match self {
-            Self::TwoFactorRecover => Level::Error,
-            Self::LoginFailed |
-            Self::PasswordHint |
-            Self::PasswordChange |
-            Self::EmailChange |
-            Self::KdfChange |
-            Self::CipherDelete |
-            Self::SendDelete |
-            Self::TwoFactorDisable |
-            Self::TwoFactorRecoveryCodeView |
-            Self::WebauthnCredentialDelete |
-            Self::AccountSecurityChanged |
-            Self::AccountDeleted => Level::Warning,
-            _ => Level::Info,
-        }
+        self.meta().level
     }
 
     fn selected_by(self, filter: &str) -> bool {
-        match filter {
-            "*" | "all" => true,
-            "vault-changed" => matches!(
-                self,
-                Self::CipherCreate |
-                    Self::CipherUpdate |
-                    Self::CipherDelete |
-                    Self::Import |
-                    Self::SendCreate |
-                    Self::SendDelete |
-                    Self::VaultChanged
-            ),
-            "account-security-changed" => matches!(
-                self,
-                Self::PasswordChange |
-                    Self::EmailChange |
-                    Self::KdfChange |
-                    Self::AccountSecurityChanged
-            ),
-            _ => {
-                let (key, aliases) = self.names();
-                key == filter || aliases.contains(&filter)
-            }
+        let meta = self.meta();
+        if filter == "*" || filter.eq_ignore_ascii_case("all") {
+            true
+        } else if filter.eq_ignore_ascii_case("vault-changed") {
+            meta.family == Some(EventFamily::Vault)
+        } else if filter.eq_ignore_ascii_case("account-security-changed") {
+            meta.family == Some(EventFamily::AccountSecurity)
+        } else {
+            meta.key.eq_ignore_ascii_case(filter)
+                || meta
+                    .aliases
+                    .iter()
+                    .any(|alias| alias.eq_ignore_ascii_case(filter))
         }
     }
 }
 
 fn enabled(event: Event, level: Option<&str>, events: Option<&str>) -> bool {
-    event.level() >= Level::parse(level) &&
-        events.is_some_and(|events| {
-            events.split(',').any(|filter| {
-                event.selected_by(&filter.trim().to_ascii_lowercase())
-            })
+    event.level() >= Level::parse(level)
+        && events.is_some_and(|events| {
+            events
+                .split(',')
+                .any(|filter| event.selected_by(filter.trim()))
         })
 }
 
@@ -260,9 +185,10 @@ async fn deliver_telegram(env: &Env, text: &str) -> AppResult<()> {
     ) else {
         return Ok(());
     };
-    if !token.bytes().all(|byte| {
-        byte.is_ascii_alphanumeric() || matches!(byte, b':' | b'_' | b'-')
-    }) {
+    if !token
+        .bytes()
+        .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b':' | b'_' | b'-'))
+    {
         return Ok(());
     }
     let url = format!("https://api.telegram.org/bot{token}/sendMessage");

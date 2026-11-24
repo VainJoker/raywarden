@@ -4,11 +4,8 @@ import re
 import sqlite3
 import unittest
 
-from sql_regression import seed_cipher, seed_attachment
-
-from sql_source import account_guard, source as read_source
-from sql_regression import (NOW, OLD, FUTURE, account_snapshot, database,
-                            function_source, rust_strings, statement, statements)
+from sql_fixtures import NOW, OLD, FUTURE, account_snapshot, database, seed_attachment, seed_cipher, send_guard
+from sql_source import account_guard, literal, rust_strings, source as read_source, statement, statements
 
 
 def service_strings():
@@ -22,10 +19,9 @@ def rotation_claim(db, user="alice"):
     for name in ("CIPHERS", "FOLDERS", "ATTACHMENTS", "PASSKEYS"):
         match = re.search(rf"const {name}:.*?=\s*&\[(.*?)\];", source, re.S)
         constants[name] = list(rust_strings(match.group(1)))
-    guard_template = next(text for text in rust_strings(read_source("cipher_mutation"))
-                          if text.startswith("SELECT CASE WHEN ({predicate})"))
+    guard_template = statement("cipher_mutation", "guard")
     def guard(predicate, values):
-        return guard_template.format(predicate=predicate, CONFLICT_SENTINEL="RAY_VAULT_WRITE_CONFLICT"), values
+        return guard_template.format(predicate=predicate), values
     guards = []
     for table, name, where in [
         ("ciphers", "CIPHERS", "user_id=?1"), ("folders", "FOLDERS", "user_id=?1"),
@@ -38,8 +34,6 @@ def rotation_claim(db, user="alice"):
         predicate = " AND ".join(f"{column} IS ?{i+2}" for i, column in enumerate(columns))
         for row in rows:
             guards.append(guard(f"EXISTS(SELECT 1 FROM {table} WHERE {where} AND {predicate})", (user, *row)))
-    from send_transactions_sql import send_guard
-    from sql_source import literal
     sends = db.execute("SELECT * FROM sends WHERE user_id=? ORDER BY id", (user,)).fetchall()
     guards.append(guard(literal("send_mutation", "(SELECT COUNT(*) FROM sends"), (user, len(sends))))
     guards.extend(send_guard(dict(row)) for row in sends)
@@ -80,14 +74,14 @@ class AccountV2Sql(unittest.TestCase):
         self.approval()
         self.db.execute("UPDATE users SET key='new-key',security_version=2 WHERE id='alice'")
         row = self.db.execute(statement("auth_request", "respond"),
-                              (1, "wrapped", None, NOW, "device", "approval", "alice")).fetchone()
+                              (1, "wrapped", None, NOW, "device", "approval", "alice", "stamp", "nonce")).fetchone()
         self.assertIsNone(row)
         self.assertIsNone(self.db.execute("SELECT approved FROM auth_requests").fetchone()[0])
 
     def test_same_stamp_upgrade_invalidates_approved_exchange(self):
         self.approval()
         self.assertIsNotNone(self.db.execute(statement("auth_request", "respond"),
-                                            (1, "wrapped", None, NOW, "device", "approval", "alice")).fetchone())
+                                            (1, "wrapped", None, NOW, "device", "approval", "alice", "stamp", "nonce")).fetchone())
         self.db.execute("UPDATE users SET private_key='7.new-private' WHERE id='alice'")
         self.assertIsNone(self.db.execute(statement("auth_request", "consume"), (NOW, "approval")).fetchone())
 
@@ -123,16 +117,6 @@ class AccountV2Sql(unittest.TestCase):
         self.db.commit()
         self.assertIsNone(apply_rotation(self.db, claim, args, guards))
 
-    def test_prf_update_rejects_material_from_previous_account_generation(self):
-        snapshot = account_snapshot(self.db, "alice")
-        self.db.execute("INSERT INTO webauthn_credentials(id,user_id,slot,name,credential_id,public_key,sign_count,credential_use,account_snapshot,created_at,updated_at) VALUES('credential','alice',1,'Passkey','wire','public',0,'login',?,?,?)", (snapshot, OLD, OLD))
-        self.db.execute("UPDATE users SET key='upgraded-user-key' WHERE id='alice'")
-        changed = self.db.execute(statement("webauthn", "update_keys"),
-                                  ("Passkey", 0, "enc-public", "stale-key", "enc-private", NOW, "credential", "alice", snapshot,
-                                   "stamp", "device", "nonce", 0, "accepted-challenge")).fetchone()
-        self.assertIsNone(changed)
-        self.assertIsNone(self.db.execute("SELECT encrypted_user_key FROM webauthn_credentials").fetchone()[0])
-
     def test_large_blob_collection_stays_under_d1_value_and_function_limits(self):
         self.db.setlimit(sqlite3.SQLITE_LIMIT_LENGTH, 2_000_000)
         self.db.setlimit(sqlite3.SQLITE_LIMIT_FUNCTION_ARG, 32)
@@ -144,6 +128,60 @@ class AccountV2Sql(unittest.TestCase):
         self.assertLess(max(len(value.encode()) for _, values in guards for value in values if isinstance(value, str)), 500_000)
         self.assertIsNotNone(apply_rotation(self.db, claim, args, guards))
         self.assertEqual(self.db.execute("SELECT COUNT(*) FROM ciphers").fetchone()[0], 5)
+
+    def test_rotation_attachment_writes_require_matching_cipher_and_write_token(self):
+        seed_cipher(self.db, "a", data={"name": "encrypted", "key": "wrapped-item-key"})
+        seed_cipher(self.db, "b", "bob")
+        seed_attachment(self.db, "file-a", "a")
+        seed_attachment(self.db, "file-b", "b")
+        self.db.execute(statement("device", "persist_session_statement"), ("alice", "device", "browser", 2, "nonce", NOW))
+        claim, args, guards = rotation_claim(self.db)
+        cipher_update = literal("account_rotation", "UPDATE ciphers SET data=", "cipher_write")
+        attachment_update = literal("account_rotation", "UPDATE attachments SET ", "attachment_write")
+        self.db.commit()
+        with self.db:
+            self.assertIsNotNone(self.db.execute(claim, args).fetchone())
+            for query, values in guards:
+                self.db.execute(query, values).fetchall()
+            self.assertEqual(self.db.execute(cipher_update, ('{"name":"rotated","key":"rotated-key"}', NOW, "a", "alice", args[10])).rowcount, 1)
+            self.assertEqual(self.db.execute(attachment_update, ("rotated-file", "rotated-file-key", NOW, "file-a", "a", "alice", args[10])).rowcount, 1)
+            self.db.execute(attachment_update, ("bad-file", "bad-key", NOW, "file-b", "a", "alice", args[10]))
+            self.db.execute(attachment_update, ("bad-file", "bad-key", NOW, "file-b", "b", "alice", "wrong-write-token"))
+        rows = {row["id"]: row["encrypted_key"] for row in self.db.execute("SELECT * FROM attachments")}
+        self.assertEqual(rows, {"file-a": "rotated-file-key", "file-b": "attachment-key"})
+        value = self.db.execute("SELECT * FROM ciphers WHERE id=?", ("a",)).fetchone()
+        self.assertEqual(json.loads(value["data"])["key"], "rotated-key")
+
+    def test_failed_rotation_rolls_back_content_and_wrapping_keys_together(self):
+        seed_cipher(self.db, "a", data={"name": "encrypted", "key": "wrapped-item-key"})
+        seed_attachment(self.db, "file-a", "a")
+        self.db.execute(
+            "INSERT INTO sends(id,user_id,name,send_type,data,encrypted_key,created_at,updated_at,deletes_at,access_stamp) "
+            "VALUES('send','alice','encrypted-name',0,'{}','wrapped-send-key',?,?,?,'access-stamp')",
+            (NOW, NOW, FUTURE),
+        )
+        self.approval()
+        self.db.execute(statement("device", "persist_session_statement"), ("alice", "device", "browser", 2, "nonce", NOW))
+        # Inject a late failure at the real rotation batch's approval cleanup.
+        self.db.execute("CREATE TEMP TRIGGER reject_rotation_cleanup BEFORE DELETE ON auth_requests BEGIN SELECT RAISE(ABORT,'injected cleanup failure'); END")
+        claim, args, guards = rotation_claim(self.db)
+        cipher_update = literal("account_rotation", "UPDATE ciphers SET data=", "cipher_write")
+        attachment_update = literal("account_rotation", "UPDATE attachments SET ", "attachment_write")
+        cleanup = literal("account_rotation", "DELETE FROM auth_requests WHERE user_id=?1 AND EXISTS", "invalidation_writes")
+        self.db.commit()
+        with self.assertRaisesRegex(sqlite3.IntegrityError, "injected cleanup failure"):
+            with self.db:
+                self.assertIsNotNone(self.db.execute(claim, args).fetchone())
+                for query, values in guards:
+                    self.db.execute(query, values).fetchall()
+                self.assertEqual(self.db.execute(statement("send", "rotation_statement"), ("rotated-send-key", NOW, "send", "alice", args[10], "new-access-stamp")).rowcount, 1)
+                self.assertEqual(self.db.execute(cipher_update, ('{"name":"rotated","key":"rotated-key"}', NOW, "a", "alice", args[10])).rowcount, 1)
+                self.assertEqual(self.db.execute(attachment_update, ("rotated-file", "rotated-file-key", NOW, "file-a", "a", "alice", args[10])).rowcount, 1)
+                self.db.execute(cleanup, ("alice", args[10]))
+        self.assertEqual(self.db.execute("SELECT key FROM users WHERE id='alice'").fetchone()[0], "key")
+        self.assertEqual(json.loads(self.db.execute("SELECT data FROM ciphers WHERE id='a'").fetchone()[0])["key"], "wrapped-item-key")
+        self.assertEqual(self.db.execute("SELECT encrypted_key FROM attachments WHERE id='file-a'").fetchone()[0], "attachment-key")
+        self.assertEqual(self.db.execute("SELECT encrypted_key FROM sends WHERE id='send'").fetchone()[0], "wrapped-send-key")
 
     def email_args(self):
         return ("new@example.test", "new-hash", "new-salt", "rewrapped-user", 0, 600000,
@@ -227,7 +265,7 @@ class PasswordVerifierSql(unittest.TestCase):
 
     def upgrade(self):
         old = self.user()
-        query = statement("user", "migrate_password_if_current").replace("{}", account_guard(9))
+        query = statement("user", "migrate_password_statement").replace("{}", account_guard(9))
         return query, ("upgraded-hash", "upgraded-salt", 600000, "alice", old["master_password_hash"],
                        old["password_salt"], old["password_iterations"], old["security_stamp"], account_snapshot(self.db, "alice"))
 

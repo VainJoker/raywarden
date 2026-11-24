@@ -1,57 +1,43 @@
 //! Authenticated vault transactions; SQL and row assertions live in models.
-use worker::{
-    D1Database,
-    D1PreparedStatement,
-};
+use worker::{D1Database, D1PreparedStatement, Env};
 
 use crate::{
-    app::AppContext,
     errors::AppResult,
-    models::{
-        identity::account_keys::AccountSnapshot,
-        mutation,
-        vault::cipher::CipherRow,
-    },
+    models::{identity::account_keys::AccountSnapshot, mutation, vault::cipher::CipherRow},
     service::{
-        identity::session::Claims,
-        notifications::{
-            self,
-            UpdateType,
-            admin,
-            admin::Event,
-        },
+        identity::session::{Claims, TokenUse},
+        notifications::{self, UpdateType, admin, admin::Event},
     },
 };
 
 /// The session and ordered snapshot checks for a single vault write.
 pub(crate) struct VaultWrite<'a> {
-    state:  &'a AppContext,
+    db: &'a D1Database,
+    env: &'a Env,
     claims: &'a Claims,
     guards: Vec<D1PreparedStatement>,
 }
 
 impl<'a> VaultWrite<'a> {
-    pub(crate) const fn new(state: &'a AppContext, claims: &'a Claims) -> Self {
+    pub(crate) const fn new(db: &'a D1Database, env: &'a Env, claims: &'a Claims) -> Self {
         Self {
-            state,
+            db,
+            env,
             claims,
             guards: Vec::new(),
         }
     }
 
     pub(crate) const fn database(&self) -> &'a D1Database {
-        self.state.database()
+        self.db
     }
 
     pub(crate) fn user_id(&self) -> &str {
         &self.claims.sub
     }
 
-    pub(crate) async fn guard_account_key(
-        &mut self,
-    ) -> AppResult<AccountSnapshot> {
-        let (account, guard) =
-            account_key_guard(self.database(), self.claims).await?;
+    pub(crate) async fn guard_account_key(&mut self) -> AppResult<AccountSnapshot> {
+        let (account, guard) = account_key_guard(self.database(), self.claims).await?;
         self.guards.push(guard);
         Ok(account)
     }
@@ -62,10 +48,7 @@ impl<'a> VaultWrite<'a> {
         Ok(())
     }
 
-    pub(crate) fn guard_folder(
-        &mut self,
-        folder_id: Option<&str>,
-    ) -> AppResult<()> {
+    pub(crate) fn guard_folder(&mut self, folder_id: Option<&str>) -> AppResult<()> {
         self.guards.push(mutation::folder_guard(
             self.database(),
             self.user_id(),
@@ -86,11 +69,9 @@ impl<'a> VaultWrite<'a> {
         self,
         writes: Vec<D1PreparedStatement>,
     ) -> AppResult<CommittedVaultWrite<'a>> {
-        let revision =
-            commit(self.state.database(), self.claims, self.guards, writes)
-                .await?;
+        let revision = commit(self.db, self.claims, self.guards, writes).await?;
         Ok(CommittedVaultWrite {
-            state: self.state,
+            env: self.env,
             claims: self.claims,
             revision,
         })
@@ -99,15 +80,15 @@ impl<'a> VaultWrite<'a> {
 
 /// The committed revision used by vault notifications for this write.
 pub(crate) struct CommittedVaultWrite<'a> {
-    state:    &'a AppContext,
-    claims:   &'a Claims,
+    env: &'a Env,
+    claims: &'a Claims,
     revision: String,
 }
 
 impl CommittedVaultWrite<'_> {
     pub(crate) async fn publish_cipher(&self, kind: UpdateType, id: &str) {
         notifications::publish_cipher_update(
-            &self.state.env,
+            self.env,
             &self.claims.sub,
             kind,
             id,
@@ -119,7 +100,7 @@ impl CommittedVaultWrite<'_> {
 
     pub(crate) async fn publish_folder(&self, kind: UpdateType, id: &str) {
         notifications::publish_revision_update(
-            &self.state.env,
+            self.env,
             &self.claims.sub,
             kind,
             id,
@@ -132,7 +113,7 @@ impl CommittedVaultWrite<'_> {
 
     pub(crate) async fn publish_user(&self, kind: UpdateType) {
         notifications::publish_user_update(
-            &self.state.env,
+            self.env,
             &self.claims.sub,
             kind,
             &self.revision,
@@ -142,7 +123,7 @@ impl CommittedVaultWrite<'_> {
     }
 
     pub(crate) async fn emit_admin(&self, event: Event) {
-        admin::emit(&self.state.env, event, &self.claims.sub).await;
+        admin::emit(self.env, event, &self.claims.sub).await;
     }
 }
 
@@ -150,7 +131,7 @@ pub async fn account_key_guard(
     db: &D1Database,
     claims: &Claims,
 ) -> AppResult<(AccountSnapshot, D1PreparedStatement)> {
-    claims.validate_session(db, "access").await?;
+    claims.validate_session(db, TokenUse::Access).await?;
     mutation::account_snapshot_guard(db, &claims.sub).await
 }
 

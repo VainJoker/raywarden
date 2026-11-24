@@ -1,23 +1,10 @@
 //! Account-key protocol DTOs, validation and response projection.
-use serde::{
-    Deserialize,
-    Serialize,
-};
-use serde_json::{
-    Value,
-    json,
-};
+use serde::{Deserialize, Serialize};
+use serde_json::{Value, json};
 
 use crate::{
-    errors::{
-        AppError,
-        AppResult,
-        AuthError,
-    },
-    models::identity::{
-        account_keys::AccountKeyMaterial,
-        user::UserRow,
-    },
+    errors::{AppError, AppResult, AuthError},
+    models::identity::{account_keys::AccountKeyMaterial, user::UserRow},
 };
 
 fn required(value: &str, field: &str) -> AppResult<()> {
@@ -39,6 +26,32 @@ pub struct AccountKeysRequest {
     pub security_state: Option<SecurityState>,
 }
 
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct WrappedRotationKeys {
+    public_key_encryption_key_pair: PublicKeyEncryptionKeyPair,
+    signature_key_pair: Option<SignatureKeyPair>,
+    security_state: Option<SecurityState>,
+}
+
+impl WrappedRotationKeys {
+    pub(crate) fn into_validated(self) -> AppResult<ValidatedAccountKeys> {
+        let pair = self.public_key_encryption_key_pair;
+        required(
+            &pair.wrapped_private_key,
+            "UserKeyEncryptedAccountPrivateKey",
+        )?;
+        required(&pair.public_key, "AccountPublicKey")?;
+        ValidatedAccountKeys::from_wire(
+            pair.wrapped_private_key,
+            pair.public_key,
+            pair.signed_public_key,
+            self.signature_key_pair,
+            self.security_state,
+        )
+    }
+}
+
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 #[allow(
@@ -47,8 +60,8 @@ pub struct AccountKeysRequest {
 )]
 pub struct PublicKeyEncryptionKeyPair {
     pub wrapped_private_key: String,
-    pub public_key:          String,
-    pub signed_public_key:   Option<String>,
+    pub public_key: String,
+    pub signed_public_key: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -56,71 +69,84 @@ pub struct PublicKeyEncryptionKeyPair {
 pub struct SignatureKeyPair {
     pub signature_algorithm: String,
     pub wrapped_signing_key: String,
-    pub verifying_key:       String,
+    pub verifying_key: String,
 }
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SecurityState {
-    pub security_state:   String,
+    pub security_state: String,
     pub security_version: i32,
 }
 
 #[derive(Debug, Clone)]
 pub struct ValidatedAccountKeys {
     private_key: String,
-    public_key:  String,
-    version:     AccountKeyVersion,
+    public_key: String,
+    version: AccountKeyVersion,
 }
 
 #[derive(Debug, Clone)]
 enum AccountKeyVersion {
     V1,
     V2 {
-        signed_public_key:  String,
-        security_state:     SecurityState,
+        signed_public_key: String,
+        security_state: SecurityState,
         signature_key_pair: SignatureKeyPair,
     },
 }
 
 impl AccountKeysRequest {
-    pub fn validate(&self) -> AppResult<ValidatedAccountKeys> {
+    pub fn into_validated(self) -> AppResult<ValidatedAccountKeys> {
         required(
             &self.user_key_encrypted_account_private_key,
             "UserKeyEncryptedAccountPrivateKey",
         )?;
         required(&self.account_public_key, "AccountPublicKey")?;
-        let (private_key, public_key, signed_public_key) =
-            match &self.public_key_encryption_key_pair {
-                Some(pair) => {
-                    required(&pair.wrapped_private_key, "WrappedPrivateKey")?;
-                    required(&pair.public_key, "PublicKey")?;
-                    (
-                        pair.wrapped_private_key.clone(),
-                        pair.public_key.clone(),
-                        pair.signed_public_key.clone(),
-                    )
-                }
-                None => (
-                    self.user_key_encrypted_account_private_key.clone(),
-                    self.account_public_key.clone(),
-                    None,
-                ),
-            };
-        if let Some(pair) = &self.signature_key_pair {
+        let (private_key, public_key, signed_public_key) = match self.public_key_encryption_key_pair
+        {
+            Some(pair) => {
+                required(&pair.wrapped_private_key, "WrappedPrivateKey")?;
+                required(&pair.public_key, "PublicKey")?;
+                (
+                    pair.wrapped_private_key,
+                    pair.public_key,
+                    pair.signed_public_key,
+                )
+            }
+            None => (
+                self.user_key_encrypted_account_private_key,
+                self.account_public_key,
+                None,
+            ),
+        };
+        ValidatedAccountKeys::from_wire(
+            private_key,
+            public_key,
+            signed_public_key,
+            self.signature_key_pair,
+            self.security_state,
+        )
+    }
+}
+
+impl ValidatedAccountKeys {
+    fn from_wire(
+        private_key: String,
+        public_key: String,
+        signed_public_key: Option<String>,
+        signature_key_pair: Option<SignatureKeyPair>,
+        security_state: Option<SecurityState>,
+    ) -> AppResult<Self> {
+        if let Some(pair) = &signature_key_pair {
             required(&pair.signature_algorithm, "SignatureAlgorithm")?;
             required(&pair.wrapped_signing_key, "WrappedSigningKey")?;
             required(&pair.verifying_key, "VerifyingKey")?;
-            if !matches!(
-                pair.signature_algorithm.as_str(),
-                "ed25519" | "mldsa44"
-            ) {
-                return Err(AppError::bad_request(
-                    "Unsupported signature algorithm",
-                ));
+            if !matches!(pair.signature_algorithm.as_str(), "ed25519" | "mldsa44") {
+                return Err(AppError::bad_request("Unsupported signature algorithm"));
             }
         }
-        if let Some(state) = &self.security_state {
+        if let Some(state) = &security_state {
             required(&state.security_state, "SecurityState")?;
             if state.security_state.encode_utf16().count() > 10_000 {
                 return Err(AppError::bad_request(
@@ -129,17 +155,13 @@ impl AccountKeysRequest {
                 ));
             }
         }
-        let version = match (
-            &signed_public_key,
-            &self.signature_key_pair,
-            &self.security_state,
-        ) {
+        let version = match (signed_public_key, signature_key_pair, security_state) {
             (Some(signed), Some(pair), Some(state)) => {
-                required(signed, "SignedPublicKey")?;
+                required(&signed, "SignedPublicKey")?;
                 AccountKeyVersion::V2 {
-                    signed_public_key:  signed.clone(),
-                    security_state:     state.clone(),
-                    signature_key_pair: pair.clone(),
+                    signed_public_key: signed,
+                    security_state: state,
+                    signature_key_pair: pair,
                 }
             }
             (None, None, None) => AccountKeyVersion::V1,
@@ -151,21 +173,15 @@ impl AccountKeysRequest {
                 ));
             }
         };
-        Ok(ValidatedAccountKeys {
+        Ok(Self {
             private_key,
             public_key,
             version,
         })
     }
-}
-
-impl ValidatedAccountKeys {
     // Legacy registration accepts the pair as supplied; callers retain their
     // existing validation rather than imposing newer request rules here.
-    pub const fn from_legacy_pair(
-        private_key: String,
-        public_key: String,
-    ) -> Self {
+    pub const fn from_legacy_pair(private_key: String, public_key: String) -> Self {
         Self {
             private_key,
             public_key,
@@ -174,12 +190,9 @@ impl ValidatedAccountKeys {
     }
 
     pub fn into_persistence_material(self) -> AppResult<AccountKeyMaterial> {
-        let (
-            signed_public_key,
-            security_state,
-            security_version,
-            signature_key_pair,
-        ) = match self.version {
+        let (signed_public_key, security_state, security_version, signature_key_pair) = match self
+            .version
+        {
             AccountKeyVersion::V1 => (None, None, None, None),
             AccountKeyVersion::V2 {
                 signed_public_key,
@@ -189,10 +202,7 @@ impl ValidatedAccountKeys {
                 Some(signed_public_key),
                 Some(security_state.security_state),
                 Some(security_state.security_version),
-                Some(
-                    serde_json::to_string(&signature_key_pair)
-                        .map_err(AppError::internal_error)?,
-                ),
+                Some(serde_json::to_string(&signature_key_pair).map_err(AppError::internal_error)?),
             ),
         };
         Ok(AccountKeyMaterial {
@@ -220,12 +230,12 @@ impl ValidatedAccountKeys {
             ..
         } = &self.version
         {
-            if self.private_key.split_once('.').map(|(kind, _)| kind) !=
-                Some("7") ||
-                pair.wrapped_signing_key
+            if self.private_key.split_once('.').map(|(kind, _)| kind) != Some("7")
+                || pair
+                    .wrapped_signing_key
                     .split_once('.')
-                    .map(|(kind, _)| kind) !=
-                    Some("7")
+                    .map(|(kind, _)| kind)
+                    != Some("7")
             {
                 return Err(AppError::bad_request(
                     "The provided private keys must be wrapped with \
@@ -233,14 +243,11 @@ impl ValidatedAccountKeys {
                 ));
             }
             if crate::service::identity::user::is_v2(user) {
-                let old: SignatureKeyPair = serde_json::from_str(
-                    user.signature_key_pair.as_deref().ok_or_else(|| {
-                        AppError::bad_request(
-                            "The account is missing its signature key pair",
-                        )
-                    })?,
-                )
-                .map_err(AppError::internal_error)?;
+                let old: SignatureKeyPair =
+                    serde_json::from_str(user.signature_key_pair.as_deref().ok_or_else(|| {
+                        AppError::bad_request("The account is missing its signature key pair")
+                    })?)
+                    .map_err(AppError::internal_error)?;
                 if pair.verifying_key != old.verifying_key {
                     return Err(AppError::bad_request(
                         "Changing the verifying key is not possible during \
@@ -255,9 +262,7 @@ impl ValidatedAccountKeys {
                      during key rotation",
                 ));
             }
-            if self.private_key.split_once('.').map(|(kind, _)| kind) !=
-                Some("2")
-            {
+            if self.private_key.split_once('.').map(|(kind, _)| kind) != Some("2") {
                 return Err(AppError::bad_request(
                     "The provided account private key was not wrapped with \
                      AES-256-CBC-HMAC",
@@ -284,19 +289,30 @@ pub struct RotateAccountKeysRequest {
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct PasskeyUnlockItem {
+    #[serde(default)]
+    pub id: Option<String>,
+    #[serde(default)]
+    pub encrypted_public_key: Option<String>,
+    #[serde(default)]
+    pub encrypted_user_key: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct AccountUnlockPayload {
     pub master_password_unlock_data: RotateMasterPasswordUnlockPayload,
     #[serde(default)]
-    pub passkey_unlock_data: Vec<serde_json::Value>,
+    pub passkey_unlock_data: Vec<PasskeyUnlockItem>,
     #[serde(default)]
     #[serde(rename = "v2UpgradeToken")]
     pub _v2_upgrade_token: Option<serde_json::Value>,
     #[serde(default)]
-    pub emergency_access_unlock_data: Vec<serde_json::Value>,
+    pub emergency_access_unlock_data: Vec<serde::de::IgnoredAny>,
     #[serde(default)]
-    pub organization_account_recovery_unlock_data: Vec<serde_json::Value>,
+    pub organization_account_recovery_unlock_data: Vec<serde::de::IgnoredAny>,
     #[serde(default)]
-    pub device_key_unlock_data: Vec<serde_json::Value>,
+    pub device_key_unlock_data: Vec<serde::de::IgnoredAny>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -320,7 +336,7 @@ pub struct RotateAccountPayload {
     pub ciphers: Vec<crate::service::vault::cipher::CipherRequest>,
     pub folders: Vec<RotateFolderRequest>,
     #[serde(default)]
-    pub sends:   Vec<crate::service::send::RotateSendRequest>,
+    pub sends: Vec<crate::service::send::RotateSendRequest>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -329,20 +345,17 @@ pub struct RotateFolderRequest {
     // There is a bug in 2024.3.x which adds a `null` item.
     // To bypass this we allow an Option here, but skip it during the updates
     // See: https://github.com/bitwarden/clients/issues/8453
-    pub id:   Option<String>,
+    pub id: Option<String>,
     pub name: String,
 }
 
 impl RotateAccountKeysRequest {
-    pub(crate) fn validate_rotation_metadata(
-        &self,
-        user: &UserRow,
-    ) -> AppResult<()> {
+    pub(crate) fn validate_rotation_metadata(&self, user: &UserRow) -> AppResult<()> {
         let unlock_data = &self.account_unlock_data.master_password_unlock_data;
-        let kdf_matches = user.kdf_type == unlock_data.kdf_type &&
-            user.kdf_iterations == unlock_data.kdf_iterations &&
-            user.kdf_memory == unlock_data.kdf_memory &&
-            user.kdf_parallelism == unlock_data.kdf_parallelism;
+        let kdf_matches = user.kdf_type == unlock_data.kdf_type
+            && user.kdf_iterations == unlock_data.kdf_iterations
+            && user.kdf_memory == unlock_data.kdf_memory
+            && user.kdf_parallelism == unlock_data.kdf_parallelism;
 
         if user.email != unlock_data.email || !kdf_matches {
             log::error!(
@@ -354,18 +367,16 @@ impl RotateAccountKeysRequest {
             return Err(AppError::Auth(AuthError::InvalidKdf(
                 "Changing the kdf variant or email is not supported during \
                  key rotation"
-                    .to_string(),
+                    .into(),
             )));
         }
 
         if user.public_key != self.account_keys.account_public_key {
-            log::error!(
-                "Public key mismatch in rotation request: stored != provided"
-            );
+            log::error!("Public key mismatch in rotation request: stored != provided");
             return Err(AppError::Auth(AuthError::InvalidKdf(
                 "Changing the asymmetric keypair is not supported during key \
                  rotation"
-                    .to_string(),
+                    .into(),
             )));
         }
 
@@ -374,8 +385,8 @@ impl RotateAccountKeysRequest {
 }
 
 pub fn is_valid_key_id(value: &str) -> bool {
-    value.len() == 32 &&
-        value
+    value.len() == 32
+        && value
             .bytes()
             .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
 }
@@ -421,11 +432,11 @@ mod tests {
     }
     #[test]
     fn v2_material_is_complete_or_rejected() {
-        let valid: AccountKeysRequest = serde_json::from_value(v2())
-            .expect("valid account request fixture");
+        let valid: AccountKeysRequest =
+            serde_json::from_value(v2()).expect("valid account request fixture");
         assert!(
             valid
-                .validate()
+                .into_validated()
                 .expect("valid account request fixture")
                 .is_v2()
         );
@@ -434,25 +445,22 @@ mod tests {
             body.as_object_mut()
                 .expect("valid account request fixture")
                 .remove(field);
-            let keys: AccountKeysRequest = serde_json::from_value(body)
-                .expect("valid account request fixture");
-            assert!(keys.validate().is_err());
+            let keys: AccountKeysRequest =
+                serde_json::from_value(body).expect("valid account request fixture");
+            assert!(keys.into_validated().is_err());
         }
         let mut body = v2();
         body["signatureKeyPair"]["signatureAlgorithm"] = json!("unknown");
         assert!(
             serde_json::from_value::<AccountKeysRequest>(body)
                 .expect("valid account request fixture")
-                .validate()
+                .into_validated()
                 .is_err()
         );
     }
     #[test]
     fn persistence_keeps_complete_versions_and_signature_json() {
-        let v1 = ValidatedAccountKeys::from_legacy_pair(
-            String::new(),
-            "public".into(),
-        );
+        let v1 = ValidatedAccountKeys::from_legacy_pair(String::new(), "public".into());
         assert!(!v1.is_v2());
         let v1 = v1.into_persistence_material().expect("V1 material");
         assert_eq!(v1.private_key, "");
@@ -461,10 +469,10 @@ mod tests {
         assert!(v1.security_version.is_none());
         assert!(v1.signature_key_pair.is_none());
 
-        let request: AccountKeysRequest = serde_json::from_value(v2())
-            .expect("valid account request fixture");
+        let request: AccountKeysRequest =
+            serde_json::from_value(v2()).expect("valid account request fixture");
         let material = request
-            .validate()
+            .into_validated()
             .expect("valid V2 material")
             .into_persistence_material()
             .expect("persistable V2 material");
@@ -483,9 +491,11 @@ mod tests {
 
     #[test]
     fn rotation_preserves_public_identity_and_prohibits_downgrade() {
-        let keys: AccountKeysRequest = serde_json::from_value(v2())
+        let keys: AccountKeysRequest =
+            serde_json::from_value(v2()).expect("valid account request fixture");
+        let keys = keys
+            .into_validated()
             .expect("valid account request fixture");
-        let keys = keys.validate().expect("valid account request fixture");
         let mut user = user();
         assert!(keys.validate_rotation(&user).is_ok());
         user.public_key = "different".into();
@@ -499,10 +509,7 @@ mod tests {
         user.security_state = material.security_state;
         user.security_version = material.security_version;
         user.signature_key_pair = material.signature_key_pair;
-        let old = ValidatedAccountKeys::from_legacy_pair(
-            "2.private".into(),
-            "public".into(),
-        );
+        let old = ValidatedAccountKeys::from_legacy_pair("2.private".into(), "public".into());
         assert!(old.validate_rotation(&user).is_err());
         let mut changed = keys.clone();
         let AccountKeyVersion::V2 {

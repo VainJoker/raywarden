@@ -1,35 +1,23 @@
+use std::sync::Arc;
+
 use axum::{
-    Json,
     extract::State,
-    http::{
-        HeaderMap,
-        HeaderValue,
-        header,
-    },
-    response::{
-        Html,
-        IntoResponse,
-        Response,
-    },
+    http::{HeaderMap, HeaderValue, header},
+    response::{Html, IntoResponse, Response},
 };
-use serde::{
-    Deserialize,
-    Serialize,
-};
+use serde::{Deserialize, Serialize};
 
 use crate::{
     api::{
         AppState,
-        common::response::ApiResponse,
+        common::{
+            extract::ClientIp,
+            json::Json,
+            response::{ApiResponse, NoStore, WithCookies},
+        },
     },
-    errors::{
-        AppError,
-        AppResult,
-    },
-    service::{
-        identity::setup,
-        rate_limit,
-    },
+    errors::{AppError, AppResult},
+    service::{identity::setup, rate_limit},
 };
 
 #[derive(Deserialize)]
@@ -40,14 +28,12 @@ pub(in crate::api) struct SetupRequest {
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct OwnerSetupResponse {
-    object:     &'static str,
+    object: &'static str,
     expires_in: i64,
 }
 
-fn private_response(mut response: Response) -> Response {
-    response
-        .headers_mut()
-        .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+fn private_response(response: impl IntoResponse) -> Response {
+    let mut response = NoStore(response).into_response();
     response.headers_mut().insert(
         header::X_CONTENT_TYPE_OPTIONS,
         HeaderValue::from_static("nosniff"),
@@ -69,31 +55,39 @@ fn private_response(mut response: Response) -> Response {
 
 #[worker::send]
 pub(in crate::api) async fn page() -> AppResult<Response> {
-    Ok(private_response(
-        Html(include_str!("../../../../static/setup.html")).into_response(),
-    ))
+    Ok(private_response(Html(include_str!(
+        "../../../../static/setup.html"
+    ))))
 }
 
 #[worker::send]
 pub(in crate::api) async fn authorize(
-    State(state): State<AppState>,
+    State(state): State<Arc<AppState>>,
     headers: HeaderMap,
+    ClientIp(ip): ClientIp,
     Json(payload): Json<SetupRequest>,
 ) -> AppResult<Response> {
-    rate_limit::check_auth_attempt(
-        &state,
-        format!("owner-setup:{}", rate_limit::client_ip(&headers)),
-    )
-    .await?;
-    let cookie = setup::issue_cookie(&state, &headers, &payload.token).await?;
-    let mut response = ApiResponse(OwnerSetupResponse {
-        object:     "ownerSetup",
-        expires_in: setup::TTL_SECONDS,
-    })
-    .into_response();
-    response.headers_mut().insert(
-        header::SET_COOKIE,
-        HeaderValue::from_str(&cookie).map_err(AppError::internal_error)?,
-    );
-    Ok(private_response(response))
+    rate_limit::check_auth_attempt(&state.env, format!("owner-setup:{ip}")).await?;
+    let cookie = state
+        .setup_guard()
+        .issue_cookie(&headers, &payload.token)
+        .await?;
+    Ok(private_response(WithCookies {
+        response: ApiResponse(OwnerSetupResponse {
+            object: "ownerSetup",
+            expires_in: setup::TTL_SECONDS,
+        }),
+        cookies: vec![HeaderValue::from_str(&cookie).map_err(AppError::internal_error)?],
+    }))
+}
+
+impl AppState {
+    pub(in crate::api) fn setup_guard(&self) -> setup::SetupGuard<'_> {
+        setup::SetupGuard {
+            db: self.database(),
+            env: &self.env,
+            config: &self.config,
+            access_secret: &self.jwt_keys.access_secret,
+        }
+    }
 }

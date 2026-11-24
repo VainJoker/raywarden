@@ -2,7 +2,7 @@
 import sqlite3
 import unittest
 
-from sql_regression import database, seed_cipher
+from sql_fixtures import database, seed_cipher
 from sql_source import ROOT, extract_function, rust_strings
 
 

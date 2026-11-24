@@ -3,23 +3,12 @@ import json
 import sqlite3
 import unittest
 
-from sql_regression import OLD, NOW, database, rust_strings, statements, cipher_rows_query
-from sql_source import literal, source_literals
-from send_transactions_sql import guard_sql, session_sql, key_guard
-
+from sql_fixtures import NOW, OLD, VAULT_REVISION, database, first_page, guard_sql, key_guard, row_guard, session_sql
+from sql_source import literal, statements
 
 CIPHERS = "cipher_writes"
 IMPORT = "vault_import"
 ATTACHMENTS = "attachment"
-REVISION = literal("cipher_mutation", "UPDATE users SET updated_at = ").replace(
-    "{NEXT_USER_REVISION_SQL}", literal("cipher_mutation", "CASE WHEN julianday(updated_at)")
-)
-
-
-def row_guard(row):
-    predicate = literal("cipher_mutation", "EXISTS(SELECT 1 FROM ciphers WHERE id=")
-    columns = ("id", "user_id", "organization_id", "cipher_type", "data", "is_favorite", "folder_id", "deleted_at", "archived_at", "created_at", "updated_at")
-    return guard_sql(predicate), [row[column] for column in columns]
 
 
 class CipherTransactions(unittest.TestCase):
@@ -76,7 +65,7 @@ class CipherTransactions(unittest.TestCase):
         self.db.execute("UPDATE users SET updated_at=? WHERE id='alice'", (NOW,))
         previous = NOW
         for request_time in (NOW, OLD, NOW):
-            current = self.db.execute(REVISION, (request_time, "alice")).fetchone()[0]
+            current = self.db.execute(VAULT_REVISION, (request_time, "alice")).fetchone()[0]
             self.assertGreater(current, previous)
             previous = current
 
@@ -103,7 +92,7 @@ class CipherTransactions(unittest.TestCase):
         with self.db:
             self.db.execute(folder_sql, (json.dumps([["import-folder", "encrypted-name"]]), "alice", NOW))
             self.db.execute(cipher_sql, (json.dumps([["import-cipher", 8, encoded, True, "import-folder", NOW]]), "alice", NOW))
-            self.db.execute(REVISION, (NOW, "alice")).fetchall()
+            self.db.execute(VAULT_REVISION, (NOW, "alice")).fetchall()
         row = self.db.execute("SELECT * FROM ciphers WHERE id='import-cipher'").fetchone()
         self.assertEqual((row["cipher_type"], row["folder_id"], row["archived_at"]), (8, "import-folder", NOW))
         self.assertEqual(json.loads(row["data"])["data"], blob)
@@ -124,14 +113,14 @@ class CipherTransactions(unittest.TestCase):
         with self.assertRaises(sqlite3.IntegrityError), self.db:
             self.db.execute("DELETE FROM folders WHERE id='folder'")
             self.db.execute("UPDATE ciphers SET data='new encrypted value' WHERE id='cipher'")
-            self.db.execute(REVISION, (NOW, "alice")).fetchall()
+            self.db.execute(VAULT_REVISION, (NOW, "alice")).fetchall()
         self.assertEqual(self.row()["folder_id"], "folder")
         self.assertNotEqual(self.row()["data"], "new encrypted value")
 
     def test_real_row_read_exceeds_the_old_aggregate_ceiling_with_d1_limits(self):
         blob = json.dumps({"format_version": 2, "data": "x" * 450_000})
         data = json.dumps({"name": "", "data": blob})
-        for index in range(5):
+        for index in range(10):
             self.db.execute("INSERT INTO ciphers(id,user_id,cipher_type,data,created_at,updated_at) VALUES(?,'alice',8,?,?,?)", (f"large-{index}", data, OLD, OLD))
         self.db.setlimit(sqlite3.SQLITE_LIMIT_LENGTH, 2_000_000)
         self.db.setlimit(sqlite3.SQLITE_LIMIT_FUNCTION_ARG, 32)
@@ -139,10 +128,12 @@ class CipherTransactions(unittest.TestCase):
         # second implementation of the production response serializer.
         with self.assertRaises(sqlite3.DataError):
             self.db.execute("SELECT json_group_array(json(data)) FROM ciphers WHERE id LIKE 'large-%'").fetchone()
-        rows = self.db.execute(cipher_rows_query(True, "WHERE c.id LIKE 'large-%'", "ORDER BY c.id")).fetchall()
-        self.assertEqual(len(rows), 5)
-        self.assertEqual(sum(len(row["data"]) for row in rows), 5 * len(data))
-        self.assertEqual(json.loads(rows[4]["data"])["data"], blob)
+        page = first_page(self.db, "cipher", "list_page", ("alice", 1), include_attachments=True)
+        rows = [row for row in page if row["id"].startswith("large-")]
+        self.assertGreater(len(rows), 0)
+        self.assertLess(len(rows), 10)
+        self.assertTrue(page[-1]["page_has_more"])
+        self.assertTrue(all(row["data"] == data for row in rows))
 
     def test_attachment_publication_adopts_only_one_staged_pointer(self):
         self.db.execute("INSERT INTO attachments_pending(id,cipher_id,file_name,file_size_bytes,encrypted_key,created_at,updated_at) VALUES('file','cipher','encrypted',7,'wrapped',?,?)", (OLD, OLD))
@@ -156,7 +147,7 @@ class CipherTransactions(unittest.TestCase):
             self.db.execute(writes[0], ("file", "cipher", "encrypted", 7, "wrapped", OLD, NOW, None, "staged-winner"))
             self.db.execute(writes[1], ("file",))
             self.db.execute(writes[2], (NOW, "cipher", "alice"))
-            self.db.execute(REVISION, (NOW, "alice")).fetchall()
+            self.db.execute(VAULT_REVISION, (NOW, "alice")).fetchall()
         with self.assertRaises(sqlite3.OperationalError), self.db:
             self.db.execute(guard_sql(predicate), params).fetchall()
             self.db.execute("UPDATE attachments SET storage_key='late-loser' WHERE id='file'")

@@ -31,10 +31,9 @@ mod tests {
 
     #[test]
     fn timestamps_use_fixed_utc_precision_without_losing_offset_semantics() {
-        let utc = parse("2026-11-17T01:02:03.123456789Z")
-            .expect("test fixture should be valid");
-        let offset = parse("2026-11-17T09:02:03.123456789+08:00")
-            .expect("test fixture should be valid");
+        let utc = parse("2026-11-17T01:02:03.123456789Z").expect("test fixture should be valid");
+        let offset =
+            parse("2026-11-17T09:02:03.123456789+08:00").expect("test fixture should be valid");
         assert_eq!(utc, offset);
         assert_eq!(format_millis(utc), "2026-11-17T01:02:03.123Z");
         assert_eq!(format_micros(offset), "2026-11-17T01:02:03.123456Z");

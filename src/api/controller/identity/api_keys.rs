@@ -1,17 +1,16 @@
-use axum::{
-    Json,
-    extract::State,
-};
+use std::sync::Arc;
+
+use axum::extract::State;
 use serde::Serialize;
 
 use crate::{
     api::{
         AppState,
-        common::response::ApiResponse,
+        common::{json::Json, response::ApiResponse},
     },
     errors::AppResult,
     service::identity::{
-        api_key,
+        api_key::{ApiKeyAction, ApiKeyService},
         session::Claims,
         user::AccountVerificationRequest,
     },
@@ -20,9 +19,9 @@ use crate::{
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(in crate::api) struct ApiKeyResponse {
-    api_key:       String,
+    api_key: String,
     revision_date: String,
-    object:        &'static str,
+    object: &'static str,
 }
 
 impl ApiKeyResponse {
@@ -38,20 +37,32 @@ impl ApiKeyResponse {
 #[worker::send]
 pub(in crate::api) async fn get_api_key(
     claims: Claims,
-    State(state): State<AppState>,
+    State(state): State<Arc<AppState>>,
     Json(proof): Json<AccountVerificationRequest>,
 ) -> AppResult<ApiResponse<ApiKeyResponse>> {
-    let (key, revision) =
-        api_key::get_or_rotate(&state, &claims, &proof, false).await?;
+    let service = ApiKeyService {
+        db: state.database(),
+        env: &state.env,
+        access_secret: &state.jwt_keys.access_secret,
+    };
+    let (key, revision) = service
+        .get_or_rotate(&claims, &proof, ApiKeyAction::Get)
+        .await?;
     Ok(ApiResponse(ApiKeyResponse::new(key, revision)))
 }
 #[worker::send]
 pub(in crate::api) async fn rotate_api_key(
     claims: Claims,
-    State(state): State<AppState>,
+    State(state): State<Arc<AppState>>,
     Json(proof): Json<AccountVerificationRequest>,
 ) -> AppResult<ApiResponse<ApiKeyResponse>> {
-    let (key, revision) =
-        api_key::get_or_rotate(&state, &claims, &proof, true).await?;
+    let service = ApiKeyService {
+        db: state.database(),
+        env: &state.env,
+        access_secret: &state.jwt_keys.access_secret,
+    };
+    let (key, revision) = service
+        .get_or_rotate(&claims, &proof, ApiKeyAction::Rotate)
+        .await?;
     Ok(ApiResponse(ApiKeyResponse::new(key, revision)))
 }

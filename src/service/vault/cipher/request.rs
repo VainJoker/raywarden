@@ -2,18 +2,66 @@
 //! construction.
 use std::collections::HashMap;
 
-use serde::{
-    Deserialize,
-    Deserializer,
-    Serialize,
-    de,
-};
+use serde::{Deserialize, Deserializer, Serialize, Serializer, de};
 use serde_json::Value;
 
-use crate::errors::{
-    AppError,
-    AppResult,
-};
+use crate::errors::{AppError, AppResult};
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(i32)]
+pub enum CipherKind {
+    Login = 1,
+    SecureNote = 2,
+    Card = 3,
+    Identity = 4,
+    SshKey = 5,
+    BankAccount = 6,
+    DriversLicense = 7,
+    Passport = 8,
+}
+
+impl From<CipherKind> for i32 {
+    fn from(kind: CipherKind) -> Self {
+        kind as Self
+    }
+}
+
+impl TryFrom<i32> for CipherKind {
+    type Error = ();
+
+    fn try_from(value: i32) -> Result<Self, Self::Error> {
+        match value {
+            1 => Ok(Self::Login),
+            2 => Ok(Self::SecureNote),
+            3 => Ok(Self::Card),
+            4 => Ok(Self::Identity),
+            5 => Ok(Self::SshKey),
+            6 => Ok(Self::BankAccount),
+            7 => Ok(Self::DriversLicense),
+            8 => Ok(Self::Passport),
+            _ => Err(()),
+        }
+    }
+}
+
+impl Serialize for CipherKind {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_i32((*self).into())
+    }
+}
+
+impl<'de> Deserialize<'de> for CipherKind {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let value = i32::deserialize(deserializer)?;
+        Self::try_from(value).map_err(|()| {
+            de::Error::invalid_value(
+                de::Unexpected::Signed(i64::from(value)),
+                &"a valid cipher type (1=Login, 2=SecureNote, 3=Card, 4=Identity, 5=SshKey)",
+            )
+        })
+    }
+}
+
 /// Common cipher type-specific fields shared across multiple cipher structures.
 /// These represent the encrypted content fields that vary based on cipher type.
 /// Used with `#[serde(flatten)]` to embed these fields into other structs.
@@ -22,31 +70,47 @@ use crate::errors::{
 pub struct CipherPayloadFields {
     // Per-item key wrapped by the user's symmetric key.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub key:              Option<String>,
+    pub key: Option<String>,
     // Only one of these should exist, depending on cipher type
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub login:            Option<Value>,
+    pub login: Option<Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub card:             Option<Value>,
+    pub card: Option<Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub identity:         Option<Value>,
+    pub identity: Option<Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub secure_note:      Option<Value>,
+    pub secure_note: Option<Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub ssh_key:          Option<Value>,
+    pub ssh_key: Option<Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub bank_account:     Option<Value>,
+    pub bank_account: Option<Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub drivers_license:  Option<Value>,
+    pub drivers_license: Option<Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub passport:         Option<Value>,
+    pub passport: Option<Value>,
     // Common fields
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub fields:           Option<Value>,
+    pub fields: Option<Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub password_history: Option<Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub reprompt:         Option<i32>,
+    pub reprompt: Option<i32>,
+}
+
+impl CipherPayloadFields {
+    const fn active(&self, kind: CipherKind) -> Option<&Value> {
+        match kind {
+            CipherKind::Login => &self.login,
+            CipherKind::SecureNote => &self.secure_note,
+            CipherKind::Card => &self.card,
+            CipherKind::Identity => &self.identity,
+            CipherKind::SshKey => &self.ssh_key,
+            CipherKind::BankAccount => &self.bank_account,
+            CipherKind::DriversLicense => &self.drivers_license,
+            CipherKind::Passport => &self.passport,
+        }
+        .as_ref()
+    }
 }
 
 /// This struct represents the data stored in the `data` column of the `ciphers`
@@ -54,11 +118,11 @@ pub struct CipherPayloadFields {
 #[derive(Debug, Serialize, Deserialize, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct CipherPayload {
-    pub name:           String,
+    pub name: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub data:           Option<String>,
+    pub data: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub notes:          Option<String>,
+    pub notes: Option<String>,
     #[serde(flatten)]
     pub payload_fields: CipherPayloadFields,
 }
@@ -71,30 +135,26 @@ pub struct CipherPayload {
 pub struct CipherRequest {
     // Id is optional as it is included only in bulk share / key rotation
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub id:                     Option<String>,
+    pub id: Option<String>,
     // Folder id is not included in import (determined by folder_relationships)
-    #[serde(
-        default,
-        deserialize_with = "deserialize_optional_nonempty_string"
-    )]
+    #[serde(default, deserialize_with = "deserialize_optional_nonempty_string")]
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub folder_id:              Option<String>,
+    pub folder_id: Option<String>,
     #[serde(alias = "organizationID")]
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub organization_id:        Option<String>,
+    pub organization_id: Option<String>,
     #[serde(rename = "type")]
-    #[serde(deserialize_with = "deserialize_cipher_type")]
-    pub cipher_type:            i32,
-    pub name:                   Option<String>,
+    pub cipher_type: CipherKind,
+    pub name: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub data:                   Option<String>,
+    pub data: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub notes:                  Option<String>,
+    pub notes: Option<String>,
     #[serde(default)]
     #[serde(rename = "favorite")]
-    pub is_favorite:            Option<bool>,
+    pub is_favorite: Option<bool>,
     #[serde(flatten)]
-    pub payload_fields:         CipherPayloadFields,
+    pub payload_fields: CipherPayloadFields,
     // The revision datetime (in ISO 8601 format) of the client's local copy
     // Used to prevent updating a cipher when client doesn't have the latest
     // version
@@ -105,23 +165,22 @@ pub struct CipherRequest {
     pub last_known_revision_at: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     #[serde(rename = "attachments2")]
-    pub attachment_key_updates:
-        Option<HashMap<String, RotateAttachmentRequest>>,
+    pub attachment_key_updates: Option<HashMap<String, RotateAttachmentRequest>>,
     #[serde(default)]
-    pub collection_ids:         Vec<String>,
+    pub collection_ids: Vec<String>,
     #[serde(default, rename = "archivedDate")]
-    pub archived_at:            Option<String>,
+    pub archived_at: Option<String>,
     #[serde(default, alias = "encryptedByUserId")]
-    pub encrypted_for:          Option<String>,
+    pub encrypted_for: Option<String>,
     #[serde(default)]
-    pub encrypted_by_key_id:    Option<String>,
+    pub encrypted_by_key_id: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct RotateAttachmentRequest {
     pub file_name: String,
-    pub key:       String,
+    pub key: String,
 }
 
 /// Represents the full request payload for creating a cipher with collections.
@@ -131,7 +190,7 @@ pub struct RotateAttachmentRequest {
 #[serde(rename_all = "camelCase")]
 pub struct CreateCipherWithCollectionsRequest {
     #[serde(alias = "Cipher")]
-    pub cipher:         CipherRequest,
+    pub cipher: CipherRequest,
     #[serde(default)]
     #[serde(alias = "CollectionIds")]
     pub collection_ids: Vec<String>,
@@ -141,27 +200,31 @@ pub struct CreateCipherWithCollectionsRequest {
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct UpdateCipherPartialRequest {
-    #[serde(
-        default,
-        deserialize_with = "deserialize_optional_nonempty_string"
-    )]
-    pub folder_id:   Option<String>,
+    #[serde(default, deserialize_with = "deserialize_optional_nonempty_string")]
+    pub folder_id: Option<String>,
     #[serde(rename = "favorite")]
     pub is_favorite: bool,
 }
 
 impl CipherPayload {
-    pub fn from_request(request: &CipherRequest) -> Self {
-        let is_blob = request.is_blob();
-        let mut payload_fields = if is_blob {
-            CipherPayloadFields {
-                key: request.payload_fields.key.clone(),
-                reprompt: request.payload_fields.reprompt,
+    fn sealed(data: String, key: Option<String>, reprompt: Option<i32>) -> Self {
+        Self {
+            name: String::new(),
+            data: Some(data),
+            notes: None,
+            payload_fields: CipherPayloadFields {
+                key,
+                reprompt,
                 ..Default::default()
-            }
-        } else {
-            request.payload_fields.clone()
-        };
+            },
+        }
+    }
+
+    fn from_fields(
+        name: Option<String>,
+        notes: Option<String>,
+        mut payload_fields: CipherPayloadFields,
+    ) -> Self {
         for value in [
             &mut payload_fields.login,
             &mut payload_fields.card,
@@ -177,67 +240,35 @@ impl CipherPayload {
         {
             if let Some(object) = value.as_object_mut() {
                 object.remove("response");
-                if let Some(uris) =
-                    object.get_mut("uris").and_then(Value::as_array_mut)
-                {
-                    for uri in uris.iter_mut().filter_map(Value::as_object_mut)
-                    {
+                if let Some(uris) = object.get_mut("uris").and_then(Value::as_array_mut) {
+                    for uri in uris.iter_mut().filter_map(Value::as_object_mut) {
                         uri.remove("response");
                     }
                 }
             }
         }
-        if let Some(fields) =
-            payload_fields.fields.as_mut().and_then(Value::as_array_mut)
-        {
+        if let Some(fields) = payload_fields.fields.as_mut().and_then(Value::as_array_mut) {
             for field in fields.iter_mut().filter_map(Value::as_object_mut) {
                 field.remove("response");
             }
         }
         Self {
-            name: if is_blob {
-                String::new()
-            } else {
-                request.name.clone().unwrap_or_default()
-            },
-            data: is_blob.then(|| request.data.clone()).flatten(),
-            notes: if is_blob { None } else { request.notes.clone() },
+            name: name.unwrap_or_default(),
+            data: None,
+            notes,
             payload_fields,
         }
     }
 }
 
-pub(super) fn deserialize_cipher_type<'de, D>(
-    deserializer: D,
-) -> Result<i32, D::Error>
-where
-    D: Deserializer<'de>,
-{
-    let value = i32::deserialize(deserializer)?;
-    match value {
-        1..=8 => Ok(value), // Valid cipher types: Login, SecureNote, Card,
-        // Identity, SshKey
-        _ => Err(de::Error::invalid_value(
-            de::Unexpected::Signed(i64::from(value)),
-            &"a valid cipher type (1=Login, 2=SecureNote, 3=Card, 4=Identity, \
-              5=SshKey)",
-        )),
-    }
-}
-
-pub(super) fn deserialize_optional_nonempty_string<
-    'de,
-    D: Deserializer<'de>,
->(
+pub(super) fn deserialize_optional_nonempty_string<'de, D: Deserializer<'de>>(
     deserializer: D,
 ) -> Result<Option<String>, D::Error> {
-    Ok(Option::<String>::deserialize(deserializer)?
-        .filter(|value| !value.is_empty()))
+    Ok(Option::<String>::deserialize(deserializer)?.filter(|value| !value.is_empty()))
 }
 
 pub(super) fn is_data_blob_encrypted(data: &str) -> bool {
-    serde_json::from_str::<Value>(data)
-        .is_ok_and(|value| value.get("format_version").is_some())
+    serde_json::from_str::<Value>(data).is_ok_and(|value| value.get("format_version").is_some())
 }
 
 pub(super) fn is_valid_ssh_key(ssh_key: &Value) -> bool {
@@ -264,10 +295,7 @@ pub fn normalize_optional_rfc3339(value: Option<&str>) -> Option<String> {
         .map(crate::utils::time::format_micros)
 }
 
-pub fn client_revision_is_stale(
-    server_revision: &str,
-    client_revision: Option<&str>,
-) -> bool {
+pub fn client_revision_is_stale(server_revision: &str, client_revision: Option<&str>) -> bool {
     let Some(client_revision) = client_revision else {
         return false;
     };
@@ -282,14 +310,18 @@ pub fn client_revision_is_stale(
 }
 
 impl CipherRequest {
+    pub(crate) fn into_payload(self) -> CipherPayload {
+        if let Some(data) = self.data.filter(|value| is_data_blob_encrypted(value)) {
+            CipherPayload::sealed(data, self.payload_fields.key, self.payload_fields.reprompt)
+        } else {
+            CipherPayload::from_fields(self.name, self.notes, self.payload_fields)
+        }
+    }
+
     pub fn is_blob(&self) -> bool {
         self.data.as_deref().is_some_and(is_data_blob_encrypted)
     }
-    pub fn validate_encryption_context(
-        &self,
-        user_id: &str,
-        user_key_id: Option<&str>,
-    ) -> AppResult<()> {
+    fn ensure_encrypted_for(&self, user_id: &str) -> AppResult<()> {
         if self
             .encrypted_for
             .as_deref()
@@ -299,15 +331,20 @@ impl CipherRequest {
                 "Cipher was not encrypted for the current user",
             ));
         }
+        Ok(())
+    }
+
+    pub fn validate_encryption_context(
+        &self,
+        user_id: &str,
+        user_key_id: Option<&str>,
+    ) -> AppResult<()> {
+        self.ensure_encrypted_for(user_id)?;
         if let Some(key_id) = self.encrypted_by_key_id.as_deref() {
-            if user_key_id != Some(key_id) &&
-                !crate::service::identity::account_keys::is_valid_key_id(
-                    key_id,
-                )
+            if user_key_id != Some(key_id)
+                && !crate::service::identity::account_keys::is_valid_key_id(key_id)
             {
-                if user_key_id.is_some() &&
-                    uuid::Uuid::parse_str(key_id).is_ok()
-                {
+                if user_key_id.is_some() && uuid::Uuid::parse_str(key_id).is_ok() {
                     return Err(AppError::conflict(
                         "Cipher was not encrypted with the current user key",
                     ));
@@ -329,29 +366,11 @@ impl CipherRequest {
         if !self.collection_ids.is_empty() {
             return Err(AppError::bad_request("Collections are not supported"));
         }
-        if self
-            .encrypted_for
-            .as_deref()
-            .is_some_and(|id| id != user_id)
-        {
-            return Err(AppError::bad_request(
-                "Cipher was not encrypted for the current user",
-            ));
-        }
+        self.ensure_encrypted_for(user_id)?;
         if self.data.as_ref().is_some_and(|data| data.len() > 500_000) {
             return Err(AppError::bad_request("Data exceeds 500000 bytes"));
         }
-        let active = match self.cipher_type {
-            1 => &self.payload_fields.login,
-            2 => &self.payload_fields.secure_note,
-            3 => &self.payload_fields.card,
-            4 => &self.payload_fields.identity,
-            5 => &self.payload_fields.ssh_key,
-            6 => &self.payload_fields.bank_account,
-            7 => &self.payload_fields.drivers_license,
-            8 => &self.payload_fields.passport,
-            _ => return Err(AppError::bad_request("Invalid cipher type")),
-        };
+        let active = self.payload_fields.active(self.cipher_type);
         if self.is_blob() {
             return Ok(());
         }
@@ -362,12 +381,10 @@ impl CipherRequest {
         {
             return Err(AppError::bad_request("The Name field is required"));
         }
-        if !active.as_ref().is_some_and(Value::is_object) {
+        if !active.is_some_and(Value::is_object) {
             return Err(AppError::bad_request("Cipher type data is missing"));
         }
-        if self.cipher_type == 5 &&
-            !active.as_ref().is_some_and(is_valid_ssh_key)
-        {
+        if self.cipher_type == CipherKind::SshKey && !active.is_some_and(is_valid_ssh_key) {
             return Err(AppError::bad_request(
                 "SSH key is missing required encrypted fields",
             ));
@@ -376,9 +393,7 @@ impl CipherRequest {
     }
     pub fn ensure_personal(&self) -> AppResult<()> {
         if self.organization_id.is_some() {
-            return Err(AppError::bad_request(
-                "Organizations are not supported",
-            ));
+            return Err(AppError::bad_request("Organizations are not supported"));
         }
         Ok(())
     }
@@ -395,11 +410,11 @@ mod tests {
         let request: CipherRequest = serde_json::from_value(json!({
             "type": 1, "name": "encrypted", "login": {}, "favorite": true,
             "attachments2": {"file": {"fileName": "encrypted-name", "key": "wrapped-key"}}
-        })).expect("valid cipher payload fixture");
-        assert_eq!(request.cipher_type, 1);
+        }))
+        .expect("valid cipher payload fixture");
+        assert_eq!(request.cipher_type, CipherKind::Login);
         assert_eq!(request.is_favorite, Some(true));
-        let response = serde_json::to_value(request)
-            .expect("valid cipher payload fixture");
+        let response = serde_json::to_value(request).expect("valid cipher payload fixture");
         assert_eq!(response["type"], 1);
         assert_eq!(response["favorite"], true);
         assert_eq!(response["attachments2"]["file"]["key"], "wrapped-key");
@@ -409,18 +424,14 @@ mod tests {
     }
 
     #[test]
-    fn encryption_context_accepts_matching_legacy_id_but_rejects_other_users_and_old_keys()
-     {
+    fn encryption_context_accepts_matching_legacy_id_but_rejects_other_users_and_old_keys() {
         let legacy = "00000000-0000-4000-8000-000000000001";
         let request: CipherRequest=serde_json::from_value(json!({"type":1,"name":"encrypted","login":{},"encryptedFor":"owner","encryptedByKeyId":legacy})).expect("valid cipher projection fixture");
         request
             .validate_encryption_context("owner", Some(legacy))
             .expect("valid cipher projection fixture");
         assert!(matches!(
-            request.validate_encryption_context(
-                "owner",
-                Some("0123456789abcdef0123456789abcdef")
-            ),
+            request.validate_encryption_context("owner", Some("0123456789abcdef0123456789abcdef")),
             Err(AppError::Conflict { .. })
         ));
         assert!(
@@ -428,13 +439,15 @@ mod tests {
                 .validate_encryption_context("other", Some(legacy))
                 .is_err()
         );
-        let request: CipherRequest=serde_json::from_value(json!({"type":1,"name":"encrypted","login":{},"collectionIds":["unsupported"]})).expect("valid cipher projection fixture");
+        let request: CipherRequest = serde_json::from_value(
+            json!({"type":1,"name":"encrypted","login":{},"collectionIds":["unsupported"]}),
+        )
+        .expect("valid cipher projection fixture");
         assert!(request.validate_for_personal_vault("owner").is_err());
     }
 
     #[test]
-    fn personal_vault_rejects_organization_items()
-    -> Result<(), serde_json::Error> {
+    fn personal_vault_rejects_organization_items() -> Result<(), serde_json::Error> {
         let request: CipherRequest = serde_json::from_value(json!({
             "type": 1, "name": "encrypted", "organizationId": "another-org"
         }))?;
@@ -445,10 +458,7 @@ mod tests {
 
 #[cfg(test)]
 mod timestamp_tests {
-    use super::{
-        client_revision_is_stale,
-        normalize_optional_rfc3339,
-    };
+    use super::{client_revision_is_stale, normalize_optional_rfc3339};
 
     #[test]
     fn offset_inputs_normalize_to_utc_microseconds() {

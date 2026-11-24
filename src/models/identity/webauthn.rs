@@ -1,53 +1,43 @@
-use serde::{
-    Deserialize,
-    Serialize,
-};
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use uuid::Uuid;
-use worker::{
-    D1Database,
-    D1PreparedStatement,
-    query,
-};
+use worker::{D1Database, D1PreparedStatement, query};
 
 use super::{
     account_keys::AccountSnapshot,
+    authorization::VerifiedAccountAction,
+    device::{DeviceRow, NewDeviceSession, SessionSnapshot},
+    email::require_changed_row,
     two_factor::TwoFactorRow,
+    user::UserRow,
 };
 use crate::{
-    errors::{
-        AppError,
-        AppResult,
-    },
+    errors::{AppError, AppResult, DatabaseError, DbSentinel},
     infra::db,
 };
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct WebauthnCredentialRow {
-    pub id:                    String,
-    pub user_id:               String,
-    pub slot:                  i32,
-    pub name:                  String,
-    pub credential_id:         String,
-    pub public_key:            String,
-    pub sign_count:            i64,
-    pub credential_use:        String,
-    pub prf_status:            i32,
-    pub encrypted_public_key:  Option<String>,
-    pub encrypted_user_key:    Option<String>,
+    pub id: String,
+    pub user_id: String,
+    pub slot: i32,
+    pub name: String,
+    pub credential_id: String,
+    pub public_key: String,
+    pub sign_count: i64,
+    pub credential_use: String,
+    pub prf_status: i32,
+    pub encrypted_public_key: Option<String>,
+    pub encrypted_user_key: Option<String>,
     pub encrypted_private_key: Option<String>,
-    pub last_challenge:        Option<String>,
+    pub last_challenge: Option<String>,
     #[serde(default)]
-    pub account_snapshot:      Option<String>,
-    pub created_at:            String,
-    pub updated_at:            String,
+    pub account_snapshot: Option<String>,
+    pub created_at: String,
+    pub updated_at: String,
 }
 impl WebauthnCredentialRow {
-    pub async fn list(
-        db: &D1Database,
-        user: &str,
-        usage: &str,
-    ) -> AppResult<Vec<Self>> {
+    pub async fn list(db: &D1Database, user: &str, usage: &str) -> AppResult<Vec<Self>> {
         db::run_query(
             async {
                 query!(
@@ -80,12 +70,7 @@ impl WebauthnCredentialRow {
         )
         .await
     }
-    pub async fn find_owned(
-        db: &D1Database,
-        user: &str,
-        usage: &str,
-        id: &str,
-    ) -> AppResult<Self> {
+    pub async fn find_owned(db: &D1Database, user: &str, usage: &str, id: &str) -> AppResult<Self> {
         db::run_query(
             async {
                 query!(
@@ -208,92 +193,110 @@ impl WebauthnCredentialRow {
             "Failed to register WebAuthn credential",
         )
         .await?;
-        if result[0].meta()?.and_then(|m| m.changes).unwrap_or(0) != 1 {
+        let inserted = result.first().ok_or(AppError::Internal)?;
+        if db::changes_count(inserted)? != 1 {
             return Err(AppError::bad_request(
                 "WebAuthn challenge expired or already used",
             ));
         }
         Ok(())
     }
-    pub async fn accept_assertion(
+    pub(crate) fn consume_assertion_statements(
         &self,
         db: &D1Database,
         challenge: &WebauthnChallengeRow,
         new_count: i64,
+    ) -> AppResult<[D1PreparedStatement; 3]> {
+        let [advance, consume] = self.assertion_statements(db, challenge, new_count)?;
+        Ok([
+            advance,
+            consume,
+            require_changed_row(db, DbSentinel::LoginPasskeyConflict)?,
+        ])
+    }
+
+    pub(crate) async fn accept_login_assertion(
+        &self,
+        db: &D1Database,
+        challenge: &WebauthnChallengeRow,
+        new_count: i64,
+        user: &UserRow,
+        session: &NewDeviceSession<'_>,
     ) -> AppResult<()> {
+        let mut writes = vec![DeviceRow::guard_current_login_account(db, user)?];
+        writes.extend(self.consume_assertion_statements(db, challenge, new_count)?);
+        writes.push(session.upsert_statement(db, &user.id)?);
+        db.batch(writes)
+            .await
+            .map_err(|error| DatabaseError::login_session(&error))?;
+        Ok(())
+    }
+
+    fn assertion_statements(
+        &self,
+        db: &D1Database,
+        challenge: &WebauthnChallengeRow,
+        new_count: i64,
+    ) -> worker::Result<[D1PreparedStatement; 2]> {
         let now = crate::utils::time::now_rfc3339();
         let snapshot_predicate =
             AccountSnapshot::matches_sql_expression("u.", "c.account_snapshot");
-        let results = db::run_query(
-            async {
-                db.batch(vec![
-                    query!(
-                        db,
-                        format!(
-                            "UPDATE webauthn_credentials SET \
-                             sign_count=MAX(sign_count,?1),last_challenge=?2,\
-                             updated_at=?3 WHERE id=?4 AND sign_count=?5 AND \
-                             EXISTS(SELECT 1 FROM webauthn_challenges c WHERE \
-                             c.id=?2 AND c.consumed_at IS NULL AND \
-                             julianday(c.expires_at) > julianday(?3) AND \
-                             (c.user_id IS NULL OR (c.user_id=?6 AND \
-                             EXISTS(SELECT 1 FROM users u WHERE u.id=?6 AND \
-                             u.security_stamp=c.security_stamp  AND \
-                             {snapshot_predicate}))) AND (c.session_token IS \
-                             NULL OR EXISTS(SELECT 1 FROM devices d WHERE \
-                             d.user_id=?6 AND d.device_id=c.device_id AND \
-                             d.session_token=c.session_token)))"
-                        ),
-                        new_count,
-                        challenge.id,
-                        now,
-                        self.id,
-                        self.sign_count,
-                        self.user_id
-                    )?,
-                    query!(
-                        db,
-                        "UPDATE webauthn_challenges SET consumed_at=?1 WHERE \
-                         id=?2 AND consumed_at IS NULL AND EXISTS(SELECT 1 \
-                         FROM webauthn_credentials WHERE id=?3 AND \
-                         last_challenge=?2)",
-                        now,
-                        challenge.id,
-                        self.id
-                    )?,
-                ])
-                .await
-            },
-            "Failed to consume WebAuthn assertion",
-        )
-        .await?;
-        if results[0].meta()?.and_then(|m| m.changes).unwrap_or(0) != 1 ||
-            results[1].meta()?.and_then(|m| m.changes).unwrap_or(0) != 1
-        {
-            return Err(AppError::bad_request(
-                "WebAuthn challenge expired, used or counter changed",
-            ));
-        }
-        Ok(())
+        Ok([
+            query!(
+                db,
+                format!(
+                    "UPDATE webauthn_credentials SET \
+                     sign_count=MAX(sign_count,?1),last_challenge=?2,\
+                     updated_at=?3 WHERE id=?4 AND sign_count=?5 AND \
+                     user_id=?6 AND credential_id=?7 AND public_key=?8 AND \
+                     credential_use=?9 AND EXISTS(SELECT 1 FROM \
+                     webauthn_challenges c WHERE c.id=?2 AND c.consumed_at IS \
+                     NULL AND julianday(c.expires_at) > julianday(?3) AND \
+                     (c.user_id IS NULL OR (c.user_id=?6 AND EXISTS(SELECT 1 \
+                     FROM users u WHERE u.id=?6 AND \
+                     u.security_stamp=c.security_stamp  AND \
+                     {snapshot_predicate}))) AND (c.session_token IS NULL OR \
+                     EXISTS(SELECT 1 FROM devices d WHERE d.user_id=?6 AND \
+                     d.device_id=c.device_id AND \
+                     d.session_token=c.session_token)))"
+                ),
+                new_count,
+                challenge.id,
+                now,
+                self.id,
+                self.sign_count,
+                self.user_id,
+                self.credential_id,
+                self.public_key,
+                self.credential_use,
+            )?,
+            query!(
+                db,
+                "UPDATE webauthn_challenges SET consumed_at=?1 WHERE id=?2 \
+                 AND changes()=1 AND consumed_at IS NULL AND EXISTS(SELECT 1 \
+                 FROM webauthn_credentials WHERE id=?3 AND last_challenge=?2)",
+                now,
+                challenge.id,
+                self.id
+            )?,
+        ])
     }
-    pub async fn update_keys(
+    pub(crate) async fn update_keys(
         &self,
         db: &D1Database,
         session: &crate::models::identity::device::SessionSnapshot<'_>,
+        proof: [D1PreparedStatement; 4],
     ) -> AppResult<()> {
         if self.user_id != session.user_id {
             return Err(AppError::conflict(
                 "Passkey owner does not match the session",
             ));
         }
-        let snapshot_predicate =
-            AccountSnapshot::matches_sql_expression("u.", "?9");
-        let changed = db::run_query(
-            async {
-                query!(
-                    db,
-                    format!(
-                        "UPDATE webauthn_credentials SET \
+        let snapshot_predicate = AccountSnapshot::matches_sql_expression("u.", "?9");
+        let update = query!(
+            db,
+            format!(
+                "UPDATE webauthn_credentials SET \
                          name=?1,prf_status=?2,encrypted_public_key=?3,\
                          encrypted_user_key=?4,encrypted_private_key=?5,\
                          updated_at=?6,account_snapshot=?9 WHERE id=?7 AND \
@@ -308,34 +311,89 @@ impl WebauthnCredentialRow {
                          security_stamp=?10 AND device_id=?11 AND \
                          session_token=?12 AND consumed_at IS NOT NULL) \
                          RETURNING id"
-                    ),
-                    self.name,
-                    self.prf_status,
-                    self.encrypted_public_key,
-                    self.encrypted_user_key,
-                    self.encrypted_private_key,
-                    crate::utils::time::now_rfc3339(),
-                    self.id,
-                    self.user_id,
-                    self.account_snapshot,
-                    session.security_stamp,
-                    session.device_id,
-                    session.session_token,
-                    self.sign_count,
-                    self.last_challenge
-                )?
-                .first::<String>(Some("id"))
-                .await
-            },
-            "Failed to update passkey encryption",
-        )
-        .await?;
-        if changed.is_none() {
-            return Err(AppError::conflict(
-                "Account encryption changed during PRF update",
-            ));
-        }
+            ),
+            self.name,
+            self.prf_status,
+            self.encrypted_public_key,
+            self.encrypted_user_key,
+            self.encrypted_private_key,
+            crate::utils::time::now_rfc3339(),
+            self.id,
+            self.user_id,
+            self.account_snapshot,
+            session.security_stamp,
+            session.device_id,
+            session.session_token,
+            self.sign_count,
+            self.last_challenge
+        )?;
+        let mut writes = Vec::from(proof);
+        writes.push(update);
+        writes.push(require_changed_row(db, DbSentinel::VaultWriteConflict)?);
+        db.batch(writes).await.map_err(|error| {
+            match DatabaseError::find_sentinel(&error, &[
+                DbSentinel::LoginPasskeyConflict,
+                DbSentinel::VaultWriteConflict,
+            ]) {
+                Some(DbSentinel::LoginPasskeyConflict) => DatabaseError::login_session(&error),
+                Some(DbSentinel::VaultWriteConflict) => {
+                    AppError::conflict("Account encryption changed during PRF update")
+                }
+                _ => DatabaseError::query("Failed to update passkey encryption", &error),
+            }
+        })?;
         Ok(())
+    }
+
+    pub(crate) fn prepare_prf_assertion(
+        &self,
+        db: &D1Database,
+        session: &SessionSnapshot<'_>,
+        challenge: &WebauthnChallengeRow,
+        new_count: i64,
+    ) -> AppResult<[D1PreparedStatement; 4]> {
+        let expected = serde_json::to_string(self).map_err(AppError::internal_error)?;
+        let guard = crate::models::mutation::guard(
+            db,
+            "EXISTS(SELECT 1 FROM users u JOIN devices d ON u.id=d.user_id \
+             WHERE u.id=?1 AND u.security_stamp=?2 AND d.device_id=?3 AND d.session_token=?4) \
+             AND EXISTS(SELECT 1 FROM webauthn_credentials WHERE id=?5 AND user_id=?1 \
+             AND name IS json_extract(?6,'$.name') AND sign_count IS json_extract(?6,'$.sign_count') \
+             AND last_challenge IS json_extract(?6,'$.last_challenge') \
+             AND prf_status IS json_extract(?6,'$.prf_status') \
+             AND encrypted_public_key IS json_extract(?6,'$.encrypted_public_key') \
+             AND encrypted_user_key IS json_extract(?6,'$.encrypted_user_key') \
+             AND encrypted_private_key IS json_extract(?6,'$.encrypted_private_key') \
+             AND account_snapshot IS json_extract(?6,'$.account_snapshot'))",
+            &db::d1_params![
+                session.user_id,
+                session.security_stamp,
+                session.device_id,
+                session.session_token,
+                self.id,
+                expected
+            ],
+        )?;
+        let [advance, consume, accepted] =
+            self.consume_assertion_statements(db, challenge, new_count)?;
+        Ok([guard, advance, consume, accepted])
+    }
+
+    pub(super) fn guard_second_factor_keys(
+        db: &D1Database,
+        user_id: &str,
+        keys: &[Self],
+    ) -> AppResult<D1PreparedStatement> {
+        let snapshot = serde_json::to_string(keys).map_err(AppError::internal_error)?;
+        crate::models::mutation::guard(
+            db,
+            "(SELECT COUNT(*) FROM webauthn_credentials WHERE user_id=?1 AND credential_use='2fa') \
+             =json_array_length(?2) AND NOT EXISTS(SELECT 1 FROM json_each(?2) p WHERE NOT EXISTS(\
+             SELECT 1 FROM webauthn_credentials WHERE user_id=?1 AND credential_use='2fa' \
+             AND id=json_extract(p.value,'$.id') AND credential_id=json_extract(p.value,'$.credential_id') \
+             AND public_key=json_extract(p.value,'$.public_key')))",
+            &db::d1_params![user_id, snapshot],
+        )
     }
 
     pub(super) fn purge_2fa_statement(
@@ -363,8 +421,7 @@ impl WebauthnCredentialRow {
         account: &crate::models::identity::account_keys::AccountSnapshot,
         keys: &[Self],
     ) -> AppResult<()> {
-        let snapshot =
-            serde_json::to_string(keys).map_err(AppError::internal_error)?;
+        let snapshot = serde_json::to_string(keys).map_err(AppError::internal_error)?;
         let account = account.to_json()?;
         let columns = [
             "id",
@@ -385,9 +442,7 @@ impl WebauthnCredentialRow {
             "updated_at",
         ];
         let matches = columns
-            .map(|column| {
-                format!("k.{column} IS json_extract(j.value,'$.{column}')")
-            })
+            .map(|column| format!("k.{column} IS json_extract(j.value,'$.{column}')"))
             .join(" AND ");
         let revision_sql = crate::models::mutation::next_user_revision_sql(8);
         let claim = format!(
@@ -407,15 +462,15 @@ impl WebauthnCredentialRow {
         let results = db::run_query(
             async {
                 db.batch(vec![
-                    db.prepare(claim).bind(&[
-                        marker.clone().into(),
-                        session.user_id.into(),
-                        session.security_stamp.into(),
-                        session.device_id.into(),
-                        session.session_token.into(),
-                        account.into(),
-                        snapshot.into(),
-                        crate::utils::time::now_rfc3339().into(),
+                    db.prepare(claim).bind(&db::d1_params![
+                        marker,
+                        session.user_id,
+                        session.security_stamp,
+                        session.device_id,
+                        session.session_token,
+                        account,
+                        snapshot,
+                        crate::utils::time::now_rfc3339(),
                     ])?,
                     query!(
                         db,
@@ -442,11 +497,7 @@ impl WebauthnCredentialRow {
                         session.user_id,
                         marker
                     )?,
-                    TwoFactorRow::clear_recovery_statement(
-                        db,
-                        session.user_id,
-                        Some(&marker),
-                    )?,
+                    TwoFactorRow::clear_recovery_statement(db, session.user_id, Some(&marker))?,
                 ])
                 .await
             },
@@ -466,66 +517,67 @@ impl WebauthnCredentialRow {
         Ok(())
     }
 
-    pub async fn delete(&self, db: &D1Database) -> AppResult<()> {
+    pub(crate) async fn delete(
+        &self,
+        db: &D1Database,
+        authorization: &VerifiedAccountAction<'_>,
+        expected_keys: Option<&[Self]>,
+    ) -> AppResult<()> {
+        let user_id = authorization.session.user_id;
         let revision_sql = crate::models::mutation::next_user_revision_sql(1);
-        db::run_query(
-            async {
-                let mut writes = vec![
-                    query!(
-                        db,
-                        "DELETE FROM webauthn_credentials WHERE id=?1 AND \
-                         user_id=?2",
-                        self.id,
-                        self.user_id
-                    )?,
-                    query!(
-                        db,
-                        "DELETE FROM two_factors WHERE user_id=?1 AND \
-                         provider_type=7 AND NOT EXISTS(SELECT 1 FROM \
-                         webauthn_credentials WHERE user_id=?1 AND \
-                         credential_use='2fa')",
-                        self.user_id
-                    )?,
-                    query!(
-                        db,
-                        format!(
-                            "UPDATE users SET updated_at={revision_sql} WHERE \
-                             id=?2"
-                        ),
-                        crate::utils::time::now_rfc3339(),
-                        self.user_id
-                    )?,
-                ];
-                if self.credential_use == "2fa" {
-                    writes.push(TwoFactorRow::clear_recovery_statement(
-                        db,
-                        &self.user_id,
-                        None,
-                    )?);
-                }
-                db.batch(writes).await
-            },
-            "Failed to delete WebAuthn credential",
-        )
-        .await?;
+        let mut writes = Vec::new();
+        if let Some(keys) = expected_keys {
+            writes.push(Self::guard_second_factor_keys(db, user_id, keys)?);
+        }
+        writes.extend([
+            query!(
+                db,
+                "DELETE FROM webauthn_credentials WHERE id=?1 AND user_id=?2 \
+                 AND credential_use=?3 AND credential_id=?4 AND public_key=?5",
+                self.id,
+                user_id,
+                self.credential_use,
+                self.credential_id,
+                self.public_key
+            )?,
+            require_changed_row(db, DbSentinel::VaultWriteConflict)?,
+            query!(
+                db,
+                "DELETE FROM two_factors WHERE user_id=?1 AND provider_type=7 AND NOT EXISTS(\
+                 SELECT 1 FROM webauthn_credentials WHERE user_id=?1 AND credential_use='2fa')",
+                user_id
+            )?,
+            query!(
+                db,
+                format!("UPDATE users SET updated_at={revision_sql} WHERE id=?2"),
+                crate::utils::time::now_rfc3339(),
+                user_id
+            )?,
+        ]);
+        if self.credential_use == "2fa" {
+            writes.push(TwoFactorRow::clear_recovery_statement(db, user_id, None)?);
+        }
+        authorization
+            .commit(db, writes, "Failed to delete WebAuthn credential")
+            .await?;
         Ok(())
     }
 }
 
 #[derive(Clone, Debug, Deserialize)]
 pub struct WebauthnChallengeRow {
-    pub id:               String,
-    pub challenge:        String,
-    pub purpose:          String,
-    pub user_id:          Option<String>,
-    pub security_stamp:   Option<String>,
-    pub device_id:        Option<String>,
-    pub session_token:    Option<String>,
+    pub id: String,
+    pub challenge: String,
+    pub purpose: String,
+    pub user_id: Option<String>,
+    pub security_stamp: Option<String>,
+    pub device_id: Option<String>,
+    pub session_token: Option<String>,
     #[serde(default)]
     pub account_snapshot: Option<String>,
-    pub rp_id:            String,
-    pub origin:           String,
-    pub expires_at:       String,
+    pub rp_id: String,
+    pub origin: String,
+    pub expires_at: String,
 }
 impl WebauthnChallengeRow {
     pub async fn insert(&self, db: &D1Database) -> AppResult<()> {
@@ -579,9 +631,7 @@ impl WebauthnChallengeRow {
             "Failed to fetch WebAuthn challenge",
         )
         .await?
-        .ok_or_else(|| {
-            AppError::bad_request("WebAuthn challenge missing or expired")
-        })
+        .ok_or_else(|| AppError::bad_request("WebAuthn challenge missing or expired"))
     }
     pub async fn purge(db: &D1Database) -> AppResult<()> {
         db::run_query(

@@ -4,7 +4,7 @@ import sqlite3
 import unittest
 
 from sql_source import statement
-from sql_regression import apply_migrations
+from sql_fixtures import apply_migrations
 
 
 class JwtKeySql(unittest.TestCase):

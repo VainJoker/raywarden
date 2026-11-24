@@ -1,37 +1,31 @@
 use serde::Deserialize;
-use worker::{
-    D1Database,
-    query,
-};
+use worker::{D1Database, D1PreparedStatement, query};
 
 use super::account_keys::AccountSnapshot;
 use crate::{
-    errors::{
-        AppError,
-        AppResult,
-    },
+    errors::{AppError, AppResult, DbSentinel},
     infra::db,
 };
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct AuthRequestRow {
-    pub id:                   String,
-    pub user_id:              String,
-    pub request_device_id:    String,
-    pub device_type:          i32,
-    pub request_ip:           String,
-    pub access_code:          String,
-    pub public_key:           String,
-    pub security_stamp:       String,
+    pub id: String,
+    pub user_id: String,
+    pub request_device_id: String,
+    pub device_type: i32,
+    pub request_ip: String,
+    pub access_code: String,
+    pub public_key: String,
+    pub security_stamp: String,
     #[serde(default)]
-    pub account_snapshot:     Option<String>,
-    pub encrypted_key:        Option<String>,
+    pub account_snapshot: Option<String>,
+    pub encrypted_key: Option<String>,
     pub master_password_hash: Option<String>,
-    pub approved:             Option<i32>,
-    pub created_at:           String,
-    pub expires_at:           String,
-    pub responded_at:         Option<String>,
-    pub authenticated_at:     Option<String>,
+    pub approved: Option<i32>,
+    pub created_at: String,
+    pub expires_at: String,
+    pub responded_at: Option<String>,
+    pub authenticated_at: Option<String>,
 }
 
 impl AuthRequestRow {
@@ -66,10 +60,7 @@ impl AuthRequestRow {
         Ok(())
     }
 
-    pub async fn find_by_id(
-        db: &D1Database,
-        id: &str,
-    ) -> AppResult<Option<Self>> {
+    pub async fn find_by_id(db: &D1Database, id: &str) -> AppResult<Option<Self>> {
         db::run_query(
             async {
                 query!(db, "SELECT * FROM auth_requests WHERE id = ?1", id)?
@@ -81,10 +72,7 @@ impl AuthRequestRow {
         .await
     }
 
-    pub async fn list_pending_for_user(
-        db: &D1Database,
-        user_id: &str,
-    ) -> AppResult<Vec<Self>> {
+    pub async fn list_pending_for_user(db: &D1Database, user_id: &str) -> AppResult<Vec<Self>> {
         let now = crate::utils::time::now_rfc3339();
         let snapshot_predicate =
             AccountSnapshot::matches_sql_expression("u.", "a.account_snapshot");
@@ -115,16 +103,17 @@ impl AuthRequestRow {
     pub async fn respond(
         &self,
         db: &D1Database,
-        device_id: &str,
+        session: &super::device::SessionSnapshot<'_>,
         approved: bool,
         key: &str,
         hash: Option<&str>,
     ) -> AppResult<Self> {
+        if session.user_id != self.user_id {
+            return Err(AppError::auth_request_unavailable());
+        }
         let now = crate::utils::time::now_rfc3339();
-        let snapshot_predicate = AccountSnapshot::matches_sql_expression(
-            "u.",
-            "auth_requests.account_snapshot",
-        );
+        let snapshot_predicate =
+            AccountSnapshot::matches_sql_expression("u.", "auth_requests.account_snapshot");
         let row: Option<Self> = db::run_query(
             async {
                 query!(
@@ -138,16 +127,20 @@ impl AuthRequestRow {
                          julianday(?4) AND security_stamp = (SELECT \
                          security_stamp FROM users WHERE id = ?7) AND \
                          EXISTS(SELECT 1 FROM users u WHERE \
-                         u.id=auth_requests.user_id AND {snapshot_predicate}) \
+                         u.id=auth_requests.user_id AND {snapshot_predicate}) AND \
+                         security_stamp=?8 AND EXISTS(SELECT 1 FROM devices \
+                         WHERE user_id=?7 AND device_id=?5 AND session_token=?9) \
                          RETURNING *"
                     ),
                     i32::from(approved),
                     if approved { Some(key) } else { None },
                     if approved { hash } else { None },
                     now,
-                    device_id,
+                    session.device_id,
                     self.id,
-                    self.user_id
+                    self.user_id,
+                    session.security_stamp,
+                    session.session_token
                 )?
                 .first(None)
                 .await
@@ -156,49 +149,42 @@ impl AuthRequestRow {
         )
         .await?;
         row.ok_or_else(|| {
-            AppError::bad_request(
-                "Authentication request expired or already answered",
-            )
+            AppError::bad_request("Authentication request expired or already answered")
         })
     }
 
     /// The conditional write prevents concurrent token exchanges from reusing
     /// approval.
-    pub async fn consume(&self, db: &D1Database) -> AppResult<()> {
+    fn consume(&self, db: &D1Database) -> worker::Result<D1PreparedStatement> {
         let now = crate::utils::time::now_rfc3339();
-        let snapshot_predicate = AccountSnapshot::matches_sql_expression(
-            "u.",
-            "auth_requests.account_snapshot",
-        );
-        let id: Option<String> = db::run_query(
-            async {
-                query!(
-                    db,
-                    format!(
-                        "UPDATE auth_requests SET authenticated_at = ?1 WHERE \
+        let snapshot_predicate =
+            AccountSnapshot::matches_sql_expression("u.", "auth_requests.account_snapshot");
+        query!(
+            db,
+            format!(
+                "UPDATE auth_requests SET authenticated_at = ?1 WHERE \
                          id = ?2 AND approved = 1 AND authenticated_at IS \
                          NULL AND julianday(expires_at) > julianday(?1) AND \
                          security_stamp = (SELECT security_stamp FROM users \
                          WHERE id = auth_requests.user_id) AND EXISTS(SELECT \
                          1 FROM users u WHERE u.id=auth_requests.user_id AND \
                          {snapshot_predicate}) RETURNING id"
-                    ),
-                    now,
-                    self.id
-                )?
-                .first(Some("id"))
-                .await
-            },
-            "Failed to consume authentication request",
+            ),
+            now,
+            self.id
         )
-        .await?;
-        if id.is_none() {
-            return Err(AppError::bad_request(
-                "Authentication request expired or already used",
-            ));
-        }
-        Ok(())
     }
+
+    pub(crate) fn consume_statements(
+        &self,
+        db: &D1Database,
+    ) -> worker::Result<[D1PreparedStatement; 2]> {
+        Ok([
+            self.consume(db)?,
+            super::email::require_changed_row(db, DbSentinel::LoginApprovalConflict)?,
+        ])
+    }
+
     pub async fn purge_expired(db: &D1Database) -> AppResult<u32> {
         let now = crate::utils::time::now_rfc3339();
         let result = db::run_query(
@@ -215,6 +201,6 @@ impl AuthRequestRow {
             "Failed to purge expired authentication requests",
         )
         .await?;
-        Ok(result.meta()?.and_then(|meta| meta.changes).unwrap_or(0) as u32)
+        Ok(db::changes_count(&result)? as u32)
     }
 }

@@ -46,6 +46,10 @@ if [[ "$ui_mode" == offline ]]; then
   [[ -d "$ui_destination" && ! -L "$ui_destination" ]] || fail "Missing existing Web Vault; use --download or --archive PATH"
   cp -R -- "$ui_destination" "$ui_stage/web-vault"
 else
+  if [[ -n "${WEB_VAULT_SHA256:-}" ]]; then
+    printf '%s  %s\n' "$WEB_VAULT_SHA256" "$ui_archive" | sha256sum -c - >/dev/null \
+      || fail "Archive SHA-256 digest does not match WEB_VAULT_SHA256"
+  fi
   # Official releases contain only ordinary files/directories under web-vault/.
   tar -tzf "$ui_archive" > "$ui_stage/paths"
   [[ -s "$ui_stage/paths" ]] || fail "Archive is empty"

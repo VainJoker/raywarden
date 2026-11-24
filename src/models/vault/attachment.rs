@@ -1,31 +1,18 @@
 //! Persisted attachment records and D1 queries and transaction builders.
-use serde::{
-    Deserialize,
-    Serialize,
-};
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use wasm_bindgen::JsValue;
-use worker::{
-    D1Database,
-    D1PreparedStatement,
-    query,
-};
+use worker::{D1Database, D1PreparedStatement, query};
 
 use crate::{
-    errors::{
-        AppError,
-        AppResult,
-        DatabaseError,
-    },
+    errors::{AppError, AppResult, DatabaseError, DbSentinel},
     infra::db,
-    models::mutation::{
-        ATTACHMENT_QUOTA_SENTINEL,
-        batch_count_last_write,
+    models::{
+        mutation::batch_count_last_write,
+        page::{Page, PageCursor, PageOrder, PageQuery},
     },
 };
 
-const USER_ATTACHMENT_USAGE_SQL: &str =
-    "SELECT COALESCE(SUM(file_size_bytes), 0) AS total FROM (
+const USER_ATTACHMENT_USAGE_SQL: &str = "SELECT COALESCE(SUM(file_size_bytes), 0) AS total FROM (
         SELECT a.file_size_bytes FROM attachments a
         JOIN ciphers c ON c.id = a.cipher_id
         WHERE c.user_id = ?1 AND (?2 IS NULL OR a.id != ?2)
@@ -35,20 +22,30 @@ const USER_ATTACHMENT_USAGE_SQL: &str =
         WHERE c.user_id = ?1 AND (?2 IS NULL OR p.id != ?2)
     ) AS files";
 
+#[derive(Deserialize)]
+struct AttachmentUsageRow {
+    #[serde(default, deserialize_with = "attachment_total")]
+    total: i64,
+}
+
+fn attachment_total<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<i64, D::Error> {
+    Ok(Value::deserialize(deserializer)?.as_i64().unwrap_or(0))
+}
+
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct AttachmentRow {
-    pub id:              String,
-    pub cipher_id:       String,
-    pub file_name:       String,
+    pub id: String,
+    pub cipher_id: String,
+    pub file_name: String,
     pub file_size_bytes: i64,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub encrypted_key:   Option<String>,
-    pub created_at:      String,
-    pub updated_at:      String,
+    pub encrypted_key: Option<String>,
+    pub created_at: String,
+    pub updated_at: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub organization_id: Option<String>,
     #[serde(default)]
-    pub storage_key:     Option<String>,
+    pub storage_key: Option<String>,
 }
 
 impl AttachmentRow {
@@ -123,64 +120,84 @@ impl AttachmentRow {
         ])
     }
 
-    pub async fn purge_pending_before(
-        db: &D1Database,
-        cutoff_exclusive: &str,
-    ) -> AppResult<u32> {
+    pub async fn purge_pending_before(db: &D1Database, cutoff_exclusive: &str) -> AppResult<u32> {
         let delete = query!(
             db,
             "DELETE FROM attachments_pending WHERE julianday(created_at) < \
              julianday(?1)",
             cutoff_exclusive
         )?;
-        batch_count_last_write(
-            db,
-            vec![delete],
-            "Failed to purge pending attachments",
-        )
-        .await
+        batch_count_last_write(db, vec![delete], "Failed to purge pending attachments").await
     }
 
-    pub async fn fetch_attachment(
+    pub async fn fetch_for_cipher(
         db: &D1Database,
+        cipher_id: &str,
         attachment_id: &str,
     ) -> AppResult<Self> {
-        db.prepare("SELECT * FROM attachments WHERE id = ?1")
-            .bind(&[attachment_id.into()])?
+        db.prepare("SELECT * FROM attachments WHERE id = ?1 AND cipher_id = ?2")
+            .bind(&db::d1_params![attachment_id, cipher_id])?
             .first(None)
             .await
-            .map_err(|e| DatabaseError::query("Failed to fetch attachment", e))?
+            .map_err(|e| DatabaseError::query("Failed to fetch attachment", &e))?
             .ok_or_else(|| AppError::not_found("Attachment"))
     }
 
-    pub async fn fetch_pending_attachment(
+    pub async fn fetch_pending_for_cipher(
         db: &D1Database,
+        cipher_id: &str,
         attachment_id: &str,
     ) -> AppResult<Self> {
-        db.prepare("SELECT * FROM attachments_pending WHERE id = ?1")
-            .bind(&[attachment_id.into()])?
-            .first(None)
-            .await
-            .map_err(|e| {
-                DatabaseError::query("Failed to fetch pending attachment", e)
-            })?
-            .ok_or_else(|| AppError::not_found("Pending attachment"))
+        db.prepare(
+            "SELECT * FROM attachments_pending WHERE id = ?1 AND cipher_id = \
+             ?2",
+        )
+        .bind(&db::d1_params![attachment_id, cipher_id])?
+        .first(None)
+        .await
+        .map_err(|e| DatabaseError::query("Failed to fetch pending attachment", &e))?
+        .ok_or_else(|| AppError::not_found("Pending attachment"))
     }
 
-    pub async fn list_for_ciphers_json(
+    pub(crate) async fn list_page(
         db: &D1Database,
-        json_body: &str,
-        ids_path: &str,
-    ) -> AppResult<Vec<Self>> {
-        let result = db
-            .prepare(
-                "SELECT * FROM attachments WHERE cipher_id IN (SELECT value \
-                 FROM json_each(?1, ?2))",
-            )
-            .bind(&[json_body.to_owned().into(), ids_path.to_owned().into()])?
-            .all()
-            .await?;
-        db::decode_results(&result)
+        cipher_ids_json: &str,
+        after: Option<&PageCursor>,
+    ) -> AppResult<Page<Self>> {
+        Self::paged("cipher_id IN (SELECT value FROM json_each(?))")
+            .fetch(db, &db::d1_params![cipher_ids_json], after)
+            .await
+    }
+
+    pub(crate) async fn list_key_update_page(
+        db: &D1Database,
+        cipher_id: &str,
+        user_id: &str,
+        attachment_ids_json: &str,
+        after: Option<&PageCursor>,
+    ) -> AppResult<Page<Self>> {
+        Self::paged("cipher_id=? AND id IN (SELECT value FROM json_each(?)) AND                      EXISTS (SELECT 1 FROM ciphers WHERE ciphers.id=attachments.cipher_id AND user_id=?)")
+            .fetch(db, &db::d1_params![cipher_id, attachment_ids_json, user_id], after)
+            .await
+    }
+
+    const fn paged(filter: &'static str) -> PageQuery {
+        PageQuery {
+            table: "attachments",
+            filter,
+            text_columns: &[
+                "id",
+                "cipher_id",
+                "file_name",
+                "encrypted_key",
+                "created_at",
+                "updated_at",
+                "organization_id",
+                "storage_key",
+            ],
+            order: PageOrder::RowId,
+            related_bytes: None,
+        }
     }
 
     pub async fn user_attachment_usage(
@@ -188,27 +205,14 @@ impl AttachmentRow {
         user_id: &str,
         exclude_attachment: Option<&str>,
     ) -> AppResult<i64> {
-        let row: Option<Value> = db
+        let row: Option<AttachmentUsageRow> = db
             .prepare(USER_ATTACHMENT_USAGE_SQL)
-            .bind(&[
-                user_id.into(),
-                exclude_attachment.map_or(JsValue::NULL, Into::into),
-            ])?
+            .bind(&db::d1_params![user_id, exclude_attachment,])?
             .first(None)
             .await
-            .map_err(|e| {
-                DatabaseError::query(
-                    "Failed to calculate user attachment usage",
-                    e,
-                )
-            })?;
+            .map_err(|e| DatabaseError::query("Failed to calculate user attachment usage", &e))?;
 
-        let total = row
-            .and_then(|v| v.get("total").cloned())
-            .and_then(|v| v.as_i64())
-            .unwrap_or(0);
-
-        Ok(total)
+        Ok(row.map_or(0, |row| row.total))
     }
 
     /// Check the allowance for other files before writing this upload's size.
@@ -220,33 +224,18 @@ impl AttachmentRow {
     ) -> AppResult<D1PreparedStatement> {
         // The aggregate fits a SQLite integer. Bind as decimal text to avoid
         // rounding the allowance through a JavaScript number.
+        let abort = DbSentinel::AttachmentQuotaExceeded.sql_abort_expr();
         let usage_limit = i64::try_from(usage_limit).unwrap_or(i64::MAX);
         Ok(db
             .prepare(format!(
                 "SELECT CASE WHEN ({USER_ATTACHMENT_USAGE_SQL}) <= CAST(?3 AS \
-                 INTEGER) THEN 1 ELSE json_extract('[]', \
-                 '{ATTACHMENT_QUOTA_SENTINEL}') END"
+                 INTEGER) THEN 1 ELSE {abort} END"
             ))
-            .bind(&[
-                user_id.into(),
-                exclude_attachment.map_or(JsValue::NULL, Into::into),
-                usage_limit.to_string().into(),
+            .bind(&db::d1_params![
+                user_id,
+                exclude_attachment,
+                usage_limit.to_string(),
             ])?)
-    }
-
-    pub(crate) async fn find_for_user(
-        db: &D1Database,
-        attachment_id: &str,
-        user_id: &str,
-    ) -> AppResult<Option<Self>> {
-        Ok(db
-            .prepare(
-                "SELECT a.* FROM attachments a JOIN ciphers c ON \
-                 c.id=a.cipher_id WHERE a.id=?1 AND c.user_id=?2",
-            )
-            .bind(&[attachment_id.into(), user_id.into()])?
-            .first(None)
-            .await?)
     }
 
     pub(crate) fn rotate_key_statements(
@@ -261,18 +250,14 @@ impl AttachmentRow {
             "EXISTS(SELECT 1 FROM attachments WHERE id=?1 AND cipher_id=?2 \
              AND file_name IS ?3 AND encrypted_key IS ?4 AND updated_at IS ?5 \
              AND storage_key IS ?6 AND file_size_bytes IS ?7)",
-            &[
-                row.id.clone().into(),
-                row.cipher_id.clone().into(),
-                row.file_name.clone().into(),
-                row.encrypted_key
-                    .as_deref()
-                    .map_or(JsValue::NULL, JsValue::from_str),
-                row.updated_at.clone().into(),
-                row.storage_key
-                    .as_deref()
-                    .map_or(JsValue::NULL, JsValue::from_str),
-                JsValue::from_f64(row.file_size_bytes as f64),
+            &db::d1_params![
+                row.id,
+                row.cipher_id,
+                row.file_name,
+                row.encrypted_key,
+                row.updated_at,
+                row.storage_key,
+                row.file_size_bytes as f64,
             ],
         )?;
         let update = db
@@ -281,20 +266,11 @@ impl AttachmentRow {
                  file_name=?1,encrypted_key=?2,updated_at=?3 WHERE id=?4 AND \
                  cipher_id=?5",
             )
-            .bind(&[
-                file_name.into(),
-                key.into(),
-                now.into(),
-                row.id.clone().into(),
-                row.cipher_id.clone().into(),
-            ])?;
+            .bind(&db::d1_params![file_name, key, now, row.id, row.cipher_id,])?;
         Ok(vec![snapshot, update])
     }
 
-    pub(crate) fn reserve_upload(
-        &self,
-        db: &D1Database,
-    ) -> AppResult<D1PreparedStatement> {
+    pub(crate) fn reserve_upload(&self, db: &D1Database) -> AppResult<D1PreparedStatement> {
         Ok(db
             .prepare(
                 "INSERT INTO \
@@ -302,35 +278,30 @@ impl AttachmentRow {
                  encrypted_key,created_at,updated_at,organization_id) \
                  VALUES(?1,?2,?3,?4,?5,?6,?6,?7)",
             )
-            .bind(&[
-                self.id.clone().into(),
-                self.cipher_id.clone().into(),
-                self.file_name.clone().into(),
-                JsValue::from_f64(self.file_size_bytes as f64),
-                self.encrypted_key.clone().map_or(JsValue::NULL, Into::into),
-                self.created_at.clone().into(),
-                self.organization_id
-                    .clone()
-                    .map_or(JsValue::NULL, Into::into),
+            .bind(&db::d1_params![
+                self.id,
+                self.cipher_id,
+                self.file_name,
+                self.file_size_bytes as f64,
+                self.encrypted_key,
+                self.created_at,
+                self.organization_id,
             ])?)
     }
 
-    pub(crate) fn deletion_guard(
-        &self,
-        db: &D1Database,
-    ) -> AppResult<D1PreparedStatement> {
+    pub(crate) fn deletion_guard(&self, db: &D1Database) -> AppResult<D1PreparedStatement> {
         crate::models::mutation::guard(
             db,
             "EXISTS(SELECT 1 FROM attachments WHERE id=?1 AND cipher_id=?2 \
              AND file_name IS ?3 AND encrypted_key IS ?4 AND storage_key IS \
              ?5 AND updated_at IS ?6)",
-            &[
-                self.id.clone().into(),
-                self.cipher_id.clone().into(),
-                self.file_name.clone().into(),
-                self.encrypted_key.clone().map_or(JsValue::NULL, Into::into),
-                self.storage_key.clone().map_or(JsValue::NULL, Into::into),
-                self.updated_at.clone().into(),
+            &db::d1_params![
+                self.id,
+                self.cipher_id,
+                self.file_name,
+                self.encrypted_key,
+                self.storage_key,
+                self.updated_at,
             ],
         )
     }
@@ -343,18 +314,9 @@ impl AttachmentRow {
     ) -> AppResult<Vec<D1PreparedStatement>> {
         Ok(vec![
             db.prepare("DELETE FROM attachments WHERE id=?1 AND cipher_id=?2")
-                .bind(&[
-                    self.id.clone().into(),
-                    self.cipher_id.clone().into(),
-                ])?,
-            db.prepare(
-                "UPDATE ciphers SET updated_at=?1 WHERE id=?2 AND user_id=?3",
-            )
-            .bind(&[
-                now.into(),
-                self.cipher_id.clone().into(),
-                owner.into(),
-            ])?,
+                .bind(&db::d1_params![self.id, self.cipher_id])?,
+            db.prepare("UPDATE ciphers SET updated_at=?1 WHERE id=?2 AND user_id=?3")
+                .bind(&db::d1_params![now, self.cipher_id, owner])?,
         ])
     }
 }
@@ -369,17 +331,15 @@ pub(crate) fn pending_snapshot_guard(
          cipher_id=?2 AND file_name IS ?3 AND file_size_bytes IS ?4 AND \
          encrypted_key IS ?5 AND created_at IS ?6 AND updated_at IS ?7 AND \
          organization_id IS ?8)",
-        &[
-            row.id.clone().into(),
-            row.cipher_id.clone().into(),
-            row.file_name.clone().into(),
-            JsValue::from_f64(row.file_size_bytes as f64),
-            row.encrypted_key.clone().map_or(JsValue::NULL, Into::into),
-            row.created_at.clone().into(),
-            row.updated_at.clone().into(),
-            row.organization_id
-                .clone()
-                .map_or(JsValue::NULL, Into::into),
+        &db::d1_params![
+            row.id,
+            row.cipher_id,
+            row.file_name,
+            row.file_size_bytes as f64,
+            row.encrypted_key,
+            row.created_at,
+            row.updated_at,
+            row.organization_id,
         ],
     )
 }
@@ -395,18 +355,16 @@ pub(crate) fn attachment_snapshot_guard(
          AND created_at IS ?6 AND updated_at IS ?7 AND organization_id IS ?8 \
          AND storage_key IS ?9) AND NOT EXISTS(SELECT 1 FROM \
          attachments_pending WHERE id=?1)",
-        &[
-            row.id.clone().into(),
-            row.cipher_id.clone().into(),
-            row.file_name.clone().into(),
-            JsValue::from_f64(row.file_size_bytes as f64),
-            row.encrypted_key.clone().map_or(JsValue::NULL, Into::into),
-            row.created_at.clone().into(),
-            row.updated_at.clone().into(),
-            row.organization_id
-                .clone()
-                .map_or(JsValue::NULL, Into::into),
-            row.storage_key.clone().map_or(JsValue::NULL, Into::into),
+        &db::d1_params![
+            row.id,
+            row.cipher_id,
+            row.file_name,
+            row.file_size_bytes as f64,
+            row.encrypted_key,
+            row.created_at,
+            row.updated_at,
+            row.organization_id,
+            row.storage_key,
         ],
     )
 }

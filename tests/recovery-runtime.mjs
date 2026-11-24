@@ -1,14 +1,10 @@
+import { equal, expectStatus as status } from "./runtime-assertions.mjs";
+import { oauthToken } from "./runtime-auth.mjs";
+
 /** Recovery-code ownership, snapshot and transaction regressions. */
 export async function runRecoveryCompatibility({ fixture, check, sql }) {
   const CODE = "ABCDEF0123456789ABCDEF0123456789";
   const EMAIL = "owner@example.test";
-  const equal = (actual, expected, label = "value") => {
-    if (actual !== expected) throw new Error(`${label}: expected ${expected}, received ${actual}`);
-  };
-  const status = async (response, expected) => {
-    if (response.status !== expected) throw new Error(`Expected HTTP ${expected}, received ${response.status}: ${await response.text()}`);
-    return response;
-  };
   const seed = () => {
     const f = fixture();
     const owner = sql.exec("SELECT id FROM users WHERE email=?", EMAIL).one().id;
@@ -27,6 +23,7 @@ export async function runRecoveryCompatibility({ fixture, check, sql }) {
   };
   const state = () => JSON.stringify({
     users: sql.exec("SELECT * FROM users ORDER BY id").toArray(),
+    devices: sql.exec("SELECT * FROM devices ORDER BY user_id,device_id").toArray(),
     providers: sql.exec("SELECT * FROM two_factors ORDER BY id").toArray(),
     codes: sql.exec("SELECT * FROM verification_codes ORDER BY id").toArray(),
     passkeys: sql.exec("SELECT * FROM webauthn_credentials ORDER BY id").toArray(),
@@ -41,13 +38,11 @@ export async function runRecoveryCompatibility({ fixture, check, sql }) {
     method: "POST", headers: { "Content-Type": "application/json", ...headers },
     body: JSON.stringify({ email: EMAIL, masterPasswordHash: "hash", recoveryCode: CODE, ...override }),
   });
-  const login = (f, { version = "2026.10.1", code = CODE } = {}) => f.fetch("/identity/connect/token", {
-    method: "POST", headers: { "Content-Type": "application/x-www-form-urlencoded", "device-type": "14",
-      ...(version === null ? {} : { "Bitwarden-Client-Version": version }) },
-    body: new URLSearchParams({ grant_type: "password", username: EMAIL, password: "hash",
-      deviceIdentifier: "recovery-runtime-client", deviceName: "Recovery Browser", deviceType: "14",
-      twoFactorProvider: "8", twoFactorToken: code, twoFactorRemember: "1" }),
-  });
+  const login = (f, { version = "2026.10.1", code = CODE, username = EMAIL, device = "recovery-runtime-client" } = {}) => oauthToken(f, {
+    grant_type: "password", username, password: "hash",
+    deviceIdentifier: device, deviceName: "Recovery Browser", deviceType: "14",
+    twoFactorProvider: "8", twoFactorToken: code, twoFactorRemember: "1",
+  }, { "device-type": "14", ...(version === null ? {} : { "Bitwarden-Client-Version": version }) });
   const call = (kind, f) => kind === "recover" ? recover(f) : login(f);
   const isRecovery = statements => statements.some(statement => statement.sql.startsWith("UPDATE users SET two_factor_recovery_code=NULL,account_write_token="));
   const assertCleared = (f, other) => {
@@ -75,7 +70,12 @@ export async function runRecoveryCompatibility({ fixture, check, sql }) {
   await check("incorrect recovery credentials leave every provider and verification record intact", async () => {
     const f = seed(), before = state();
     for (const body of [{ masterPasswordHash: "wrong-password" }, { recoveryCode: "wrong-code" }, { email: "missing@example.test" }]) {
-      await status(await recover(f, body), 401);
+      const response = await status(await recover(f, body), 401);
+      if (body.recoveryCode) {
+        const error = await response.json();
+        equal(error.code, 2);
+        equal(error.message, "Invalid credentials: Invalid recovery code");
+      }
       equal(state(), before);
     }
     sql.exec("UPDATE users SET two_factor_recovery_code='' WHERE id=?", f.owner);
@@ -136,6 +136,31 @@ export async function runRecoveryCompatibility({ fixture, check, sql }) {
       const before = state();
       await status(await call(kind, f), 500);
       equal(state(), before, `${kind} partially committed recovery cleanup`);
+    }
+  });
+
+  await check("recovery login keeps factors and the prior session on signing or session-write failure", async () => {
+    for (const failure of ["signing", "device upsert"]) {
+      const f = seed();
+      let username = EMAIL;
+      if (failure === "signing") {
+        username = `${"a".repeat(9000)}@example.test`;
+        sql.exec("UPDATE users SET email=? WHERE id=?", username, f.owner);
+      } else {
+        sql.exec("CREATE TRIGGER reject_recovery_session BEFORE INSERT ON devices BEGIN SELECT RAISE(ABORT, 'fixture session rejected'); END;");
+      }
+      const before = state();
+      await status(await login(f, { username, device: "device" }), 500);
+      equal(state(), before, `${failure} changed recovery or session state`);
+      if (failure === "signing") {
+        sql.exec("UPDATE users SET email=? WHERE id=?", EMAIL, f.owner);
+      } else {
+        sql.exec("DROP TRIGGER reject_recovery_session");
+      }
+      const other = otherState();
+      const tokens = await (await status(await login(f, { device: "device" }), 200)).json();
+      assertCleared(f, other);
+      await status(await f.fetch("/api/accounts/profile", { headers: { Authorization: `Bearer ${tokens.access_token}` } }), 200);
     }
   });
 

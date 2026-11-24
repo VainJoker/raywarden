@@ -183,7 +183,20 @@ export async function verifyResources(env = process.env, fetchImpl = globalThis.
 }
 
 
-export async function checkHealth({ configPath, attempts = 12, interval: retryIntervalMs = 5000 } = {}, fetchImpl = globalThis.fetch, wait = delay, environment = process.env) {
+const RELEASE_HEADER = "X-Raywarden-Release-Id";
+const RELEASE_VARIABLE = "RAYWARDEN_RELEASE_ID";
+const RFC3339 = /^(\d{4})-(\d{2})-(\d{2})T(?:[01]\d|2[0-3]):[0-5]\d:[0-5]\d(?:\.\d+)?(?:Z|[+-](?:[01]\d|2[0-3]):[0-5]\d)$/;
+
+function isHealthTimestamp(value) {
+  const date = typeof value === "string" && RFC3339.exec(value);
+  if (!date) return false;
+  const [year, month, day] = date.slice(1).map(Number);
+  const leapYear = year % 4 === 0 && (year % 100 !== 0 || year % 400 === 0);
+  const days = [31, leapYear ? 29 : 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+  return day >= 1 && day <= days[month - 1];
+}
+
+export async function checkHealth({ configPath, attempts = 12, interval: retryIntervalMs = 5000, expectedReleaseId } = {}, fetchImpl = globalThis.fetch, wait = delay, environment = process.env) {
   const target = readTargetConfig({ configPath });
   let origin = target.domain;
   if (!origin) {
@@ -195,10 +208,15 @@ export async function checkHealth({ configPath, attempts = 12, interval: retryIn
   let failure;
   for (let attempt = 1; attempt <= attempts; attempt++) {
     try {
-      const response = await fetchImpl(url, { redirect: "error", signal: AbortSignal.timeout(10000), headers: { Accept: "application/json", "User-Agent": "raywarden-health/0.1" } });
+      const response = await fetchImpl(url, { cache: "no-store", redirect: "error", signal: AbortSignal.timeout(10000), headers: { Accept: "application/json", "User-Agent": "raywarden-health/0.1" } });
       if (!response.ok) throw new Error(`HTTP ${response.status}`);
       const body = await response.text();
-      try { JSON.parse(body); } catch { throw new Error("Expected JSON from /api/alive"); }
+      let timestamp;
+      try { timestamp = JSON.parse(body); } catch { throw new Error("Expected JSON from /api/alive"); }
+      if (!isHealthTimestamp(timestamp)) throw new Error("Expected an RFC3339 timestamp from /api/alive");
+      if (expectedReleaseId !== undefined && response.headers.get(RELEASE_HEADER) !== expectedReleaseId) {
+        throw new Error("The public endpoint has not reported the expected release artifact");
+      }
       console.log(`Health check passed: ${url}`);
       return { url };
     } catch (error) { failure = error; }
@@ -288,10 +306,19 @@ export async function verifyArtifact({ configPath, manifestPath, expectedSha } =
   return { target, manifest };
 }
 
+export function artifactReleaseId(manifest) {
+  const files = Object.keys(manifest.files).sort().map(path => [path, manifest.files[path]]);
+  return createHash("sha256").update(JSON.stringify([
+    manifest.formatVersion, manifest.sourceSha, manifest.environment, manifest.configurationSha256,
+    manifest.bundleDirectory, manifest.entrypoint, files,
+  ])).digest("hex");
+}
+
 export function compiledConfig(target, manifest) {
   const config = parseJsonc(readFileSync(target.configPath, "utf8"));
   delete config.build;
   delete config.env;
+  config.vars = { ...config.vars, [RELEASE_VARIABLE]: artifactReleaseId(manifest) };
   for (const binding of config.d1_databases ?? []) if (binding.migrations_dir) binding.migrations_dir = resolve(target.projectDir, binding.migrations_dir);
   config.main = resolveArtifactPath(target.projectDir, manifest.entrypoint);
   config.base_dir = resolveArtifactPath(target.projectDir, manifest.bundleDirectory);
@@ -393,8 +420,8 @@ export async function deployArtifact(options = {}, runner = runWrangler, head = 
 
 export function parseDeployArgs(args, environment = process.env) {
   const [command, ...flags] = args;
-  if (!["config", "resources", "health", "manifest", "verify", "worker"].includes(command)) {
-    throw new Error("Usage: deploy.mjs config|resources|health|manifest|verify|worker");
+  if (!["config", "preflight", "resources", "health", "release-health", "manifest", "verify", "worker"].includes(command)) {
+    throw new Error("Usage: deploy.mjs config|preflight|resources|health|release-health|manifest|verify|worker");
   }
   const options = {};
   for (let i = 0; i < flags.length; i++) {
@@ -405,9 +432,9 @@ export function parseDeployArgs(args, environment = process.env) {
     if (!value || value.startsWith("--")) throw new Error(`${flag} requires a value`);
     options[key] = value;
   }
-  const artifactCommand = ["manifest", "verify", "worker"].includes(command);
+  const artifactCommand = ["manifest", "verify", "worker", "release-health"].includes(command);
   if (!artifactCommand && (options.manifestPath !== undefined || options.expectedSha !== undefined)) {
-    throw new Error("--manifest and --expected-sha apply only to manifest, verify and worker");
+    throw new Error("--manifest and --expected-sha apply only to manifest, verify, worker and release-health");
   }
   if (artifactCommand) {
     options.expectedSha ??= environment.ARTIFACT_SOURCE_SHA;
@@ -426,6 +453,17 @@ export async function main(argv = process.argv.slice(2), environment = process.e
     }
     case "resources": return verifyResources(environment, globalThis.fetch, options);
     case "health": return checkHealth(options, globalThis.fetch, delay, environment);
+    case "release-health": {
+      const { target, manifest } = await verifyArtifact(options);
+      const healthOptions = { configPath: target.configPath, expectedReleaseId: artifactReleaseId(manifest) };
+      return checkHealth(healthOptions, globalThis.fetch, delay, environment);
+    }
+    case "preflight": {
+      readTargetConfig(options);
+      configuredSecrets(environment);
+      console.log("Supplied production secret formats are valid");
+      break;
+    }
     case "manifest": return createArtifactManifest(options);
     case "verify": return verifyArtifact(options);
     case "worker": return deployArtifact(options, undefined, undefined, environment);

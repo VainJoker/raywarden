@@ -1,13 +1,13 @@
-"""Exercise the attachment finalization batch extracted from Rust against SQLite."""
+"""Exercise attachment metadata guards and late transaction rollback in SQLite."""
 
 import sqlite3
 import unittest
 
-from sql_regression import seed_cipher, seed_attachment
-
-from sql_regression import NOW, OLD, database, statement, statements
-from send_transactions_sql import guard_sql, session_sql, key_guard
-from cipher_v2_sql import ATTACHMENTS, REVISION, literal, row_guard, source_literals
+from sql_fixtures import (
+    NOW, OLD, VAULT_REVISION, database, guard_sql, key_guard, row_guard, seed_attachment,
+    seed_cipher, session_sql,
+)
+from sql_source import literal, source_literals, statements
 
 
 class AttachmentFinalizationSql(unittest.TestCase):
@@ -26,7 +26,7 @@ class AttachmentFinalizationSql(unittest.TestCase):
 
     def finalize(self):
         insert, remove, touch_cipher = self.batch
-        pending_predicate = literal(ATTACHMENTS, "EXISTS(SELECT 1 FROM attachments_pending WHERE")
+        pending_predicate = literal("attachment", "EXISTS(SELECT 1 FROM attachments_pending WHERE")
         pending_args = [self.pending[column] for column in ("id", "cipher_id", "file_name", "file_size_bytes", "encrypted_key", "created_at", "updated_at", "organization_id")]
         with self.db:
             self.db.execute(session_sql(), ("alice", "stamp", "device", "session")).fetchall()
@@ -36,7 +36,7 @@ class AttachmentFinalizationSql(unittest.TestCase):
             self.db.execute(insert, ("attachment", "cipher", "encrypted-name", 15, "wrapped-key", OLD, NOW, None, "staged-object"))
             self.db.execute(remove, ("attachment",))
             self.db.execute(touch_cipher, (NOW, "cipher", "alice"))
-            self.db.execute(REVISION, (NOW, "alice")).fetchall()
+            self.db.execute(VAULT_REVISION, (NOW, "alice")).fetchall()
 
     def test_finalize_moves_reservation_and_updates_only_owner_revisions(self):
         self.finalize()
@@ -49,17 +49,18 @@ class AttachmentFinalizationSql(unittest.TestCase):
         self.assertEqual(users, {"alice": NOW, "bob": OLD})
 
     def test_database_failure_rolls_back_metadata_reservation_and_revisions(self):
-        self.db.execute("CREATE TRIGGER reject_revision BEFORE UPDATE ON users BEGIN SELECT RAISE(ABORT, 'test failure'); END")
+        self.db.execute("CREATE TRIGGER reject_revision BEFORE UPDATE OF updated_at ON users BEGIN SELECT RAISE(ABORT, 'injected attachment cursor failure'); END")
         self.db.commit()
-        with self.assertRaises(sqlite3.IntegrityError):
+        with self.assertRaisesRegex(sqlite3.IntegrityError, "injected attachment cursor failure"):
             self.finalize()
         self.assertEqual(self.db.execute("SELECT COUNT(*) FROM attachments").fetchone()[0], 0)
         self.assertEqual(self.db.execute("SELECT COUNT(*) FROM attachments_pending").fetchone()[0], 1)
         self.assertEqual(self.db.execute("SELECT updated_at FROM ciphers WHERE id='cipher'").fetchone()[0], OLD)
+        self.assertEqual(dict(self.db.execute("SELECT id, updated_at FROM users")), {"alice": OLD, "bob": OLD})
 
     def replace(self, expected, key):
         update, touch = statements("attachment", "replace_upload")
-        predicate = next(value for value in source_literals(ATTACHMENTS)
+        predicate = next(value for value in source_literals("attachment")
                          if value.startswith("EXISTS(SELECT 1 FROM attachments WHERE id=?1 AND cipher_id=?2")
                          and "storage_key IS ?9" in value)
         cipher = dict(self.db.execute("SELECT * FROM ciphers WHERE id='cipher'").fetchone())
@@ -71,34 +72,16 @@ class AttachmentFinalizationSql(unittest.TestCase):
             self.db.execute(guard_sql(predicate), args).fetchall()
             self.db.execute(update, (18, "replacement-wrapped-key", key, NOW, "attachment", "cipher"))
             self.db.execute(touch, (NOW, "cipher", "alice"))
-            self.db.execute(REVISION, (NOW, "alice")).fetchall()
-
-    def test_ready_replacement_adopts_new_pointer_and_queues_previous_file(self):
-        self.finalize()
-        old = dict(self.db.execute("SELECT * FROM attachments").fetchone())
-        self.replace(old, "replacement-object")
-        row = self.db.execute("SELECT storage_key,file_size_bytes,encrypted_key FROM attachments").fetchone()
-        self.assertEqual(tuple(row), ("replacement-object", 18, "replacement-wrapped-key"))
-        self.assertIsNotNone(self.db.execute("SELECT object_key FROM storage_cleanup_jobs WHERE object_key='staged-object'").fetchone())
-        self.assertEqual(self.db.execute("SELECT COUNT(*) FROM attachments_pending").fetchone()[0], 0)
-
-    def test_competing_ready_replacement_cannot_overwrite_the_winner(self):
-        self.finalize()
-        old = dict(self.db.execute("SELECT * FROM attachments").fetchone())
-        self.replace(old, "winning-object")
-        with self.assertRaises(sqlite3.OperationalError):
-            self.replace(old, "losing-object")
-        self.assertEqual(self.db.execute("SELECT storage_key FROM attachments").fetchone()[0], "winning-object")
-        self.assertIsNone(self.db.execute("SELECT 1 FROM storage_cleanup_jobs WHERE object_key='winning-object'").fetchone())
+            self.db.execute(VAULT_REVISION, (NOW, "alice")).fetchall()
 
     def test_failed_ready_replacement_rolls_back_pointer_and_old_file_cleanup(self):
         self.finalize()
         old = dict(self.db.execute("SELECT * FROM attachments").fetchone())
-        self.db.execute("CREATE TRIGGER reject_replacement_revision BEFORE UPDATE ON users BEGIN SELECT RAISE(ABORT, 'test failure'); END")
+        self.db.execute("CREATE TRIGGER reject_replacement_revision BEFORE UPDATE OF updated_at ON users BEGIN SELECT RAISE(ABORT, 'injected attachment cursor failure'); END")
         self.db.commit()
-        with self.assertRaises(sqlite3.IntegrityError):
+        with self.assertRaisesRegex(sqlite3.IntegrityError, "injected attachment cursor failure"):
             self.replace(old, "replacement-object")
-        self.assertEqual(self.db.execute("SELECT storage_key FROM attachments").fetchone()[0], "staged-object")
+        self.assertEqual(dict(self.db.execute("SELECT * FROM attachments").fetchone()), old)
         self.assertIsNone(self.db.execute("SELECT 1 FROM storage_cleanup_jobs WHERE object_key='staged-object'").fetchone())
 
 

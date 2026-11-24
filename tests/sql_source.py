@@ -19,7 +19,7 @@ SOURCES = {
     "email": "src/models/identity/email.rs",
     "folder": "src/models/vault/folder.rs",
     "purge": "src/models/vault/cipher.rs",
-    "push": "src/models/identity/device.rs",
+    "push": "src/models/identity/push.rs",
     "send": "src/models/send.rs",
     "two_factor": "src/models/identity/two_factor.rs",
     "user": "src/models/identity/user.rs",
@@ -30,8 +30,10 @@ SOURCES = {
     "cipher_writes": "src/models/vault/cipher.rs",
     "vault_import": "src/models/vault/import.rs",
     "jwt_keys": "src/models/identity/jwt_keys.rs",
-    "storage_cleanup": "src/models/storage_cleanup.rs",
+    "storage_cleanup": "src/models/storage.rs",
     "send_mutation": "src/models/send.rs",
+    "db_errors": "src/errors/database.rs",
+    "read_page": "src/models/page.rs",
 }
 
 # Raw strings (including r"..."), ordinary strings, chars and comments. Lifetimes
@@ -49,25 +51,7 @@ TOKENS = re.compile(
 def source(module):
     if module not in SOURCES:
         raise AssertionError(f"Unregistered SQL source: {module}")
-    text = (ROOT / SOURCES[module]).read_text()
-    if module == "push":
-        # Device and push projections share one model file, but keep distinct
-        # Rust impl namespaces with legitimately repeated method names.
-        code = _code_mask(text)
-        matches = list(re.finditer(r"\bimpl\s+PushStore\s*\{", code))
-        if len(matches) != 1:
-            raise AssertionError("Expected one PushStore impl in device model")
-        opening = code.index("{", matches[0].start())
-        depth = 0
-        for index in range(opening, len(code)):
-            if code[index] == "{":
-                depth += 1
-            elif code[index] == "}":
-                depth -= 1
-                if depth == 0:
-                    return text[opening + 1:index]
-        raise AssertionError("Unclosed PushStore impl in device model")
-    return text
+    return (ROOT / SOURCES[module]).read_text()
 
 
 def _check_comment(match):
@@ -206,16 +190,41 @@ def _expand_user_revision(query, body, location):
     return query.replace("{NEXT_USER_REVISION_SQL}", revision)
 
 
+@lru_cache(maxsize=1)
+def _db_abort_expressions():
+    text = source("db_errors")
+    block = re.search(r"^db_sentinels!\s*\{(.*?)^\}", text, re.M | re.S)
+    template = re.search(r"\bconcat!\([^\n]*\$value[^\n]*\)", text)
+    if block is None or template is None:
+        raise AssertionError("Expected DB sentinel definitions and SQL abort expression")
+    prefix, suffix = rust_strings(template.group())
+    return {name: prefix + marker + suffix
+            for name, marker in re.findall(r'(\w+)\s*=>\s*"([A-Z_]+)"', block[1])}
+
+
+def _expand_db_sentinels(query, body):
+    for name, variant in re.findall(
+        r"\blet\s+(\w+)\s*=\s*DbSentinel::(\w+)\.sql_abort_expr\(\);", body,
+    ):
+        placeholder = "{" + name + "}"
+        if placeholder in query:
+            query = query.replace(placeholder, _db_abort_expressions()[variant])
+    return query
+
+
 @lru_cache(maxsize=None)
 def statements(module, name):
     body = function_source(module, name)
-    queries = [text for text in rust_strings(body)
-               if re.match(r"\s*(SELECT|INSERT|UPDATE|DELETE)\b", text)]
     location = f"{module}::{name}"
-    return [_expand_user_revision(
-        _expand_snapshot_predicate(text, body, location)
-        if "{snapshot_predicate}" in text else text, body, location,
-    ) for text in queries]
+    queries = []
+    for text in rust_strings(body):
+        if not re.match(r"\s*(SELECT|INSERT|UPDATE|DELETE)\b", text):
+            continue
+        if "{snapshot_predicate}" in text:
+            text = _expand_snapshot_predicate(text, body, location)
+        text = _expand_user_revision(text, body, location)
+        queries.append(_expand_db_sentinels(text, body))
+    return tuple(queries)
 
 
 def statement(module, name):

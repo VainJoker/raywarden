@@ -1,4 +1,5 @@
-import { assertDownloadSecurityHeaders } from "./security-headers-runtime.mjs";
+import { assertDownloadSecurityHeaders, bearerJsonHeaders, equal, expectJson, expectStatus } from "./runtime-assertions.mjs";
+import { oauthToken } from "./runtime-auth.mjs";
 
 /** Two independently authenticated sessions using real client-side crypto.
  * Runs production WASM/SQL with isolated object-storage bindings. This is a
@@ -6,14 +7,7 @@ import { assertDownloadSecurityHeaders } from "./security-headers-runtime.mjs";
  */
 export async function runPersonalVaultCompatibility({ fixture, check }) {
   const encoder = new TextEncoder(), decoder = new TextDecoder();
-  const equal = (actual, expected, label = "value") => {
-    if (actual !== expected) throw new Error(`${label}: expected ${expected}, received ${actual}`);
-  };
-  const expect = async (response, status = 200) => {
-    if (response.status !== status) throw new Error(`Expected HTTP ${status}, received ${response.status}: ${await response.text()}`);
-    return response;
-  };
-  const json = async response => (await expect(await response)).json();
+  const json = async response => expectJson(await response, 200);
   const base64 = bytes => btoa(String.fromCharCode(...new Uint8Array(bytes)));
   const unbase64 = text => Uint8Array.from(atob(text), char => char.charCodeAt(0));
   const rawKey = () => crypto.getRandomValues(new Uint8Array(64));
@@ -35,15 +29,13 @@ export async function runPersonalVaultCompatibility({ fixture, check }) {
     return decoder.decode(await crypto.subtle.decrypt({ name: "AES-CBC", iv }, aes, encrypted));
   }
   const pathOf = value => { const url = new URL(value, "https://vault.test"); return url.pathname + url.search; };
-  const ownerHeaders = tokens => ({ Authorization: `Bearer ${tokens.access_token}`, "Content-Type": "application/json" });
   const request = (f, tokens, path, body, method = "POST") => f.fetch(path, {
-    method, headers: ownerHeaders(tokens), ...(body === undefined ? {} : { body: JSON.stringify(body) }),
+    method, headers: bearerJsonHeaders(tokens.access_token), ...(body === undefined ? {} : { body: JSON.stringify(body) }),
   });
-  const login = (f, password, device) => json(f.fetch("/identity/connect/token", {
-    method: "POST", headers: { "Content-Type": "application/x-www-form-urlencoded", "Bitwarden-Client-Version": "2026.10.1", "device-type": "14" },
-    body: new URLSearchParams({ grant_type: "password", username: "personal@example.test", password,
-      deviceIdentifier: device, deviceName: device, deviceType: "14" }),
-  }));
+  const login = (f, password, device) => json(oauthToken(f, {
+    grant_type: "password", username: "personal@example.test", password,
+    deviceIdentifier: device, deviceName: device, deviceType: "14",
+  }, { "Bitwarden-Client-Version": "2026.10.1", "device-type": "14" }));
   const sync = (f, tokens) => json(request(f, tokens, "/api/sync?excludeDomains=true", undefined, "GET"));
   async function bootstrap() {
     const f = fixture({ empty: true });
@@ -52,10 +44,10 @@ export async function runPersonalVaultCompatibility({ fixture, check }) {
     const wrapping = rawKey(), userKey = rawKey();
     const authentication = base64(crypto.getRandomValues(new Uint8Array(32)));
     const wrapped = await seal(wrapping, base64(userKey));
-    await expect(await f.fetch("/api/accounts/register", { method: "POST", headers: {
+    await expectStatus(await f.fetch("/api/accounts/register", { method: "POST", headers: {
       "Content-Type": "application/json", "X-Raywarden-Setup-Token": f.env.OWNER_SETUP_TOKEN,
     }, body: JSON.stringify({ email: f.env.ALLOWED_EMAILS, masterPasswordHash: authentication, key: wrapped,
-      keys: { publicKey: "isolated-public-key", encryptedPrivateKey: await seal(userKey, "isolated-private-key") }, kdf: 0, kdfIterations: 600000 }) }));
+      keys: { publicKey: "isolated-public-key", encryptedPrivateKey: await seal(userKey, "isolated-private-key") }, kdf: 0, kdfIterations: 600000 }) }), 200);
     const first = await login(f, authentication, "personal-first-device");
     const second = await login(f, authentication, "personal-second-device");
     equal(first.access_token === second.access_token, false, "independent sessions");
@@ -76,15 +68,15 @@ export async function runPersonalVaultCompatibility({ fixture, check }) {
     equal(await open(userKey, remote.name), "Edited on second device");
     equal(await open(userKey, remote.login.username), "roundtrip-user");
     const nextAuthentication = base64(crypto.getRandomValues(new Uint8Array(32))), newWrapping = rawKey();
-    await expect(await request(f, second, "/api/accounts/password", { masterPasswordHash: authentication,
-      newMasterPasswordHash: nextAuthentication, key: await seal(newWrapping, base64(userKey)) }));
-    for (const old of [first, second]) await expect(await request(f, old, "/api/accounts/profile", undefined, "GET"), 401);
+    await expectStatus(await request(f, second, "/api/accounts/password", { masterPasswordHash: authentication,
+      newMasterPasswordHash: nextAuthentication, key: await seal(newWrapping, base64(userKey)) }), 200);
+    for (const old of [first, second]) await expectStatus(await request(f, old, "/api/accounts/profile", undefined, "GET"), 401);
     const renewed = await login(f, nextAuthentication, "personal-first-device");
     equal(await open(newWrapping, renewed.Key), base64(userKey), "rewrapped user key");
     snapshot = await sync(f, renewed);
     equal(await open(userKey, snapshot.ciphers[0].login.password), "roundtrip-password");
     equal(await open(userKey, snapshot.ciphers[0].name), "Edited on second device");
-    await expect(await f.fetch("/api/sync"), 401);
+    await expectStatus(await f.fetch("/api/sync"), 401);
   });
 
   await check("another session downloads encrypted attachments and anonymous recipients decrypt text and file Sends", async () => {
@@ -94,16 +86,16 @@ export async function runPersonalVaultCompatibility({ fixture, check }) {
     const reserved = await json(request(f, first, `/api/ciphers/${item.id}/attachment/v2`, {
       key: await seal(userKey, base64(fileKey)), fileName: await seal(userKey, "example.txt"), fileSize: encoder.encode(ciphertext).length,
     }));
-    await expect(await f.fetch(pathOf(reserved.url), { method: "PUT", body: encoder.encode(ciphertext) }), 201);
+    await expectStatus(await f.fetch(pathOf(reserved.url), { method: "PUT", body: encoder.encode(ciphertext) }), 201);
     const remote = (await sync(f, second)).ciphers.find(cipher => cipher.id === item.id);
     const attachment = remote.attachments[0];
     equal(await open(userKey, attachment.fileName), "example.txt");
     const metadata = await json(request(f, second, `/api/ciphers/${item.id}/attachment/${attachment.id}`, undefined, "GET"));
-    const attachmentResponse = await expect(await f.fetch(pathOf(metadata.url)));
+    const attachmentResponse = await expectStatus(await f.fetch(pathOf(metadata.url)), 200);
     assertDownloadSecurityHeaders(attachmentResponse);
     const downloaded = decoder.decode(await attachmentResponse.arrayBuffer());
     equal(await open(unbase64(await open(userKey, attachment.key)), downloaded), "roundtrip attachment bytes");
-    await expect(await f.fetch(`/api/ciphers/${item.id}/attachment/${attachment.id}`), 401);
+    await expectStatus(await f.fetch(`/api/ciphers/${item.id}/attachment/${attachment.id}`), 401);
     const sendKey = rawKey(), deletionDate = new Date(Date.now() + 86400000).toISOString();
     const textSend = await json(request(f, first, "/api/sends", { type: 0, name: await seal(sendKey, "Shared text"),
       key: await seal(userKey, base64(sendKey)), deletionDate, text: { text: await seal(sendKey, "Anonymous text"), hidden: false } }));
@@ -112,10 +104,10 @@ export async function runPersonalVaultCompatibility({ fixture, check }) {
     const encryptedFile = encoder.encode(await seal(sendKey, "Anonymous file bytes"));
     const fileSend = await json(request(f, first, "/api/sends/file/v2", { type: 1, name: await seal(sendKey, "Shared file"),
       key: await seal(userKey, base64(sendKey)), deletionDate, fileLength: encryptedFile.length, file: { fileName: await seal(sendKey, "shared.txt") } }));
-    await expect(await f.fetch(pathOf(fileSend.url), { method: "PUT", body: encryptedFile }), 201);
+    await expectStatus(await f.fetch(pathOf(fileSend.url), { method: "PUT", body: encryptedFile }), 201);
     const shared = fileSend.sendResponse;
     const granted = await json(f.fetch(`/api/sends/${shared.id}/access/file/${shared.file.id}`, { method: "POST", headers: { "Content-Type": "application/json" }, body: "{}" }));
-    const sendResponse = await expect(await f.fetch(pathOf(granted.url)));
+    const sendResponse = await expectStatus(await f.fetch(pathOf(granted.url)), 200);
     assertDownloadSecurityHeaders(sendResponse, 'attachment; filename="send-file"');
     const bytes = decoder.decode(await sendResponse.arrayBuffer());
     equal(await open(sendKey, bytes), "Anonymous file bytes");

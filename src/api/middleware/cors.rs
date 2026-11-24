@@ -1,24 +1,9 @@
 //! One CORS policy for Axum, preflight, dispatch errors and Durable Objects.
-use axum::http::{
-    HeaderValue,
-    Method,
-};
-use tower_http::cors::{
-    AllowHeaders,
-    AllowMethods,
-    AllowOrigin,
-    CorsLayer,
-};
-use worker::{
-    Env,
-    Request,
-    Response,
-};
+use axum::http::{HeaderValue, Method};
+use tower_http::cors::{AllowHeaders, AllowMethods, AllowOrigin, CorsLayer};
+use worker::{Env, Request, Response};
 
-use crate::{
-    config::cors_allowed_origins,
-    errors::AppResult,
-};
+use crate::{errors::AppResult, infra::config::cors_allowed_origins};
 
 const ALL_METHODS: &str = "GET,HEAD,POST,PUT,DELETE,OPTIONS";
 
@@ -30,8 +15,10 @@ pub enum CorsPolicy {
 
 impl CorsPolicy {
     pub fn from_env(env: &Env) -> Self {
-        let origins = cors_allowed_origins(env);
-        Self::parse(origins.as_deref())
+        match cors_allowed_origins(env) {
+            Ok(origins) => Self::parse(origins.as_deref()),
+            Err(_) => Self::Origins(Vec::new()),
+        }
     }
 
     fn parse(origins: Option<&str>) -> Self {
@@ -46,18 +33,19 @@ impl CorsPolicy {
     fn origin<'a>(&self, origin: Option<&'a str>) -> Option<&'a str> {
         match self {
             Self::Any => Some("*"),
-            Self::Origins(allowed) => origin.filter(|value| {
-                allowed
-                    .iter()
-                    .any(|entry| entry.as_bytes() == value.as_bytes())
-            }),
+            Self::Origins(allowed) => {
+                origin.filter(|value| allowed_origin(allowed, value.as_bytes()))
+            }
         }
     }
 
     pub fn layer(&self) -> CorsLayer {
         let origins = match self {
             Self::Any => AllowOrigin::any(),
-            Self::Origins(origins) => AllowOrigin::list(origins.clone()),
+            Self::Origins(origins) => {
+                let origins = origins.clone();
+                AllowOrigin::predicate(move |origin, _| allowed_origin(&origins, origin.as_bytes()))
+            }
         };
         // Clients authenticate explicitly with bearer tokens, without cookies.
         CorsLayer::new()
@@ -74,18 +62,22 @@ impl CorsPolicy {
     }
 }
 
+fn allowed_origin(origins: &[HeaderValue], value: &[u8]) -> bool {
+    origins.iter().any(|entry| entry.as_bytes() == value)
+}
+
 fn origin_header(value: &str) -> Option<HeaderValue> {
     let value = value.trim();
     if value == "null" {
         return Some(HeaderValue::from_static("null"));
     }
     let url = url::Url::parse(value).ok()?;
-    if !url.has_host() ||
-        !url.username().is_empty() ||
-        url.password().is_some() ||
-        !matches!(url.path(), "" | "/") ||
-        url.query().is_some() ||
-        url.fragment().is_some()
+    if !url.has_host()
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || !matches!(url.path(), "" | "/")
+        || url.query().is_some()
+        || url.fragment().is_some()
     {
         return None;
     }
@@ -94,16 +86,16 @@ fn origin_header(value: &str) -> Option<HeaderValue> {
 
 /// Capture CORS before moving the original streaming request. No D1 lookup.
 pub(crate) struct CorsContext {
-    policy:            CorsPolicy,
-    origin:            Option<String>,
+    policy: CorsPolicy,
+    origin: Option<String>,
     requested_headers: Option<String>,
 }
 
 impl CorsContext {
     pub(crate) fn new(request: &Request, env: &Env) -> Self {
         Self {
-            policy:            CorsPolicy::from_env(env),
-            origin:            request.headers().get("Origin").ok().flatten(),
+            policy: CorsPolicy::from_env(env),
+            origin: request.headers().get("Origin").ok().flatten(),
             requested_headers: request
                 .headers()
                 .get("Access-Control-Request-Headers")
@@ -121,11 +113,7 @@ impl CorsContext {
         self.apply_methods(response, ALL_METHODS)
     }
 
-    pub(crate) fn apply_methods(
-        &self,
-        response: Response,
-        methods: &str,
-    ) -> AppResult<Response> {
+    pub(crate) fn apply_methods(&self, response: Response, methods: &str) -> AppResult<Response> {
         // Preserve the upgrade and its WebSocket without header reconstruction.
         if response.status_code() == 101 {
             return Ok(response);
@@ -159,9 +147,7 @@ mod tests {
             Some("*")
         );
         assert_eq!(CorsPolicy::parse(None).origin(None), Some("*"));
-        let policy = CorsPolicy::parse(Some(
-            " https://other.test, https://client.test ",
-        ));
+        let policy = CorsPolicy::parse(Some(" https://other.test, https://client.test "));
         assert_eq!(
             policy.origin(Some("https://client.test")),
             Some("https://client.test")

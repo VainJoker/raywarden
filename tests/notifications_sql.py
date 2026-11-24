@@ -2,7 +2,8 @@
 import sqlite3
 import unittest
 
-from sql_regression import apply_migrations, statement
+from sql_fixtures import apply_migrations
+from sql_source import statement
 
 
 class PushDevices(unittest.TestCase):

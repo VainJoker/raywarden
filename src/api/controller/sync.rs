@@ -1,51 +1,27 @@
-use std::borrow::Cow;
+use std::sync::Arc;
 
 use axum::{
-    extract::{
-        Query,
-        State,
-    },
-    http::HeaderMap,
+    extract::{Query, State},
+    response::Response,
 };
 use serde::Deserialize;
-use serde_json::{
-    Value,
-    json,
-};
+use serde_json::{Value, json};
 
 use crate::{
     api::{
         AppState,
-        common::response::RawJson,
-    },
-    errors::{
-        AppError,
-        AppResult,
-        AuthError,
-    },
-    models::{
-        identity::{
-            account_keys::AccountSnapshot,
-            user::UserRow,
+        common::{
+            extract::ClientVersionHeader,
+            snapshot::{ReadSnapshot, SnapshotJson},
         },
-        vault::folder::FolderRow,
     },
+    errors::AppResult,
+    models::identity::user::UserRow,
     service::{
-        identity::{
-            session::Claims,
-            user::ProfileResponse,
-        },
-        notifications::{
-            admin as admin_notify,
-            admin::Event,
-        },
+        identity::{session::Claims, user::ProfileResponse},
+        notifications::{admin as admin_notify, admin::Event},
         send,
-        vault::{
-            attachment,
-            cipher,
-            domains,
-            folder::FolderResponse,
-        },
+        vault::{attachment, cipher, domains, folder},
     },
 };
 
@@ -60,20 +36,15 @@ pub(in crate::api) struct SyncQuery {
 #[worker::send]
 pub(in crate::api) async fn sync_vault(
     claims: Claims,
-    State(state): State<AppState>,
-    headers: HeaderMap,
+    State(state): State<Arc<AppState>>,
+    ClientVersionHeader(version): ClientVersionHeader,
     Query(query): Query<SyncQuery>,
-) -> AppResult<RawJson> {
-    let show_ssh_keys = headers
-        .get("bitwarden-client-version")
-        .and_then(|value| value.to_str().ok())
-        .and_then(crate::utils::version::parse)
-        .is_some_and(|(version, prerelease)| {
-            !prerelease && version >= (2024, 12, 0)
-        });
+) -> AppResult<Response> {
+    let show_ssh_keys = version
+        .is_some_and(|version| !version.is_prerelease && version.satisfies_minimum(2024, 12, 0));
 
     VaultSync {
-        state:  &state,
+        state: &state,
         claims: &claims,
     }
     .respond(show_ssh_keys, query.exclude_domains)
@@ -83,134 +54,73 @@ pub(in crate::api) async fn sync_vault(
 /// Validate the source account and session again before releasing a response
 /// assembled from multiple reads.
 struct VaultSync<'a> {
-    state:  &'a AppState,
+    state: &'a AppState,
     claims: &'a Claims,
 }
 
 impl VaultSync<'_> {
-    async fn user(&self, context: &str) -> AppResult<UserRow> {
-        UserRow::fetch_by_id_with(
-            self.state.database(),
-            &self.claims.sub,
-            context,
-            || AppError::Auth(AuthError::UserNotFound),
-        )
-        .await
-    }
-
-    async fn respond(
-        self,
-        show_ssh_keys: bool,
-        exclude_domains: bool,
-    ) -> AppResult<RawJson> {
-        let user = self.user("Failed to fetch user for sync").await?;
-        let account = AccountSnapshot::from_user(&user);
-        let revision = user.updated_at.clone();
-        let response =
-            self.render(user, show_ssh_keys, exclude_domains).await?;
-
-        let current = self.user("Failed to verify sync snapshot").await?;
-        if account != AccountSnapshot::from_user(&current) ||
-            revision != current.updated_at
-        {
-            return Err(AppError::conflict(
-                "Account or vault changed during sync. Retry sync.",
-            ));
-        }
-        self.claims
-            .validate_session(self.state.database(), "access")
-            .await?;
-        admin_notify::emit(&self.state.env, Event::Sync, &self.claims.sub)
-            .await;
-        Ok(RawJson(response))
+    async fn respond(self, show_ssh_keys: bool, exclude_domains: bool) -> AppResult<Response> {
+        let db = self.state.database();
+        let user = ReadSnapshot::user(db, self.claims, "Failed to fetch user for sync").await?;
+        let snapshot = ReadSnapshot::from_user(&user);
+        let response = self.render(user, show_ssh_keys, exclude_domains).await?;
+        snapshot.verify(db, self.claims).await?;
+        admin_notify::emit(&self.state.env, Event::Sync, &self.claims.sub).await;
+        Ok(response)
     }
 
     async fn render(
         &self,
-        user: UserRow,
+        mut user: UserRow,
         show_ssh_keys: bool,
         exclude_domains: bool,
-    ) -> AppResult<String> {
+    ) -> AppResult<Response> {
         let db = self.state.database();
         let user_id = &self.claims.sub;
         let is_two_factor_enabled =
-            crate::service::identity::two_factor::is_two_factor_enabled(
-                db, user_id,
-            )
-            .await?;
+            crate::service::identity::two_factor::is_two_factor_enabled(db, user_id).await?;
         let has_master_password = !user.master_password_hash.is_empty();
         let decryption = user_decryption(&user, has_master_password);
 
-        let folders_db = FolderRow::list_for_user(db, user_id).await?;
-        let folders: Vec<FolderResponse> = folders_db
-            .into_iter()
-            .map(std::convert::Into::into)
-            .collect();
+        let equivalent_domains = std::mem::take(&mut user.equivalent_domains);
+        let excluded_globals = std::mem::take(&mut user.excluded_globals);
+        let mut profile = ProfileResponse::from_user(user, is_two_factor_enabled);
+        profile.status = i32::from(!has_master_password);
 
-        let include_attachments = attachment::is_enabled(&self.state.env);
-        let ciphers_json = cipher::list_cipher_responses_json(
+        let mut response = SnapshotJson::new();
+        response.field("profile", &profile)?;
+        let mut folders = response.array("folders")?;
+        folder::visit_folder_responses(db, user_id, |folder| folders.push(&folder)).await?;
+        folders.finish()?;
+        response.field("collections", &[] as &[()])?;
+        response.field("policies", &[] as &[()])?;
+        response.field("policiesNew", &[] as &[()])?;
+
+        let mut ciphers = response.array("ciphers")?;
+        cipher::visit_cipher_responses(
             db,
             user_id,
-            include_attachments,
+            attachment::include_metadata(&self.state.env),
             show_ssh_keys,
             false,
             self.state.domain(),
+            |cipher| ciphers.push(&cipher),
         )
         .await?;
+        ciphers.finish()?;
 
-        let folders_json = serde_json::to_string(&folders).map_err(|err| {
-            AppError::internal_with_context(
-                "api",
-                "Failed to serialize folders for sync",
-                err,
-            )
-        })?;
-
-        let user_decryption_json =
-            serde_json::to_string(&decryption).map_err(|err| {
-                AppError::internal_with_context(
-                    "api",
-                    "Failed to serialize user decryption data",
-                    err,
-                )
-            })?;
-
-        let sends_json = serde_json::to_string(
-            &send::list_send_responses(db, user_id).await?,
-        )
-        .map_err(AppError::internal_error)?;
-        let domains_json = if exclude_domains {
-            Cow::Borrowed("null")
+        let domains = if exclude_domains {
+            None
         } else {
-            // Match vaultwarden sync semantics:
-            // - mark excluded in /api/settings/domains
-            // - filter excluded out of sync payload
-            let global_equivalent_domains =
-                domains::global_equivalent_domains_json(
-                    db,
-                    &user.excluded_globals,
-                    false,
-                )
-                .await;
-            Cow::Owned(format!(
-                r#"{{"equivalentDomains":{},"globalEquivalentDomains":{global_equivalent_domains},"object":"domains"}}"#,
-                user.equivalent_domains,
-            ))
+            Some(domains::render_settings(db, &equivalent_domains, &excluded_globals, false).await)
         };
-        let mut profile =
-            ProfileResponse::from_user(user, is_two_factor_enabled);
-        // Clients expect the Invited status before a master password exists.
-        profile.status = i32::from(!has_master_password);
-        let profile_json = serde_json::to_string(&profile).map_err(|err| {
-            AppError::internal_with_context(
-                "api",
-                "Failed to serialize profile for sync",
-                err,
-            )
-        })?;
-        Ok(format!(
-            r#"{{"profile":{profile_json},"folders":{folders_json},"collections":[],"policies":[],"policiesNew":[],"ciphers":{ciphers_json},"domains":{domains_json},"sends":{sends_json},"userDecryption":{user_decryption_json},"object":"sync"}}"#
-        ))
+        response.field("domains", &domains)?;
+        let mut sends = response.array("sends")?;
+        send::visit_send_responses(db, user_id, |send| sends.push(&send)).await?;
+        sends.finish()?;
+        response.field("userDecryption", &decryption)?;
+        response.field("object", &"sync")?;
+        response.finish()
     }
 }
 

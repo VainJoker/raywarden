@@ -2,8 +2,8 @@
 import sqlite3
 import unittest
 
-from account_v2_sql import account_guard
-from sql_regression import NOW, account_snapshot, database, statements, statement
+from sql_fixtures import NOW, account_snapshot, database
+from sql_source import account_guard, statement, statements
 
 
 def key_snapshot(db, user="alice"):
@@ -14,13 +14,12 @@ def key_snapshot(db, user="alice"):
 
 
 def replace_key(db, snapshot, previous, marker="api-write", encrypted="new-encrypted", key_hash="new-hash"):
-    queries = statements("api_key", "replace")
-    queries[0] = queries[0].replace("{}", account_guard(6))
+    claim, revoke, clear, replace = statements("api_key", "replace")
     with db:
-        changed = db.execute(queries[0], (*snapshot, marker, "2026-11-18T10:00:00.000Z", *(previous or (None, None, None)))).fetchall()
-        db.execute(queries[1], (snapshot[0], marker))
-        db.execute(queries[2], (snapshot[0], marker))
-        db.execute(queries[3], (snapshot[0], encrypted, key_hash, marker))
+        changed = db.execute(claim.replace("{}", account_guard(6)), (*snapshot, marker, "2026-11-18T10:00:00.000Z", *(previous or (None, None, None)))).fetchall()
+        db.execute(revoke, (snapshot[0], marker))
+        db.execute(clear, (snapshot[0], marker))
+        db.execute(replace, (snapshot[0], encrypted, key_hash, marker))
     return changed
 
 
@@ -39,6 +38,7 @@ class ApiKeySql(unittest.TestCase):
                 for table in ("users", "devices", "user_api_keys", "user_api_key_sessions")}
 
     def start_session(self, key_hash="old-hash"):
+        # The account guard has already passed in these binding/rollback cases.
         upsert = statement("device", "persist_session_statement")
         bind, guard = statements("api_key", "start_session")
         with self.db:
@@ -107,10 +107,12 @@ class ApiKeySql(unittest.TestCase):
         self.db.execute("INSERT INTO user_api_key_sessions VALUES('alice','device','old-api-session')")
         self.db.execute("INSERT INTO devices(user_id,device_id,name,device_type,session_token,created_at,updated_at) VALUES('alice','api-device','CLI',14,'api-session','old','old')")
         self.db.execute("INSERT INTO user_api_key_sessions VALUES('alice','api-device','api-session')")
+        self.db.execute("INSERT INTO devices(user_id,device_id,name,device_type,session_token,created_at,updated_at) VALUES('bob','device','Browser',14,'bob-session','old','old')")
         self.db.commit()
         self.assertEqual(len(replace_key(self.db, self.snapshot, self.previous)), 1)
         self.assertEqual(replace_key(self.db, self.snapshot, self.previous, marker="loser"), [])
         self.assertEqual(self.db.execute("SELECT session_token FROM devices WHERE user_id='alice' AND device_id='device'").fetchone()[0], "session")
+        self.assertEqual(self.db.execute("SELECT session_token FROM devices WHERE user_id='bob' AND device_id='device'").fetchone()[0], "bob-session")
         self.assertIsNone(self.db.execute("SELECT 1 FROM devices WHERE device_id='api-device'").fetchone())
         self.assertEqual(self.db.execute("SELECT COUNT(*) FROM user_api_key_sessions").fetchone()[0], 0)
 

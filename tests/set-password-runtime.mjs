@@ -73,6 +73,7 @@ export async function runSetPasswordCompatibility({ fixture, check, sql, accessT
     equal(other(), unrelated); equal(sql.exec("SELECT COUNT(*) AS n FROM two_factors WHERE user_id=? AND provider_type=5", USER).one().n, 0);
     equal(sql.exec("SELECT COUNT(*) AS n FROM auth_requests WHERE user_id=?", USER).one().n, 0);
     const prf = sql.exec("SELECT * FROM webauthn_credentials WHERE user_id=?", USER).one();
+    equal(prf.credential_id, `set-wire-${USER}`);
     equal(prf.prf_status, 1); equal(prf.encrypted_user_key, null); equal(prf.encrypted_private_key, null);
     await expect(await f.fetch("/api/accounts/profile", { headers: await owner() }), 200);
     // This reference flow deliberately retains the session for late key setup.
@@ -136,18 +137,16 @@ export async function runSetPasswordCompatibility({ fixture, check, sql, accessT
     const changes = [["users", "master_password_hash", "concurrent-hash"], ["users", "private_key", "2.concurrent-private"],
       ["users", "public_key", "concurrent-public"], ["users", "key", "concurrent-wrapper"],
       ["users", "password_salt", "concurrent-salt"], ["users", "password_iterations", 1200000],
-      ["users", "security_stamp", "concurrent-stamp"], ["users", "security_version", 2],
+      ["users", "security_stamp", "concurrent-stamp"], ["users", "security_version", 2], ["users", "user_key_id", "new-id"],
       ["users", "kdf_type", 1], ["users", "kdf_iterations", 700000], ["users", "kdf_memory", 64],
       ["users", "kdf_parallelism", 4], ["devices", "session_token", "concurrent-nonce"]];
     for (const [table, column, value] of changes) {
-      const f = emptyOwner(), batch = f.db.batch.bind(f.db); let reached = false, expected;
-      f.db.batch = async writes => {
-        if (!reached && isInitialization(writes)) {
-          reached = true; sql.exec(`UPDATE ${table} SET ${column}=? WHERE ${table === "users" ? "id" : "user_id"}=?`, value, USER); expected = state();
-        }
-        return batch(writes);
-      };
-      await expect(await post(f, legacy()), 409); equal(reached, true); equal(state(), expected);
+      const f = emptyOwner(); let expected;
+      const reached = f.db.beforeNextBatch(isInitialization, () => {
+        sql.exec(`UPDATE ${table} SET ${column}=? WHERE ${table === "users" ? "id" : "user_id"}=?`, value, USER);
+        expected = state();
+      });
+      await expect(await post(f, legacy()), 409); equal(reached(), true); equal(state(), expected);
     }
   });
 

@@ -1,40 +1,28 @@
 //! Persisted accounts, credential values and guarded database operations.
-use serde::{
-    Deserialize,
-    Serialize,
-};
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use worker::{
-    D1Database,
-    query,
-    wasm_bindgen::JsValue,
-};
+use worker::{D1Database, D1PreparedStatement, D1Result, query, wasm_bindgen::JsValue};
 
 use crate::{
-    errors::{
-        AppError,
-        AppResult,
-        DatabaseError,
-    },
+    errors::{AppError, AppResult, DatabaseError, DbSentinel},
     infra::db,
     models::{
         identity::{
             account_keys,
-            device::{
-                PushDeviceRow,
-                PushStore,
-                SessionSnapshot,
-            },
+            authorization::VerifiedAccountAction,
+            device::SessionSnapshot,
+            email::{VerifiedCode, require_changed_row},
+            push::{self, PushDeviceRow},
         },
-        mutation::NEXT_USER_REVISION_SQL,
+        mutation::{NEXT_USER_REVISION_SQL, RevisionRow},
     },
     utils::serde::bool_from_int,
 };
 
 /// The complete server-side verifier persisted as one credential value.
 pub struct StoredPassword {
-    pub hash:       String,
-    pub salt:       String,
+    pub hash: String,
+    pub salt: String,
     pub iterations: u32,
 }
 
@@ -97,28 +85,67 @@ const fn legacy_password_iterations() -> u32 {
     100_000
 }
 
+#[derive(Deserialize)]
 #[allow(
     clippy::struct_field_names,
     reason = "Persisted query fields use the exact SQL KDF column names"
 )]
 pub struct UserKdfParams {
-    pub kdf_type:        Option<i32>,
-    pub kdf_iterations:  Option<i32>,
-    pub kdf_memory:      Option<i32>,
+    pub kdf_type: i32,
+    pub kdf_iterations: i32,
+    pub kdf_memory: Option<i32>,
     pub kdf_parallelism: Option<i32>,
 }
 
 /// Concrete values written by initial-password persistence after service
 /// validation.
 pub struct PasswordInitialization<'a> {
-    pub key:             &'a str,
-    pub private_key:     &'a str,
-    pub public_key:      &'a str,
-    pub hint:            Option<&'a str>,
-    pub kdf_type:        i32,
-    pub kdf_iterations:  i32,
-    pub kdf_memory:      Option<i32>,
+    pub key: &'a str,
+    pub private_key: &'a str,
+    pub public_key: &'a str,
+    pub hint: Option<&'a str>,
+    pub kdf_type: i32,
+    pub kdf_iterations: i32,
+    pub kdf_memory: Option<i32>,
     pub kdf_parallelism: Option<i32>,
+}
+
+impl PasswordInitialization<'_> {
+    fn bindings(
+        &self,
+        user: &UserRow,
+        session: &SessionSnapshot<'_>,
+        password: &StoredPassword,
+        token: &str,
+        now: &str,
+    ) -> AppResult<[JsValue; 24]> {
+        Ok(db::d1_params![
+            password.hash,
+            password.salt,
+            password.iterations,
+            self.key,
+            self.private_key,
+            self.public_key,
+            self.hint,
+            self.kdf_type,
+            self.kdf_iterations,
+            self.kdf_memory,
+            self.kdf_parallelism,
+            token,
+            now,
+            user.id,
+            session.security_stamp,
+            user.password_salt,
+            user.password_iterations,
+            account_keys::AccountSnapshot::json_from_user(user)?,
+            session.device_id,
+            session.session_token,
+            user.kdf_type,
+            user.kdf_iterations,
+            user.kdf_memory,
+            user.kdf_parallelism,
+        ])
+    }
 }
 
 impl UserRow {
@@ -135,9 +162,7 @@ impl UserRow {
         password: &StoredPassword,
     ) -> AppResult<()> {
         if user.id != session.user_id {
-            return Err(AppError::conflict(
-                "Account does not match the session",
-            ));
+            return Err(AppError::conflict("Account does not match the session"));
         }
         let now = crate::utils::time::now_rfc3339();
         let token = uuid::Uuid::new_v4().to_string();
@@ -157,36 +182,8 @@ impl UserRow {
              device_id=?19 AND session_token=?20) RETURNING id",
             account_keys::AccountSnapshot::matches_sql(18),
         );
-        let claim = db.prepare(sql).bind(&[
-            password.hash.clone().into(),
-            password.salt.clone().into(),
-            password.iterations.into(),
-            initialization.key.into(),
-            initialization.private_key.into(),
-            initialization.public_key.into(),
-            initialization.hint.map_or(JsValue::NULL, Into::into),
-            initialization.kdf_type.into(),
-            initialization.kdf_iterations.into(),
-            initialization.kdf_memory.map_or(JsValue::NULL, Into::into),
-            initialization
-                .kdf_parallelism
-                .map_or(JsValue::NULL, Into::into),
-            token.clone().into(),
-            now.clone().into(),
-            user.id.clone().into(),
-            session.security_stamp.into(),
-            user.password_salt.clone().map_or(JsValue::NULL, Into::into),
-            user.password_iterations.into(),
-            account_keys::AccountSnapshot::from_user(user)
-                .to_json()?
-                .into(),
-            session.device_id.into(),
-            session.session_token.into(),
-            user.kdf_type.into(),
-            user.kdf_iterations.into(),
-            user.kdf_memory.map_or(JsValue::NULL, Into::into),
-            user.kdf_parallelism.map_or(JsValue::NULL, Into::into),
-        ])?;
+        let bindings = initialization.bindings(user, session, password, &token, &now)?;
+        let claim = db.prepare(sql).bind(&bindings)?;
         let results = db::run_query(
             async {
                 db.batch(vec![
@@ -239,12 +236,8 @@ impl UserRow {
         Ok(())
     }
 
-    pub async fn has_available_email(
-        db: &D1Database,
-        emails: &[String],
-    ) -> AppResult<bool> {
-        let emails_json =
-            serde_json::to_string(emails).map_err(AppError::internal_error)?;
+    pub async fn has_available_email(db: &D1Database, emails: &[String]) -> AppResult<bool> {
+        let emails_json = serde_json::to_string(emails).map_err(AppError::internal_error)?;
         let found: Option<i64> = db::run_query(
             async {
                 db.prepare(
@@ -252,7 +245,7 @@ impl UserRow {
                      NOT EXISTS (SELECT 1 FROM users WHERE \
                      email=allowed.value) LIMIT 1",
                 )
-                .bind(&[emails_json.into()])?
+                .bind(&db::d1_params![emails_json])?
                 .first(Some("present"))
                 .await
             },
@@ -266,117 +259,110 @@ impl UserRow {
         db: &D1Database,
         email: &str,
     ) -> AppResult<Option<UserKdfParams>> {
-        let stmt = db.prepare(
-            "SELECT kdf_type, kdf_iterations, kdf_memory, kdf_parallelism \
-             FROM users WHERE email = ?1",
-        );
-        let query = stmt.bind(&[email.into()])?;
-
-        let row: Option<Value> = query.first(None).await.map_err(|e| {
-            DatabaseError::query("get_kdf_params_by_email query failed", e)
-        })?;
-
-        if let Some(row) = row {
-            let kdf_type = row
-                .get("kdf_type")
-                .and_then(serde_json::Value::as_i64)
-                .map(|value| value as i32);
-            let kdf_iterations = row
-                .get("kdf_iterations")
-                .and_then(serde_json::Value::as_i64)
-                .map(|value| value as i32);
-            let kdf_memory = row
-                .get("kdf_memory")
-                .and_then(serde_json::Value::as_i64)
-                .map(|value| value as i32);
-            let kdf_parallelism = row
-                .get("kdf_parallelism")
-                .and_then(serde_json::Value::as_i64)
-                .map(|value| value as i32);
-
-            Ok(Some(UserKdfParams {
-                kdf_type,
-                kdf_iterations,
-                kdf_memory,
-                kdf_parallelism,
-            }))
-        } else {
-            Ok(None)
-        }
+        let row: Option<Value> = db::run_query(
+            async {
+                db.prepare(
+                    "SELECT kdf_type, kdf_iterations, kdf_memory, kdf_parallelism \
+                     FROM users WHERE email = ?1",
+                )
+                .bind(&db::d1_params![email])?
+                .first(None)
+                .await
+            },
+            "Failed to fetch KDF settings",
+        )
+        .await?;
+        row.map(|row| db::decode_row(row, "Failed to decode stored KDF settings"))
+            .transpose()
     }
 
-    pub async fn insert(db: &D1Database, user: &Self) -> AppResult<()> {
-        let result = async {
-            query!(
-                db,
-                "INSERT INTO users (id, name, email, master_password_hash, \
-                 master_password_hint, password_salt, key, private_key, \
-                 public_key, kdf_type, kdf_iterations, kdf_memory, \
-                 kdf_parallelism, security_stamp, equivalent_domains, \
-                 excluded_globals,two_factor_recovery_code, created_at, \
-                 updated_at, is_email_verified, user_key_id, \
-                 signed_public_key, security_state, security_version, \
-                 signature_key_pair, password_iterations) VALUES (?1, ?2, ?3, \
-                 ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, \
-                 ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26)",
-                user.id,
-                user.name,
-                user.email,
-                user.master_password_hash,
-                user.master_password_hint,
-                user.password_salt,
-                user.key,
-                user.private_key,
-                user.public_key,
-                user.kdf_type,
-                user.kdf_iterations,
-                user.kdf_memory,
-                user.kdf_parallelism,
-                user.security_stamp,
-                user.equivalent_domains,
-                user.excluded_globals,
-                user.two_factor_recovery_code,
-                user.created_at,
-                user.updated_at,
-                i32::from(user.is_email_verified),
-                user.user_key_id,
-                user.signed_public_key,
-                user.security_state,
-                user.security_version,
-                user.signature_key_pair,
-                user.password_iterations
-            )?
+    pub(crate) async fn insert(
+        db: &D1Database,
+        user: &Self,
+        verification: Option<&VerifiedCode>,
+    ) -> AppResult<()> {
+        let insert = Self::insert_statement(db, user)
+            .map_err(|error| DatabaseError::registration(&error))?;
+        if let Some(verification) = verification {
+            verification
+                .batch(
+                    db,
+                    vec![
+                        insert,
+                        require_changed_row(db, DbSentinel::RegistrationInsertFailed)?,
+                    ],
+                    DatabaseError::registration,
+                )
+                .await?;
+            return Ok(());
+        }
+        insert
             .run()
             .await
-        }
-        .await;
-        result.map(|_| ()).map_err(DatabaseError::registration)
+            .map(|_| ())
+            .map_err(|error| DatabaseError::registration(&error))
     }
 
-    pub async fn revision_date(
-        db: &D1Database,
-        user_id: &str,
-    ) -> AppResult<Option<String>> {
-        let updated_at: Option<String> = db
-            .prepare("SELECT updated_at FROM users WHERE id = ?1")
-            .bind(&[user_id.into()])
-            .map_err(|e| {
-                DatabaseError::query("Database error fetching revision date", e)
-            })?
-            .first(Some("updated_at"))
-            .await
-            .map_err(|e| {
-                DatabaseError::query("Database error fetching revision date", e)
-            })?;
-
-        Ok(updated_at)
+    fn insert_statement(db: &D1Database, user: &Self) -> worker::Result<D1PreparedStatement> {
+        query!(
+            db,
+            "INSERT INTO users (id, name, email, master_password_hash, \
+             master_password_hint, password_salt, key, private_key, \
+             public_key, kdf_type, kdf_iterations, kdf_memory, \
+             kdf_parallelism, security_stamp, equivalent_domains, \
+             excluded_globals,two_factor_recovery_code, created_at, \
+             updated_at, is_email_verified, user_key_id, signed_public_key, \
+             security_state, security_version, signature_key_pair, \
+             password_iterations) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, \
+             ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, \
+             ?23, ?24, ?25, ?26)",
+            user.id,
+            user.name,
+            user.email,
+            user.master_password_hash,
+            user.master_password_hint,
+            user.password_salt,
+            user.key,
+            user.private_key,
+            user.public_key,
+            user.kdf_type,
+            user.kdf_iterations,
+            user.kdf_memory,
+            user.kdf_parallelism,
+            user.security_stamp,
+            user.equivalent_domains,
+            user.excluded_globals,
+            user.two_factor_recovery_code,
+            user.created_at,
+            user.updated_at,
+            i32::from(user.is_email_verified),
+            user.user_key_id,
+            user.signed_public_key,
+            user.security_state,
+            user.security_version,
+            user.signature_key_pair,
+            user.password_iterations
+        )
     }
 
-    pub async fn migrate_password_if_current(
+    pub async fn revision_date(db: &D1Database, user_id: &str) -> AppResult<Option<String>> {
+        db::run_query(
+            async {
+                db.prepare("SELECT updated_at FROM users WHERE id = ?1")
+                    .bind(&db::d1_params![user_id])?
+                    .first(Some("updated_at"))
+                    .await
+            },
+            "Database error fetching revision date",
+        )
+        .await
+    }
+
+    pub(super) fn migrate_password_statement(
         db: &D1Database,
         user: &Self,
         replacement: &StoredPassword,
-    ) -> AppResult<()> {
+    ) -> worker::Result<D1PreparedStatement> {
         let sql = format!(
             "UPDATE users SET \
              master_password_hash=?1,password_salt=?2,password_iterations=?3 \
@@ -385,129 +371,131 @@ impl UserRow {
              RETURNING id",
             account_keys::AccountSnapshot::matches_sql(9)
         );
-        let row: Option<String> = db::run_query(
-            async {
-                db.prepare(&sql)
-                    .bind(&[
-                        replacement.hash.clone().into(),
-                        replacement.salt.clone().into(),
-                        replacement.iterations.into(),
-                        user.id.clone().into(),
-                        user.master_password_hash.clone().into(),
-                        user.password_salt
-                            .clone()
-                            .map_or(JsValue::NULL, Into::into),
-                        user.password_iterations.into(),
-                        user.security_stamp.clone().into(),
-                        account_keys::AccountSnapshot::from_user(user)
-                            .to_json()
-                            .map_err(worker::Error::from)?
-                            .into(),
-                    ])?
-                    .first(Some("id"))
-                    .await
-            },
-            "Failed to migrate password verifier",
-        )
-        .await?;
-        if row.is_none() {
-            return Err(AppError::conflict(
-                "Account changed while upgrading password verifier",
-            ));
-        }
-        Ok(())
+        db.prepare(&sql).bind(&db::d1_params![
+            replacement.hash,
+            replacement.salt,
+            replacement.iterations,
+            user.id,
+            user.master_password_hash,
+            user.password_salt,
+            user.password_iterations,
+            user.security_stamp,
+            account_keys::AccountSnapshot::json_from_user(user).map_err(worker::Error::from)?,
+        ])
     }
 
     /// Update a user's display name and revision timestamp.
     pub async fn update_profile_name(
         db: &D1Database,
-        user_id: &str,
+        session: &SessionSnapshot<'_>,
         name: Option<&str>,
         updated_at: &str,
-    ) -> AppResult<()> {
-        db::run_query(
-            async {
-                query!(
-                    db,
-                    format!(
-                        "UPDATE users SET name = ?3, updated_at = \
-                         {NEXT_USER_REVISION_SQL} WHERE id = ?2"
-                    ),
-                    updated_at,
-                    user_id,
-                    name
-                )?
-                .run()
-                .await
-                .map(|_| ())
-            },
-            "Failed to update user profile",
-        )
-        .await
+    ) -> AppResult<String> {
+        let statement = query!(
+            db,
+            format!(
+                "UPDATE users SET name = ?3, updated_at = \
+                 {NEXT_USER_REVISION_SQL} WHERE id = ?2 RETURNING updated_at"
+            ),
+            updated_at,
+            session.user_id,
+            name
+        )?;
+        Self::commit_profile_update(db, session, statement, "Failed to update user profile").await
     }
 
     /// Update a user's avatar color and revision timestamp.
     pub async fn update_avatar_color(
         db: &D1Database,
-        user_id: &str,
+        session: &SessionSnapshot<'_>,
         avatar_color: Option<&str>,
         updated_at: &str,
-    ) -> AppResult<()> {
-        db::run_query(
-            async {
-                query!(
-                    db,
-                    format!(
-                        "UPDATE users SET avatar_color = ?3, updated_at = \
-                         {NEXT_USER_REVISION_SQL} WHERE id = ?2"
-                    ),
-                    updated_at,
-                    user_id,
-                    avatar_color
-                )?
-                .run()
-                .await
-                .map(|_| ())
-            },
-            "Failed to update user avatar",
-        )
-        .await
+    ) -> AppResult<String> {
+        let statement = query!(
+            db,
+            format!(
+                "UPDATE users SET avatar_color = ?3, updated_at = \
+                 {NEXT_USER_REVISION_SQL} WHERE id = ?2 RETURNING updated_at"
+            ),
+            updated_at,
+            session.user_id,
+            avatar_color
+        )?;
+        Self::commit_profile_update(db, session, statement, "Failed to update user avatar").await
+    }
+
+    async fn commit_profile_update(
+        db: &D1Database,
+        session: &SessionSnapshot<'_>,
+        statement: D1PreparedStatement,
+        context: &str,
+    ) -> AppResult<String> {
+        let results = db
+            .batch(vec![
+                super::authorization::session_guard(db, session)?,
+                statement,
+            ])
+            .await
+            .map_err(|error| super::authorization::map_session_write_error(context, &error))?;
+        results
+            .last()
+            .ok_or(AppError::Internal)?
+            .results::<RevisionRow>()?
+            .into_iter()
+            .next()
+            .map(|row| row.updated_at)
+            .ok_or(AppError::Internal)
     }
 
     /// Capture registrations before the same transaction deletes the account
     /// and cascades to its devices.
-    pub async fn delete_user(
+    pub(crate) async fn delete_user(
         db: &D1Database,
-        user_id: &str,
-    ) -> AppResult<Option<Vec<PushDeviceRow>>> {
-        let results = db::run_query(
-            async {
-                db.batch(vec![
-                    PushStore::list_for_user_statement(db, user_id)?,
-                    query!(
-                        db,
-                        "DELETE FROM users WHERE id = ?1 RETURNING id",
-                        user_id
-                    )?,
-                ])
-                .await
-            },
-            "Failed to delete user",
-        )
-        .await?;
-        let [devices, deletion] = results.as_slice() else {
+        authorization: &VerifiedAccountAction<'_>,
+    ) -> AppResult<Vec<PushDeviceRow>> {
+        let id = authorization.session.user_id;
+        let results = authorization
+            .commit(
+                db,
+                vec![
+                    push::list_for_user_statement(db, id)?,
+                    query!(db, "DELETE FROM users WHERE id = ?1 RETURNING id", id)?,
+                    require_changed_row(db, DbSentinel::VaultWriteConflict)?,
+                ],
+                "Failed to delete user",
+            )
+            .await?;
+        Self::deleted_devices(&results)
+    }
+
+    pub(crate) async fn delete_user_with_email(
+        db: &D1Database,
+        user: &Self,
+        verification: &VerifiedCode,
+    ) -> AppResult<Vec<PushDeviceRow>> {
+        let results = verification.batch(
+            db,
+            vec![
+                push::list_for_user_statement(db, &user.id)?,
+                query!(db,
+                    "DELETE FROM users WHERE id=?1 AND email=?2 AND security_stamp=?3 RETURNING id",
+                    user.id, user.email, user.security_stamp
+                )?,
+                require_changed_row(db, DbSentinel::InvalidVerification)?,
+            ],
+            |error| DatabaseError::query("Failed to delete user", error),
+        ).await?;
+        Self::deleted_devices(&results)
+    }
+
+    fn deleted_devices(results: &[D1Result]) -> AppResult<Vec<PushDeviceRow>> {
+        let Some(devices) = results.first() else {
             return Err(AppError::Internal);
         };
-        if deletion.results::<Value>()?.is_empty() {
-            return Ok(None);
-        }
-        let devices = db::decode_results(devices).unwrap_or_else(|error| {
-            log::warn!(
-                "Deleted user push devices could not be decoded: {error}"
-            );
+        Ok(db::decode_results(devices).unwrap_or_else(|error| {
+            log::warn!("Deleted user push devices could not be decoded: {error}");
             Vec::new()
-        });
-        Ok(Some(devices))
+        }))
     }
 
     /// Fetch a user by id with consistent error mapping and not-found handling.
@@ -520,22 +508,14 @@ impl UserRow {
     where
         F: FnOnce() -> AppError,
     {
-        let user_value: Option<Value> = db
-            .prepare("SELECT * FROM users WHERE id = ?1")
-            .bind(&[user_id.into()])
-            .map_err(|e| DatabaseError::query(context, e))?
-            .first(None)
-            .await
-            .map_err(|e| DatabaseError::query(context, e))?;
-
-        let user_value = user_value.ok_or_else(not_found)?;
-
-        serde_json::from_value(user_value).map_err(|error| {
-            DatabaseError::invalid_result(
-                format_args!("{context} deserialize"),
-                error,
-            )
-        })
+        Self::fetch_where(
+            db,
+            "SELECT * FROM users WHERE id = ?1",
+            user_id,
+            context,
+            not_found,
+        )
+        .await
     }
 
     /// Fetch a user by an already normalized email with consistent error
@@ -549,21 +529,36 @@ impl UserRow {
     where
         F: FnOnce() -> AppError,
     {
-        let user_value: Option<Value> = db
-            .prepare("SELECT * FROM users WHERE email = ?1")
-            .bind(&[email.into()])
-            .map_err(|e| DatabaseError::query(context, e))?
-            .first(None)
-            .await
-            .map_err(|e| DatabaseError::query(context, e))?;
+        Self::fetch_where(
+            db,
+            "SELECT * FROM users WHERE email = ?1",
+            email,
+            context,
+            not_found,
+        )
+        .await
+    }
 
-        let user_value = user_value.ok_or_else(not_found)?;
-
-        serde_json::from_value(user_value).map_err(|error| {
-            DatabaseError::invalid_result(
-                format_args!("{context} deserialize"),
-                error,
-            )
-        })
+    async fn fetch_where<F>(
+        db: &D1Database,
+        sql: &str,
+        key: &str,
+        context: &str,
+        not_found: F,
+    ) -> AppResult<Self>
+    where
+        F: FnOnce() -> AppError,
+    {
+        let user_value: Option<Value> = db::run_query(
+            async {
+                db.prepare(sql)
+                    .bind(&db::d1_params![key])?
+                    .first(None)
+                    .await
+            },
+            context,
+        )
+        .await?;
+        db::decode_row(user_value.ok_or_else(not_found)?, context)
     }
 }

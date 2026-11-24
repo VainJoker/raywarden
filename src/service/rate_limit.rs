@@ -3,13 +3,7 @@ use std::sync::Mutex;
 use axum::http::HeaderMap;
 use worker::Env;
 
-use crate::{
-    app::AppContext,
-    errors::{
-        AppError,
-        AppResult,
-    },
-};
+use crate::errors::{AppError, AppResult};
 
 const LOGIN_RATE_LIMITER: &str = "LOGIN_RATE_LIMITER";
 const SEND_ACCESS_RATE_LIMITER: &str = "SEND_ACCESS_RATE_LIMITER";
@@ -65,17 +59,12 @@ struct FailureWarningThrottle {
 }
 
 impl FailureWarningThrottle {
-    const fn should_report(
-        &mut self,
-        limiter: Limiter,
-        failure: LimiterFailure,
-        now: i64,
-    ) -> bool {
+    const fn should_report(&mut self, limiter: Limiter, failure: LimiterFailure, now: i64) -> bool {
         let last_reported_at_seconds =
             &mut self.last_reported_at_seconds[limiter.slot()][failure.slot()];
-        if let Some(previous) = *last_reported_at_seconds &&
-            now >= previous &&
-            now.saturating_sub(previous) < FAILURE_WARNING_INTERVAL_SECONDS
+        if let Some(previous) = *last_reported_at_seconds
+            && now >= previous
+            && now.saturating_sub(previous) < FAILURE_WARNING_INTERVAL_SECONDS
         {
             return false;
         }
@@ -106,8 +95,7 @@ fn rate_limit_result(outcome: Result<bool, LimiterFailure>) -> AppResult<()> {
     match outcome {
         Ok(true) => Ok(()),
         Ok(false) => Err(AppError::TooManyRequests {
-            message: "Too many login attempts. Please try again later."
-                .to_string(),
+            message: "Too many attempts. Please try again later.".into(),
         }),
         // Missing protection is not permission to make unlimited password or
         // OTP guesses. Unrelated reads and health checks do not use this gate.
@@ -122,26 +110,12 @@ pub fn client_ip(headers: &HeaderMap) -> &str {
         .unwrap_or("unknown")
 }
 
-pub async fn check_auth_attempt(
-    state: &AppContext,
-    rate_limit_key: String,
-) -> AppResult<()> {
-    check_login_rate_limit(&state.env, rate_limit_key).await
-}
-
-pub(crate) async fn check_login_rate_limit(
-    env: &Env,
-    rate_limit_key: String,
-) -> AppResult<()> {
+pub async fn check_auth_attempt(env: &Env, rate_limit_key: String) -> AppResult<()> {
     check_rate_limit_binding(env, rate_limit_key, Limiter::Login).await
 }
 
-pub async fn check_send_access(
-    state: &AppContext,
-    rate_limit_key: String,
-) -> AppResult<()> {
-    check_rate_limit_binding(&state.env, rate_limit_key, Limiter::SendAccess)
-        .await
+pub async fn check_send_access(env: &Env, rate_limit_key: String) -> AppResult<()> {
+    check_rate_limit_binding(env, rate_limit_key, Limiter::SendAccess).await
 }
 
 async fn check_rate_limit_binding(

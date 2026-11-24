@@ -4,7 +4,8 @@ python3 tests/email_sql.py
 """
 import sqlite3
 import unittest
-from sql_regression import account_snapshot, apply_migrations, statement, statements
+from sql_fixtures import account_snapshot, apply_migrations
+from sql_source import statement
 
 
 class EmailVerification(unittest.TestCase):

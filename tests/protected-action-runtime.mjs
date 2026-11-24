@@ -1,18 +1,11 @@
-import { openFixtureJwtKeys } from "./jwt-runtime.mjs";
+import { bearerJsonHeaders, equal, expectJsonOrEmpty as expect } from "./runtime-assertions.mjs";
+import { emailCodeHash, fixtureAccessSecret } from "./runtime-auth.mjs";
 
 /** Export authorization consumes scoped OTPs in the compiled Worker and SQLite. */
 export async function runProtectedActionCompatibility({ fixture, check, sql, accessToken, USER }) {
   const CODE = "123456", EMAIL = "owner@example.test";
-  const equal = (actual, expected, label = "value") => {
-    if (actual !== expected) throw new Error(`${label}: expected ${expected}, received ${actual}`);
-  };
-  const expect = async (response, status) => {
-    const body = await response.text();
-    equal(response.status, status, body);
-    return body ? JSON.parse(body) : null;
-  };
   const post = async (f, path = "/api/accounts/verify-otp", body = { otp: CODE }, bearer) => f.fetch(path, {
-    method: "POST", headers: { "Content-Type": "application/json", Authorization: `Bearer ${bearer ?? await accessToken()}` },
+    method: "POST", headers: bearerJsonHeaders(bearer ?? await accessToken()),
     body: JSON.stringify(body),
   });
   const row = () => sql.exec("SELECT * FROM verification_codes WHERE id='export-proof'").one();
@@ -20,21 +13,45 @@ export async function runProtectedActionCompatibility({ fixture, check, sql, acc
     const now = Math.floor(Date.now() / 1000);
     const value = { owner: USER, user: USER, purpose: "protected-action", recipient: EMAIL, context: "",
       stamp: "owner-stamp", session: "session", expires: now + 600, ready: 1, attempts: 0, ...overrides };
-    const encoder = new TextEncoder(), chunks = [];
-    for (const part of [value.owner, value.purpose, value.recipient, value.context, CODE]) {
-      const bytes = encoder.encode(part), prefix = new Uint8Array(8);
-      new DataView(prefix.buffer).setBigUint64(0, BigInt(bytes.length), false);
-      chunks.push(prefix, bytes);
-    }
-    const message = new Uint8Array(chunks.reduce((total, bytes) => total + bytes.length, 0));
-    let offset = 0; for (const bytes of chunks) { message.set(bytes, offset); offset += bytes.length; }
-    const { access_secret: secret } = await openFixtureJwtKeys(
-      sql.exec("SELECT access_secret,refresh_secret FROM jwt_keys WHERE id='global'").one(), f.env.KEY_ENCRYPTION_KEY);
-    const key = await crypto.subtle.importKey("raw", encoder.encode(secret), { name: "HMAC", hash: "SHA-256" }, false, ["sign"]);
-    const hash = Array.from(new Uint8Array(await crypto.subtle.sign("HMAC", key, message)), byte => byte.toString(16).padStart(2, "0")).join("");
+    const secret = await fixtureAccessSecret(sql, f.env.KEY_ENCRYPTION_KEY);
+    const hash = await emailCodeHash(secret, { owner: value.owner, purpose: value.purpose,
+      recipient: value.recipient, context: value.context, code: CODE });
     sql.exec("INSERT INTO verification_codes(id,owner_key,user_id,purpose,recipient,context,code_hash,security_stamp,session_token,issued_at,expires_at,ready,attempts) VALUES('export-proof',?,?,?,?,?,?,?,?,?,?,?,?)",
       value.owner, value.user, value.purpose, value.recipient, value.context, hash, value.stamp, value.session, now, value.expires, value.ready, value.attempts);
   };
+
+  await check("protected-action OTP delivery failures return 503 and release the reservation", async () => {
+    const f = fixture();
+    const webhook = "https://mail.runtime.test/send";
+    f.env.MAIL_WEBHOOK_URL = webhook;
+    const headers = { Authorization: `Bearer ${await accessToken()}` };
+    const request = () => f.fetch("/api/accounts/request-otp", { method: "POST", headers });
+    const previousFetch = globalThis.fetch;
+    let delivery = 503, calls = 0;
+    globalThis.fetch = async (input, init) => {
+      const request = input instanceof Request ? input : new Request(input, init);
+      equal(request.url, webhook);
+      equal(request.method, "POST");
+      equal(sql.exec("SELECT ready FROM verification_codes WHERE purpose='protected-action'").one().ready, 0);
+      calls++;
+      if (delivery === null) throw new Error("fixture outbound provider rejection");
+      return new Response("fixture provider detail", { status: delivery });
+    };
+    try {
+      for (delivery of [503, null]) {
+        const failure = await expect(await request(), 503);
+        equal(failure.code, 12);
+        equal(failure.message, "Internal server error");
+        equal(sql.exec("SELECT count(*) AS n FROM verification_codes").one().n, 0);
+      }
+      delivery = 200;
+      await expect(await request(), 200);
+      equal(calls, 3);
+      equal(sql.exec("SELECT ready FROM verification_codes WHERE purpose='protected-action'").one().ready, 1);
+    } finally {
+      globalThis.fetch = previousFetch;
+    }
+  });
 
   await check("export OTP verification consumes its proof through both aliases and prevents later reuse", async () => {
     for (const path of ["/api/accounts/verify-otp", "/accounts/verify-otp"]) {

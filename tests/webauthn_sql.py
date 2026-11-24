@@ -3,8 +3,8 @@ import json
 import sqlite3
 import unittest
 
-from sql_regression import account_snapshot, apply_migrations, statements, statement
-from sql_source import literal
+from sql_fixtures import account_snapshot, apply_migrations
+from sql_source import literal, statement, statements
 
 NOW = "2026-11-13T03:00:00.000Z"
 FUTURE = "2099-01-01T00:00:00.000Z"
@@ -33,9 +33,9 @@ class WebAuthnSQL(unittest.TestCase):
         self.db.commit()
 
     def assertion(self, old, new, user="owner"):
-        queries = statements("webauthn", "accept_assertion")
+        queries = statements("webauthn", "assertion_statements")
         with self.db:
-            first = self.db.execute(queries[0], (new, "challenge-id", NOW, "credential", old, user)).rowcount
+            first = self.db.execute(queries[0], (new, "challenge-id", NOW, "credential", old, user, "credential-wire-id", "public-key", "2fa")).rowcount
             second = self.db.execute(queries[1], (NOW, "challenge-id", "credential")).rowcount
         return first, second
 
@@ -46,7 +46,7 @@ class WebAuthnSQL(unittest.TestCase):
               ("factor-id","owner","2fa","new-credential","challenge-id"),
               (NOW,"owner","2fa","recovery-code","new-credential","challenge-id")]
         with self.db:
-            return [self.db.execute(query,params).rowcount for query,params in zip(queries,args)]
+            return [self.db.execute(query,params).rowcount for query,params in zip(queries,args,strict=True)]
 
     def test_registration_atomically_enables_factor_and_issues_recovery_code(self):
         self.challenge(purpose="register.2fa",session="session")
@@ -135,17 +135,12 @@ class WebAuthnSQL(unittest.TestCase):
         return statement("webauthn", "update_keys"), ("Key", 0, "new-public", "new-user", "new-private", NOW,
             "credential", "owner", account_snapshot(self.db, "owner"), "stamp", "device", "session", 1, "challenge-id")
 
-    def test_prf_update_requires_the_accepted_proof_and_current_live_session(self):
-        query, args = self.prf_update()
-        self.assertIsNotNone(self.db.execute(query, args).fetchone())
-        self.assertEqual(self.db.execute("SELECT encrypted_public_key,encrypted_user_key,encrypted_private_key FROM webauthn_credentials").fetchone(),
-                         ("new-public", "new-user", "new-private"))
-
-    def test_prf_final_write_rejects_revocation_and_a_newer_assertion_after_verification(self):
+    def test_prf_final_write_requires_current_account_session_and_accepted_assertion(self):
         query, args = self.prf_update()
         for mutation in (
             "UPDATE devices SET session_token='revoked' WHERE user_id='owner'",
             "UPDATE users SET security_stamp='revoked' WHERE id='owner'",
+            "UPDATE users SET key='concurrent-wrapper' WHERE id='owner'",
             "UPDATE users SET private_key='concurrent-private' WHERE id='owner'",
             "UPDATE webauthn_credentials SET sign_count=2",
             "UPDATE webauthn_credentials SET last_challenge='new-assertion'",
@@ -158,16 +153,9 @@ class WebAuthnSQL(unittest.TestCase):
                 self.assertIsNone(self.db.execute("SELECT encrypted_user_key FROM webauthn_credentials").fetchone()[0])
                 self.db.rollback()
 
-    def test_api_key_rotation_preserves_new_password_session_on_same_device(self):
-        self.db.execute("INSERT INTO user_api_keys VALUES('owner','encrypted','oldhash',?)", (NOW,))
-        self.db.execute("INSERT INTO user_api_key_sessions VALUES('owner','device','old-api-session')")
-        self.db.commit()
-        from api_key_sql import key_snapshot, replace_key
-        self.assertEqual(len(replace_key(self.db, key_snapshot(self.db, "owner"),
-                                        ("encrypted", "oldhash", NOW),
-                                        encrypted="new-encrypted", key_hash="newhash")), 1)
-        self.assertEqual(self.db.execute("SELECT session_token FROM devices WHERE user_id='owner'").fetchone()[0], "session")
-        self.assertIsNotNone(self.db.execute("SELECT 1 FROM devices WHERE user_id='other'").fetchone())
+        self.assertIsNotNone(self.db.execute(query, args).fetchone())
+        self.assertEqual(self.db.execute("SELECT encrypted_public_key,encrypted_user_key,encrypted_private_key FROM webauthn_credentials").fetchone(),
+                         ("new-public", "new-user", "new-private"))
 
 
 if __name__ == "__main__":

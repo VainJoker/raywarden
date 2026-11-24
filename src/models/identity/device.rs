@@ -1,46 +1,74 @@
-use serde::{
-    Deserialize,
-    Serialize,
+use serde::{Deserialize, Serialize};
+use worker::{D1Database, D1PreparedStatement, query};
+
+use super::{
+    account_keys::AccountSnapshot,
+    authorization::VerifiedAccountAction,
+    email,
+    push::{self, PushDeviceRow},
+    two_factor::LoginMfaPolicy,
+    user::{StoredPassword, UserRow},
 };
-use worker::{
-    D1Database,
-    D1PreparedStatement,
-    query,
+use crate::{
+    errors::{AppError, AppResult, DatabaseError, DbSentinel},
+    infra::db,
+    models::mutation,
 };
 
-use crate::{
-    errors::{
-        AppError,
-        AppResult,
-    },
-    infra::db,
-};
+fn current_login_account_sql(stamp: usize) -> String {
+    let hash = stamp + 1;
+    let salt = stamp + 2;
+    let iterations = stamp + 3;
+    let snapshot = AccountSnapshot::matches_sql(stamp + 4);
+    format!(
+        "EXISTS(SELECT 1 FROM users WHERE id=?1 AND security_stamp=?{stamp} \
+         AND master_password_hash=?{hash} AND password_salt IS ?{salt} AND \
+         password_iterations=?{iterations} AND ({snapshot}))"
+    )
+}
 
 /// Borrowed values to compare against the live session in a database write.
 /// This snapshot does not replace the statement's authorization check.
 pub struct SessionSnapshot<'a> {
-    pub user_id:        &'a str,
+    pub user_id: &'a str,
     pub security_stamp: &'a str,
-    pub device_id:      &'a str,
-    pub session_token:  &'a str,
+    pub device_id: &'a str,
+    pub session_token: &'a str,
+}
+
+pub(crate) struct NewDeviceSession<'a> {
+    pub(crate) device_id: &'a str,
+    pub(crate) name: &'a str,
+    pub(crate) device_type: i32,
+    pub(crate) nonce: &'a str,
+}
+
+impl NewDeviceSession<'_> {
+    pub(super) fn upsert_statement(
+        &self,
+        db: &D1Database,
+        user_id: &str,
+    ) -> worker::Result<D1PreparedStatement> {
+        DeviceRow::persist_session_statement(db, user_id, self)
+    }
 }
 
 /// A login session belongs to a user and a client-generated device identifier.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DeviceRow {
-    pub device_id:     String,
-    pub user_id:       String,
-    pub name:          String,
-    pub device_type:   i32,
+    pub device_id: String,
+    pub user_id: String,
+    pub name: String,
+    pub device_type: i32,
     pub session_token: String,
-    pub push_token:    Option<String>,
-    pub created_at:    String,
-    pub updated_at:    String,
+    pub push_token: Option<String>,
+    pub created_at: String,
+    pub updated_at: String,
 }
 
 #[derive(Deserialize)]
 pub struct DeviceSessionRow {
-    pub session_token:  String,
+    pub session_token: String,
     pub security_stamp: String,
 }
 
@@ -91,10 +119,7 @@ impl DeviceRow {
         .await
     }
 
-    pub async fn list_for_user(
-        db: &D1Database,
-        user_id: &str,
-    ) -> AppResult<Vec<Self>> {
+    pub async fn list_for_user(db: &D1Database, user_id: &str) -> AppResult<Vec<Self>> {
         let rows = db::run_query(
             async {
                 query!(
@@ -112,40 +137,70 @@ impl DeviceRow {
         Ok(rows.results()?)
     }
 
-    pub async fn persist_session(
+    pub(crate) async fn persist_session_if_current(
         db: &D1Database,
-        user_id: &str,
-        device_id: &str,
-        name: &str,
-        device_type: i32,
-        session_token: &str,
-    ) -> AppResult<Self> {
-        let device = db::run_query(
-            async {
-                Self::persist_session_statement(
-                    db,
-                    user_id,
-                    device_id,
-                    name,
-                    device_type,
-                    session_token,
-                )?
-                .first(None)
-                .await
-            },
-            "Failed to start device session",
-        )
-        .await?;
-        device.ok_or(AppError::Internal)
+        user: &UserRow,
+        session: &NewDeviceSession<'_>,
+        mfa: &LoginMfaPolicy,
+        proofs: Vec<D1PreparedStatement>,
+        replacement: Option<&StoredPassword>,
+    ) -> AppResult<()> {
+        let mfa_matches = LoginMfaPolicy::matches_sql(2);
+        let abort = DbSentinel::LoginMfaConflict.sql_abort_expr();
+        let policy = serde_json::to_string(mfa).map_err(AppError::internal_error)?;
+        let mut writes = vec![
+            Self::guard_current_login_account(db, user)?,
+            query!(
+                db,
+                format!("SELECT CASE WHEN {mfa_matches} THEN 1 ELSE {abort} END"),
+                user.id,
+                policy
+            )?,
+        ];
+        writes.extend(proofs);
+        if let Some(password) = replacement {
+            writes.extend(Self::migrate_login_password(db, user, password)?);
+        }
+        writes.push(session.upsert_statement(db, &user.id)?);
+        db.batch(writes).await.map_err(|error| {
+            if DatabaseError::has_marker(&error, DbSentinel::InvalidVerification) {
+                email::invalid_verification()
+            } else {
+                DatabaseError::login_session(&error)
+            }
+        })?;
+        Ok(())
+    }
+
+    pub(super) fn migrate_login_password(
+        db: &D1Database,
+        user: &UserRow,
+        replacement: &StoredPassword,
+    ) -> worker::Result<[D1PreparedStatement; 2]> {
+        Ok([
+            UserRow::migrate_password_statement(db, user, replacement)?,
+            email::require_changed_row(db, DbSentinel::LoginPasswordConflict)?,
+        ])
+    }
+
+    pub(super) fn guard_current_login_account(
+        db: &D1Database,
+        user: &UserRow,
+    ) -> AppResult<D1PreparedStatement> {
+        mutation::guard(db, &current_login_account_sql(2), &db::d1_params![
+            user.id,
+            user.security_stamp,
+            user.master_password_hash,
+            user.password_salt,
+            user.password_iterations,
+            AccountSnapshot::json_from_user(user)?,
+        ])
     }
 
     pub(super) fn persist_session_statement(
         db: &D1Database,
         user_id: &str,
-        device_id: &str,
-        name: &str,
-        device_type: i32,
-        session_token: &str,
+        session: &NewDeviceSession<'_>,
     ) -> worker::Result<D1PreparedStatement> {
         let now = crate::utils::time::now_rfc3339();
         query!(
@@ -157,10 +212,10 @@ impl DeviceRow {
              = excluded.session_token, updated_at = excluded.updated_at \
              RETURNING *",
             user_id,
-            device_id,
-            name,
-            device_type,
-            session_token,
+            session.device_id,
+            session.name,
+            session.device_type,
+            session.nonce,
             now
         )
     }
@@ -192,11 +247,7 @@ impl DeviceRow {
         Ok(())
     }
 
-    pub async fn delete_for_user(
-        db: &D1Database,
-        user_id: &str,
-        device_id: &str,
-    ) -> AppResult<()> {
+    pub async fn delete_for_user(db: &D1Database, user_id: &str, device_id: &str) -> AppResult<()> {
         // Remove pending approvals and remembered 2FA credentials with the
         // session.
         db::run_query(
@@ -231,132 +282,43 @@ impl DeviceRow {
         Ok(())
     }
 
-    pub async fn revoke_all_with_stamp(
+    pub(crate) async fn revoke_all_with_stamp(
         db: &D1Database,
-        user_id: &str,
+        authorization: &VerifiedAccountAction<'_>,
         stamp: &str,
-    ) -> AppResult<()> {
-        let now = crate::utils::time::now_rfc3339();
-        db::run_query(
-            async {
-                let statements = vec![
-                    query!(
-                        db,
-                        "UPDATE users SET security_stamp = ?1, updated_at = \
-                         ?2 WHERE id = ?3",
-                        stamp,
-                        now,
-                        user_id
-                    )?,
-                    query!(
-                        db,
-                        "DELETE FROM devices WHERE user_id = ?1",
-                        user_id
-                    )?,
-                    query!(
-                        db,
-                        "DELETE FROM auth_requests WHERE user_id = ?1",
-                        user_id
-                    )?,
-                    query!(
-                        db,
-                        "DELETE FROM two_factors WHERE user_id = ?1 AND \
-                         provider_type = 5",
-                        user_id
-                    )?,
-                ];
-                db.batch(statements).await
-            },
-            "Failed to revoke all sessions",
-        )
-        .await?;
-        Ok(())
-    }
-}
-
-#[derive(Debug, Deserialize)]
-pub struct PushDeviceRow {
-    pub device_id:   String,
-    pub device_type: i32,
-    pub push_token:  Option<String>,
-    pub push_id:     Option<String>,
-}
-
-pub struct PushStore;
-
-impl PushStore {
-    pub async fn find_for_user(
-        db: &D1Database,
-        user_id: &str,
-        device_id: &str,
-    ) -> AppResult<Option<PushDeviceRow>> {
-        db::run_query(
-            async {
-                query!(
-                    db,
-                    "SELECT user_id,device_id,device_type,push_token,push_id \
-                     FROM devices WHERE user_id=?1 AND device_id=?2",
-                    user_id,
-                    device_id
-                )?
-                .first(None)
-                .await
-            },
-            "Failed to fetch push device",
-        )
-        .await
-    }
-
-    pub async fn list_for_user(
-        db: &D1Database,
-        user_id: &str,
     ) -> AppResult<Vec<PushDeviceRow>> {
-        db::run_query(
-            async {
-                Self::list_for_user_statement(db, user_id)?
-                    .all()
-                    .await?
-                    .results()
-            },
-            "Failed to list push devices",
-        )
-        .await
-    }
-
-    pub(super) fn list_for_user_statement(
-        db: &D1Database,
-        user_id: &str,
-    ) -> worker::Result<worker::D1PreparedStatement> {
-        query!(
-            db,
-            "SELECT user_id,device_id,device_type,push_token,push_id FROM \
-             devices WHERE user_id=?1 AND push_id IS NOT NULL",
-            user_id
-        )
-    }
-
-    /// The relay ID is stable across a client's session nonce rotations.
-    pub async fn assign_uuid(
-        db: &D1Database,
-        user_id: &str,
-        device_id: &str,
-        id: &str,
-    ) -> AppResult<Option<String>> {
-        db::run_query(
-            async {
-                query!(
-                    db,
-                    "UPDATE devices SET push_id=COALESCE(push_id,?1) WHERE \
-                     user_id=?2 AND device_id=?3 RETURNING push_id",
-                    id,
-                    user_id,
-                    device_id
-                )?
-                .first(Some("push_id"))
-                .await
-            },
-            "Failed to assign push device ID",
-        )
-        .await
+        let user_id = authorization.session.user_id;
+        let now = crate::utils::time::now_rfc3339();
+        let revision_sql = crate::models::mutation::next_user_revision_sql(2);
+        let writes = vec![
+            push::list_for_user_statement(db, user_id)?,
+            query!(
+                db,
+                format!("UPDATE users SET security_stamp=?1,updated_at={revision_sql} WHERE id=?3"),
+                stamp,
+                now,
+                user_id
+            )?,
+            query!(db, "DELETE FROM devices WHERE user_id = ?1", user_id)?,
+            query!(db, "DELETE FROM auth_requests WHERE user_id = ?1", user_id)?,
+            query!(
+                db,
+                "DELETE FROM two_factors WHERE user_id = ?1 AND provider_type = 5",
+                user_id
+            )?,
+        ];
+        let results = authorization
+            .commit(db, writes, "Failed to revoke all sessions")
+            .await?;
+        Ok(results
+            .first()
+            .and_then(|result| {
+                db::decode_results(result)
+                    .map_err(|error| {
+                        log::warn!("Revoked push devices could not be decoded: {error}");
+                    })
+                    .ok()
+            })
+            .unwrap_or_default())
     }
 }

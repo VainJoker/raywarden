@@ -1,9 +1,8 @@
 """Date predicates compare old RFC3339 offsets by instant, without rewriting rows."""
 import unittest
 
-from sql_regression import seed_cipher, seed_attachment
-
-from sql_regression import account_snapshot, database, statement, trash_purge_statements
+from sql_fixtures import account_snapshot, database, seed_attachment, seed_cipher
+from sql_source import statement, statements
 
 CUTOFF = "2026-11-13T03:00:00.123Z"
 DATES = [
@@ -43,7 +42,7 @@ class StoredTimestampSql(unittest.TestCase):
         for name, date in DATES:
             self.cipher(name)
             self.db.execute("UPDATE ciphers SET deleted_at=? WHERE id=?", (date, name))
-        touch, delete = trash_purge_statements()
+        touch, delete = statements("purge", "delete_ciphers_before")
         with self.db:
             self.db.execute(touch, ("2026-11-14T03:00:00.123Z", CUTOFF))
             self.db.execute(delete, (CUTOFF,))

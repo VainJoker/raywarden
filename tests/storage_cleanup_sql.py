@@ -3,8 +3,8 @@ import json
 import sqlite3
 import unittest
 
-from sql_source import source as read_source
-from sql_regression import apply_migrations, rust_strings
+from sql_fixtures import apply_migrations
+from sql_source import statement
 
 
 class StorageCleanupSql(unittest.TestCase):
@@ -17,10 +17,9 @@ class StorageCleanupSql(unittest.TestCase):
         self.db.execute("INSERT INTO ciphers(id,user_id,cipher_type,data,created_at,updated_at) VALUES('c','u',1,'{}','old','old')")
         self.db.execute("INSERT INTO attachments(id,cipher_id,file_name,file_size_bytes,created_at,updated_at) VALUES('a','c','encrypted',5,'old','old')")
         self.db.execute("INSERT INTO sends(id,user_id,name,send_type,data,encrypted_key,created_at,updated_at,deletes_at,access_stamp,file_id) VALUES('s','u','encrypted',1,'{}','key','old','old','future','stamp','f')")
-        sql = list(rust_strings(read_source("storage_cleanup")))
-        self.enqueue = next(v for v in sql if v.startswith("INSERT INTO storage_cleanup_jobs"))
-        self.select = next(v for v in sql if v.startswith("SELECT object_key, generation"))
-        self.ack = next(v for v in sql if v.startswith("DELETE FROM storage_cleanup_jobs"))
+        self.enqueue = statement("storage_cleanup", "enqueue_if_unreferenced")
+        self.select = statement("storage_cleanup", "pending_batch")
+        self.ack = statement("storage_cleanup", "acknowledge_prefix")
 
     def test_adopted_files_are_never_discarded_after_an_ambiguous_response(self):
         for key in ['c/a', 'sends/s/f']:
@@ -58,6 +57,20 @@ class StorageCleanupSql(unittest.TestCase):
         current = self.db.execute(self.select).fetchone()
         self.assertNotEqual(current[1], generation)
         self.assertEqual(self.db.execute(self.ack, (json.dumps([{'object_key': current[0], 'generation': current[1]}]),)).rowcount, 1)
+
+    def test_reference_queries_use_effective_and_staged_object_key_indexes(self):
+        def plan(sql, args=()):
+            return "\n".join(row[3] for row in self.db.execute("EXPLAIN QUERY PLAN " + sql, args))
+
+        for details in (plan(self.select), plan(self.enqueue, ("stage-key", "now"))):
+            for table in ("attachments", "sends"):
+                self.assertIn(f"idx_{table}_effective_object_key", details)
+                self.assertNotIn(f"SCAN {table}", details)
+        trigger = self.db.execute("SELECT sql FROM sqlite_schema WHERE name='storage_upload_stages_delete_cleanup'").fetchone()[0]
+        for table in ("attachments", "sends"):
+            probe = f"SELECT 1 FROM {table} WHERE storage_key = OLD.object_key"
+            self.assertIn(probe, trigger)
+            self.assertIn(f"idx_{table}_storage_key", plan(probe.replace("OLD.object_key", "?"), ("stage-key",)))
 
 
 if __name__ == '__main__':

@@ -1,17 +1,14 @@
 use worker::D1Database;
 
-use crate::errors::{
-    AppResult,
-    DatabaseError,
-};
+use crate::{errors::AppResult, infra::db};
 
 /// Verify D1 connectivity without reading application tables.
 pub(crate) async fn ping(db: &D1Database) -> AppResult<()> {
-    db.prepare("SELECT 1 as ok")
-        .first::<i32>(Some("ok"))
-        .await
-        .map_err(|err| {
-            DatabaseError::query("Failed to verify database connectivity", err)
-        })?;
+    db::query_first::<i32>(
+        db.prepare("SELECT 1 as ok"),
+        Some("ok"),
+        "Failed to verify database connectivity",
+    )
+    .await?;
     Ok(())
 }

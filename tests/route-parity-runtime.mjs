@@ -1,25 +1,12 @@
+import { bearerJsonHeaders, equal, expectJsonOrEmpty as expect, ok } from "./runtime-assertions.mjs";
+import { captureNotifications, DurableObjectNamespace } from "./runtime-fixture.mjs";
+
 /** Actual compatibility aliases, bounded icons and atomic WebAuthn clearing. */
 export async function runRouteParityCompatibility({ fixture, check, sql, accessToken, USER, SEND }) {
-  const equal = (actual, expected, label = "value") => { if (actual !== expected) throw new Error(`${label}: expected ${expected}, received ${actual}`); };
-  const ok = (value, label) => { if (!value) throw new Error(label); };
-  const expect = async (response, status) => { const text = await response.text(); equal(response.status, status, text); return text ? JSON.parse(text) : null; };
-  const headers = async () => ({ Authorization: `Bearer ${await accessToken()}`, "Content-Type": "application/json" });
+  const headers = async () => bearerJsonHeaders(await accessToken());
   const request = async (f, path, body, method = "POST", authorized = true) => f.fetch(path, { method,
     headers: authorized ? await headers() : { "Content-Type": "application/json" }, body: JSON.stringify(body) });
 
-  class DurableObjectNamespace {
-    constructor(handler) { this.handler = handler; }
-    idFromName(name) { return { name }; }
-    get() { return { fetch: request => this.handler(request) }; }
-  }
-  const captureNotifications = (f, readAccount) => {
-    const captured = [];
-    f.env.NOTIFY_DO = new DurableObjectNamespace(async req => {
-      captured.push({ update: await req.json(), account: readAccount() });
-      return new Response(null, { status: 204 });
-    });
-    return captured;
-  };
   const expectNotification = (update, type, logout) => {
     equal(update.selector.kind, "user"); equal(update.selector.user_id, USER);
     equal(update.logout, logout);
@@ -28,48 +15,71 @@ export async function runRouteParityCompatibility({ fixture, check, sql, accessT
     ok(frame.includes("\xa9ContextId\xa6device"), "missing authenticated device context");
   };
 
-  await check("remaining account and folder method aliases share validation and authenticated mutations", async () => {
+  await check("password verification and folder rename aliases enforce authentication", async () => {
     const f = fixture();
     equal((await expect(await request(f, "/accounts/verify-password", { masterPasswordHash: "hash" }), 200)).Object, "masterPasswordPolicy");
     await expect(await request(f, "/accounts/verify-password", { masterPasswordHash: "wrong" }), 401);
-    const avatar = await expect(await request(f, "/api/accounts/avatar", { avatarColor: "#123abc" }), 200);
-    equal(avatar.avatarColor, "#123abc");
     const folder = await expect(await request(f, "/api/folders", { name: "2.original" }), 200);
     const renamed = await expect(await request(f, `/api/folders/${folder.id}`, { name: "2.renamed" }), 200);
     equal(renamed.name, "2.renamed");
-    for (const [path, body] of [["/api/accounts/avatar", { avatarColor: "#ffffff" }], [`/api/folders/${folder.id}`, { name: "2.unauthorized" }], ["/accounts/verify-password", { masterPasswordHash: "hash" }]]) {
+    for (const [path, body] of [[`/api/folders/${folder.id}`, { name: "2.unauthorized" }], ["/accounts/verify-password", { masterPasswordHash: "hash" }]]) {
       await expect(await request(f, path, body, "POST", false), 401);
     }
     equal(sql.exec("SELECT name FROM folders WHERE id=?", folder.id).one().name, "2.renamed");
-    sql.exec("UPDATE devices SET session_token='revoked' WHERE user_id=?", USER);
-    await expect(await request(f, "/api/accounts/avatar", { avatarColor: "#ffffff" }), 401);
-    equal(sql.exec("SELECT avatar_color FROM users WHERE id=?", USER).one().avatar_color, "#123abc");
   });
 
-  await check("profile and avatar writes each send one SyncVault update after success", async () => {
+  await check("profile and avatar aliases require a live session and notify once after each write", async () => {
     const f = fixture();
-    const captured = captureNotifications(f, () => sql.exec("SELECT name,avatar_color FROM users WHERE id=?", USER).one());
+    const account = () => sql.exec("SELECT name,avatar_color FROM users WHERE id=?", USER).one();
+    const captured = captureNotifications(f, update => ({ update, account: account() }));
     await expect(await f.fetch("/api/accounts/profile", { headers: await headers() }), 200);
-    await expect(await request(f, "/api/accounts/profile", { name: "x".repeat(51) }), 400);
     await expect(await request(f, "/api/accounts/avatar", { avatarColor: "x" }), 400);
-    await expect(await request(f, "/api/accounts/avatar", { avatarColor: "#123abc" }, "PUT", false), 401);
     equal(captured.length, 0);
     for (const method of ["POST", "PUT"]) {
       const name = `Profile ${method}`;
-      await expect(await request(f, "/api/accounts/profile", { name }, method), 200);
+      const profileResult = await expect(await request(f, "/api/accounts/profile", { name }, method), 200);
+      equal(profileResult.name, name);
       equal(captured.length, 1); const profile = captured.shift();
       expectNotification(profile.update, 5, false); equal(profile.account.name, name);
+      await expect(await request(f, "/api/accounts/profile", { name: "x".repeat(51) }, method), 400);
+      await expect(await request(f, "/api/accounts/profile", { name: "unauthorized" }, method, false), 401);
+      equal(account().name, name);
+      equal(captured.length, 0);
 
       const avatarColor = method === "POST" ? "#123abc" : "#345def";
-      await expect(await request(f, "/api/accounts/avatar", { avatarColor }, method), 200);
+      const avatarResult = await expect(await request(f, "/api/accounts/avatar", { avatarColor }, method), 200);
+      equal(avatarResult.avatarColor, avatarColor);
       equal(captured.length, 1); const avatar = captured.shift();
       expectNotification(avatar.update, 5, false); equal(avatar.account.avatar_color, avatarColor);
+      await expect(await request(f, "/api/accounts/avatar", { avatarColor: "#ffffff" }, method, false), 401);
+      equal(account().avatar_color, avatarColor);
+      equal(captured.length, 0);
+    }
+    const avatarColor = account().avatar_color;
+    sql.exec("UPDATE devices SET session_token='revoked' WHERE user_id=?", USER);
+    await expect(await request(f, "/api/accounts/avatar", { avatarColor: "#ffffff" }), 401);
+    equal(account().avatar_color, avatarColor);
+    equal(captured.length, 0);
+  });
+
+  await check("device token aliases retain current-device authorization and clear stored tokens", async () => {
+    for (const method of ["POST", "PUT"]) {
+      const f = fixture();
+      const changeToken = async (id, action, body) => f.fetch(`/api/devices/identifier/${id}/${action}`, {
+        method, headers: await headers(), ...(body ? { body: JSON.stringify(body) } : {}),
+      });
+      await expect(await changeToken("device", "token", { pushToken: " test-push-token " }), 200);
+      await expect(await changeToken("other-device", "token", { pushToken: "foreign" }), 400);
+      equal(sql.exec("SELECT push_token FROM devices WHERE user_id=? AND device_id='device'", USER).one().push_token, "test-push-token");
+      await expect(await changeToken("other-device", "clear-token"), 400);
+      await expect(await changeToken("device", "clear-token"), 200);
+      equal(sql.exec("SELECT push_token FROM devices WHERE user_id=? AND device_id='device'", USER).one().push_token, null);
     }
   });
 
   await check("an optional bearer on anonymous Send metadata never produces an account update", async () => {
     const f = fixture();
-    const captured = captureNotifications(f, () => null);
+    const captured = captureNotifications(f, update => ({ update, account: null }));
     sql.exec("INSERT INTO devices(user_id,device_id,name,device_type,session_token,created_at,updated_at) SELECT 'other-owner',device_id,name,device_type,session_token,created_at,updated_at FROM devices WHERE user_id=?", USER);
     const send = await expect(await f.fetch(`/api/sends/${SEND}`, { headers: await headers() }), 200);
     const result = await expect(await f.fetch(`/api/sends/access/${send.accessId}`, {
@@ -82,7 +92,7 @@ export async function runRouteParityCompatibility({ fixture, check, sql, accessT
 
   await check("KDF changes notify once with LogOut after revoking the old session and never after rollback", async () => {
     const f = fixture();
-    const captured = captureNotifications(f, () => sql.exec("SELECT key,kdf_iterations,security_stamp FROM users WHERE id=?", USER).one());
+    const captured = captureNotifications(f, update => ({ update, account: sql.exec("SELECT key,kdf_iterations,security_stamp FROM users WHERE id=?", USER).one() }));
     const body = { masterPasswordHash: "hash", newMasterPasswordHash: "changed-auth", key: "2.kdf-change", kdf: 0, kdfIterations: 650000 };
     f.db.failBatch = true;
     await expect(await request(f, "/api/accounts/kdf", body), 500);
@@ -110,6 +120,87 @@ export async function runRouteParityCompatibility({ fixture, check, sql, accessT
     equal(sql.exec("SELECT COUNT(*) AS n FROM auth_requests WHERE user_id=?", USER).one().n, 1);
   });
 
+  await check("client version rejection leaves an approved authentication request usable", async () => {
+    const f = fixture(), device = "requesting-device", ip = "192.0.2.11";
+    sql.exec(
+      "INSERT INTO devices(user_id,device_id,name,device_type,session_token,created_at,updated_at) VALUES(?,?,?,0,?,?,?)",
+      USER, device, "Requesting device", "previous-session", "before", "before",
+    );
+    const approvalRequest = { email: "owner@example.test", deviceIdentifier: device, accessCode: "request-code", publicKey: "request-public-key" };
+    const created = await expect(await f.fetch("/api/auth-requests", {
+      method: "POST", headers: { "Content-Type": "application/json", "device-type": "0", "cf-connecting-ip": ip },
+      body: JSON.stringify(approvalRequest),
+    }), 200);
+    const approved = await expect(await request(f, `/api/auth-requests/${created.id}`, {
+      deviceIdentifier: "device", key: "2.approved-key", requestApproved: true,
+    }, "PUT"), 200);
+    equal(approved.requestApproved, true);
+
+    const exchange = version => f.fetch("/identity/connect/token", {
+      method: "POST", headers: {
+        "Content-Type": "application/x-www-form-urlencoded", "device-type": "0", "cf-connecting-ip": ip,
+        ...(version ? { "Bitwarden-Client-Version": version } : {}),
+      },
+      body: new URLSearchParams({
+        grant_type: "password", username: approvalRequest.email, authRequest: created.id,
+        accessCode: approvalRequest.accessCode, deviceIdentifier: device, deviceType: "0",
+      }),
+    });
+    const consumed = () => sql.exec("SELECT authenticated_at FROM auth_requests WHERE id=?", created.id).one().authenticated_at;
+    const session = () => sql.exec("SELECT session_token FROM devices WHERE user_id=? AND device_id=?", USER, device).one().session_token;
+    equal((await expect(await exchange(), 400)).error, "version_header_missing");
+    equal(consumed(), null);
+    equal(session(), "previous-session");
+
+    const login = await expect(await exchange("2026.10.2"), 200);
+    equal(typeof consumed(), "string");
+    ok(session() !== "previous-session", "successful login did not rotate the device session");
+    await expect(await f.fetch("/api/accounts/profile", { headers: { Authorization: `Bearer ${login.access_token}` } }), 200);
+    await expect(await exchange("2026.10.2"), 401);
+  });
+
+  await check("email login reuses only a delivered code with attempts remaining", async () => {
+    const f = fixture(), address = "owner@example.test";
+    f.env.MAIL_WEBHOOK_URL = "https://mail.runtime.test/send";
+    sql.exec("INSERT INTO two_factors(id,user_id,provider_type,is_enabled,data) VALUES('email-login-factor',?,1,1,?)", USER, JSON.stringify({ email: address }));
+    const started = Promise.withResolvers(), release = Promise.withResolvers();
+    const previousFetch = globalThis.fetch;
+    let calls = 0, deliveryStatus = 503;
+    globalThis.fetch = async input => {
+      equal(new URL(input.url).hostname, "mail.runtime.test");
+      if (++calls === 1) {
+        started.resolve();
+        await release.promise;
+      }
+      return new Response("fixture provider", { status: deliveryStatus });
+    };
+    const send = () => request(f, "/two-factor/send-email-login", { email: address, masterPasswordHash: "hash" }, "POST", false);
+    const code = () => sql.exec("SELECT ready, attempts FROM verification_codes WHERE user_id=? AND purpose='email-login'", USER).one();
+    try {
+      const first = send();
+      await Promise.race([started.promise, first.then(() => { throw new Error("verification delivery did not start"); })]);
+      equal(code().ready, 0);
+      await expect(await send(), 429);
+      release.resolve();
+      await expect(await first, 503);
+      equal(calls, 1);
+      equal(sql.exec("SELECT count(*) AS n FROM verification_codes").one().n, 0);
+
+      deliveryStatus = 200;
+      await expect(await send(), 200);
+      equal(code().ready, 1);
+      await expect(await send(), 200);
+      equal(calls, 2);
+      sql.exec("UPDATE verification_codes SET attempts=5 WHERE user_id=? AND purpose='email-login'", USER);
+      await expect(await send(), 429);
+      equal(calls, 2);
+      equal(code().attempts, 5);
+    } finally {
+      release.resolve();
+      globalThis.fetch = previousFetch;
+    }
+  });
+
   await check("client event aliases return an empty successful body without weakening session checks", async () => {
     const f = fixture();
     for (const path of ["/events/collect", "/api/events/collect"]) {
@@ -122,7 +213,7 @@ export async function runRouteParityCompatibility({ fixture, check, sql, accessT
   await check("security-stamp publishes one logout only after its database commit and none after failure", async () => {
     for (const fail of [true, false]) {
       const f = fixture(), messages = [];
-      f.env.NOTIFY_DO = new DurableObjectNamespace(async req => {
+      f.env.notifydo = new DurableObjectNamespace(async req => {
         equal(new URL(req.url).pathname, "/internal/fanout");
         const message = await req.json(); equal(message.logout, true); messages.push(message);
         equal(sql.exec("SELECT COUNT(*) AS n FROM devices WHERE user_id=?", USER).one().n, 0, "logout preceded its database commit");
@@ -135,7 +226,7 @@ export async function runRouteParityCompatibility({ fixture, check, sql, accessT
     }
   });
 
-  await check("trailing slash normalization preserves JSON, query strings and streamed request bodies without HeavyDo", async () => {
+  await check("trailing slash normalization preserves JSON, query strings and streamed request bodies without heavydo", async () => {
     const f = fixture(); f.env.HEAVY_DO_ENABLED = "false";
     await expect(await f.fetch("/api/config///"), 200);
     const sync = await expect(await f.fetch("/api/sync///?excludeDomains=true", { headers: await headers() }), 200);

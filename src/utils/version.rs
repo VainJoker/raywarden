@@ -1,15 +1,27 @@
 //! Numeric version cores with a flag for prerelease suffixes.
 
-/// Parse three `u64` components and optional prerelease/build suffixes.
-/// Returns the numeric core and whether a prerelease is present. Build metadata
-/// is validated but discarded; this function does not compare full versions.
-pub(crate) fn parse(value: &str) -> Option<((u64, u64, u64), bool)> {
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct ParsedVersion {
+    pub major: u64,
+    pub minor: u64,
+    pub patch: u64,
+    pub is_prerelease: bool,
+}
+
+impl ParsedVersion {
+    pub(crate) fn satisfies_minimum(self, major: u64, minor: u64, patch: u64) -> bool {
+        let current = (self.major, self.minor, self.patch);
+        let minimum = (major, minor, patch);
+        current > minimum || (current == minimum && !self.is_prerelease)
+    }
+}
+
+/// Build metadata is validated and discarded.
+pub(crate) fn parse(value: &str) -> Option<ParsedVersion> {
     let identifiers = |part: &str| {
-        !part.is_empty() &&
-            part.split('.').all(|id| {
-                !id.is_empty() &&
-                    id.bytes()
-                        .all(|c| c.is_ascii_alphanumeric() || c == b'-')
+        !part.is_empty()
+            && part.split('.').all(|id| {
+                !id.is_empty() && id.bytes().all(|c| c.is_ascii_alphanumeric() || c == b'-')
             })
     };
     let (value, build) = value
@@ -22,19 +34,17 @@ pub(crate) fn parse(value: &str) -> Option<((u64, u64, u64), bool)> {
         .split_once('-')
         .map_or((value, None), |(core, pre)| (core, Some(pre)));
     if pre.is_some_and(|value| {
-        !identifiers(value) ||
-            value.split('.').any(|id| {
-                id.len() > 1 &&
-                    id.starts_with('0') &&
-                    id.bytes().all(|c| c.is_ascii_digit())
+        !identifiers(value)
+            || value.split('.').any(|id| {
+                id.len() > 1 && id.starts_with('0') && id.bytes().all(|c| c.is_ascii_digit())
             })
     }) {
         return None;
     }
     let number = |part: &str| {
-        if part.is_empty() ||
-            !part.bytes().all(|b| b.is_ascii_digit()) ||
-            (part.len() > 1 && part.starts_with('0'))
+        if part.is_empty()
+            || !part.bytes().all(|b| b.is_ascii_digit())
+            || (part.len() > 1 && part.starts_with('0'))
         {
             None
         } else {
@@ -42,21 +52,22 @@ pub(crate) fn parse(value: &str) -> Option<((u64, u64, u64), bool)> {
         }
     };
     let mut parts = core.split('.');
-    let version = (
-        number(parts.next()?)?,
-        number(parts.next()?)?,
-        number(parts.next()?)?,
-    );
-    parts.next().is_none().then_some((version, pre.is_some()))
+    let version = ParsedVersion {
+        major: number(parts.next()?)?,
+        minor: number(parts.next()?)?,
+        patch: number(parts.next()?)?,
+        is_prerelease: pre.is_some(),
+    };
+    parts.next().is_none().then_some(version)
 }
 
 #[cfg(test)]
 mod tests {
-    use super::parse;
+    use super::{ParsedVersion, parse};
 
     #[test]
     fn parses_numeric_cores_and_prerelease_flags_without_build_metadata() {
-        for (value, core, prerelease) in [
+        for (value, (major, minor, patch), is_prerelease) in [
             ("0.0.0", (0, 0, 0), false),
             ("2026.10.2", (2026, 10, 2), false),
             ("2026.11.0-beta.1+build", (2026, 11, 0), true),
@@ -64,7 +75,17 @@ mod tests {
             ("1.2.3-0", (1, 2, 3), true),
             ("18446744073709551615.0.0", (u64::MAX, 0, 0), false),
         ] {
-            assert_eq!(parse(value), Some((core, prerelease)), "{value}");
+            let version = ParsedVersion {
+                major,
+                minor,
+                patch,
+                is_prerelease,
+            };
+            assert_eq!(parse(value), Some(version), "{value}");
+            assert_eq!(
+                version.satisfies_minimum(major, minor, patch),
+                !is_prerelease
+            );
         }
     }
 

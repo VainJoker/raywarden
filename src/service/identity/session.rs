@@ -1,22 +1,13 @@
 //! Signed token claims and server-side device sessions.
 use std::collections::HashSet;
 
-use serde::{
-    Deserialize,
-    Serialize,
-};
+use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 use worker::D1Database;
 
 use crate::{
-    errors::{
-        AppError,
-        AppResult,
-    },
-    models::identity::device::{
-        DeviceRow,
-        SessionSnapshot,
-    },
+    errors::{AppError, AppResult},
+    models::identity::device::{DeviceRow, SessionSnapshot},
     utils::constant_time_eq,
 };
 
@@ -25,34 +16,46 @@ use crate::{
 pub struct ClaimsExtensions {
     #[serde(skip_serializing_if = "Option::is_none")]
     #[serde(rename = "premium")]
-    pub is_premium:        Option<bool>,
+    pub is_premium: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub name:              Option<String>,
+    pub name: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub email:             Option<String>,
+    pub email: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     #[serde(rename = "email_verified")]
     pub is_email_verified: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub amr:               Option<HashSet<String>>,
+    pub amr: Option<HashSet<String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub device:            Option<String>,
+    pub device: Option<String>,
+}
+
+/// Purpose of a session-bound JWT. Unknown and missing wire values are rejected
+/// by the same session binding check.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum TokenUse {
+    Access,
+    Refresh,
+    #[default]
+    #[serde(other, rename = "")]
+    Unknown,
 }
 
 /// Signed claims bound to an account and a device session.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Claims {
     // Required standard claims
-    pub sub:           String, // User ID
-    pub exp:           i64,    // Expiration time (Unix timestamp)
-    pub nbf:           i64,    // Not before time (Unix timestamp)
-    pub iat:           i64,    // Issued at time (Unix timestamp)
+    pub sub: String, // User ID
+    pub exp: i64,    // Expiration time (Unix timestamp)
+    pub nbf: i64,    // Not before time (Unix timestamp)
+    pub iat: i64,    // Issued at time (Unix timestamp)
     #[serde(default)]
-    pub sstamp:        String,
+    pub sstamp: String,
     #[serde(default)]
     pub session_token: String,
     #[serde(default)]
-    pub token_use:     String,
+    token_use: TokenUse,
 
     // Application-specific claims
     #[serde(flatten)]
@@ -63,20 +66,20 @@ impl Claims {
     pub(super) fn for_session(
         session: &SessionSnapshot<'_>,
         extensions: ClaimsExtensions,
-        purpose: &str,
+        purpose: TokenUse,
         duration_seconds: i64,
     ) -> Self {
         let now = crate::utils::time::now_seconds();
         Self {
-            sub:           session.user_id.to_owned(),
+            sub: session.user_id.to_owned(),
             // Runtime configuration validates durations before issuance.
-            exp:           now.checked_add(duration_seconds).unwrap_or(now),
-            nbf:           now,
-            iat:           now,
-            sstamp:        session.security_stamp.to_owned(),
+            exp: now.checked_add(duration_seconds).unwrap_or(now),
+            nbf: now,
+            iat: now,
+            sstamp: session.security_stamp.to_owned(),
             session_token: session.session_token.to_owned(),
-            token_use:     purpose.to_owned(),
-            extensions:    ClaimsExtensions {
+            token_use: purpose,
+            extensions: ClaimsExtensions {
                 device: Some(session.device_id.to_owned()),
                 ..extensions
             },
@@ -88,11 +91,12 @@ impl Claims {
         self.extensions.device.as_deref()
     }
 
-    fn bound_session(&self, purpose: &str) -> AppResult<SessionSnapshot<'_>> {
+    fn bound_session(&self, purpose: TokenUse) -> AppResult<SessionSnapshot<'_>> {
         let invalid = || AppError::invalid_credentials("Invalid session token");
-        if self.token_use != purpose ||
-            self.sstamp.is_empty() ||
-            self.session_token.is_empty()
+        if purpose == TokenUse::Unknown
+            || self.token_use != purpose
+            || self.sstamp.is_empty()
+            || self.session_token.is_empty()
         {
             return Err(invalid());
         }
@@ -109,14 +113,10 @@ impl Claims {
     }
 
     pub fn session_snapshot(&self) -> AppResult<SessionSnapshot<'_>> {
-        self.bound_session("access")
+        self.bound_session(TokenUse::Access)
     }
 
-    pub async fn validate_session(
-        &self,
-        db: &D1Database,
-        purpose: &str,
-    ) -> AppResult<()> {
+    pub async fn validate_session(&self, db: &D1Database, purpose: TokenUse) -> AppResult<()> {
         validate_session(db, &self.bound_session(purpose)?).await
     }
 }
@@ -125,9 +125,7 @@ pub(crate) async fn validate_session(
     db: &D1Database,
     expected: &SessionSnapshot<'_>,
 ) -> AppResult<()> {
-    let current =
-        DeviceRow::find_session(db, expected.user_id, expected.device_id)
-            .await?;
+    let current = DeviceRow::find_session(db, expected.user_id, expected.device_id).await?;
     if current.is_some_and(|session| {
         constant_time_eq(
             session.session_token.as_bytes(),
@@ -145,33 +143,9 @@ pub(crate) async fn validate_session(
     }
 }
 
-pub async fn start_session(
-    db: &D1Database,
-    user_id: &str,
-    device_id: &str,
-    name: &str,
-    device_type: i32,
-) -> AppResult<DeviceRow> {
-    let nonce = new_session_token();
-    DeviceRow::persist_session(
-        db,
-        user_id,
-        device_id,
-        name,
-        device_type,
-        &nonce,
-    )
-    .await
-}
-
-pub(super) fn new_session_token() -> String {
+pub(crate) fn new_session_token() -> String {
     // Rotating the nonce revokes tokens from earlier logins on this device.
     format!("{}{}", Uuid::new_v4().simple(), Uuid::new_v4().simple())
-}
-
-pub async fn revoke_all(db: &D1Database, user_id: &str) -> AppResult<()> {
-    DeviceRow::revoke_all_with_stamp(db, user_id, &Uuid::new_v4().to_string())
-        .await
 }
 
 #[cfg(test)]
@@ -190,8 +164,7 @@ mod tests {
             wire,
             serde_json::json!({"premium": true, "email_verified": false})
         );
-        let decoded: ClaimsExtensions =
-            serde_json::from_value(wire).expect("valid claims fixture");
+        let decoded: ClaimsExtensions = serde_json::from_value(wire).expect("valid claims fixture");
         assert_eq!(decoded.is_premium, Some(true));
         assert_eq!(decoded.is_email_verified, Some(false));
     }
@@ -199,13 +172,13 @@ mod tests {
     fn valid_access_claims(duration_seconds: i64) -> Claims {
         Claims::for_session(
             &SessionSnapshot {
-                user_id:        "user",
+                user_id: "user",
                 security_stamp: "stamp",
-                device_id:      "device",
-                session_token:  "nonce",
+                device_id: "device",
+                session_token: "nonce",
             },
             ClaimsExtensions::default(),
-            "access",
+            TokenUse::Access,
             duration_seconds,
         )
     }
@@ -219,15 +192,14 @@ mod tests {
     #[test]
     fn tokens_are_bound_to_purpose_and_session() {
         let mut claims = valid_access_claims(3600);
-        assert!(claims.bound_session("access").is_ok());
-        assert!(claims.bound_session("refresh").is_err());
-        claims.token_use = "send.access".into();
-        assert!(claims.bound_session("access").is_err());
+        assert!(claims.bound_session(TokenUse::Access).is_ok());
+        assert!(claims.bound_session(TokenUse::Refresh).is_err());
+        claims.token_use = TokenUse::Unknown;
+        assert!(claims.bound_session(TokenUse::Access).is_err());
     }
 
     #[test]
-    fn session_snapshot_preserves_bindings_and_requires_complete_access_claims()
-    {
+    fn session_snapshot_preserves_bindings_and_requires_complete_access_claims() {
         let claims = valid_access_claims(3600);
         let session = claims.session_snapshot().expect("valid claims fixture");
         assert_eq!(session.user_id, "user");
@@ -237,7 +209,7 @@ mod tests {
         for missing in 0..4 {
             let mut invalid = claims.clone();
             match missing {
-                0 => invalid.token_use = "refresh".into(),
+                0 => invalid.token_use = TokenUse::Refresh,
                 1 => invalid.sstamp.clear(),
                 2 => invalid.session_token.clear(),
                 _ => invalid.extensions.device = None,

@@ -39,6 +39,12 @@ jobs:
         run: just artifact-check
       - name: Install only the locked deployment CLI
         run: just setup-deploy
+      - name: Validate supplied Secrets before migrating D1
+        env:
+          ALLOWED_EMAILS: ${{ secrets.ALLOWED_EMAILS }}
+          OWNER_SETUP_TOKEN: ${{ secrets.OWNER_SETUP_TOKEN }}
+          KEY_ENCRYPTION_KEY: ${{ secrets.KEY_ENCRYPTION_KEY }}
+        run: just deploy-preflight
       - name: Verify resources and migrate D1
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
@@ -57,6 +63,7 @@ jobs:
         run: just deploy-worker
       - name: Verify the configured public health endpoint
         env:
+          ARTIFACT_SOURCE_SHA: ${{ github.sha }}
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
-        run: just health
+        run: just deploy-health

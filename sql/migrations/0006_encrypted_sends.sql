@@ -32,3 +32,11 @@ CREATE INDEX idx_sends_deletes_at ON sends(julianday(deletes_at));
 CREATE INDEX idx_sends_created_at ON sends(julianday(created_at)) WHERE upload_state<>0;
 
 CREATE INDEX idx_sends_user_id ON sends(user_id);
+
+-- Object-key lookups used by storage cleanup and publication.
+CREATE INDEX idx_sends_effective_object_key
+ON sends(COALESCE(storage_key, 'sends/' || id || '/' || file_id))
+WHERE file_id IS NOT NULL;
+
+CREATE INDEX idx_sends_storage_key
+ON sends(storage_key) WHERE storage_key IS NOT NULL;

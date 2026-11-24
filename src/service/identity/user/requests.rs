@@ -1,30 +1,24 @@
 //! Account request DTOs, protocol compatibility and normalization.
-use serde::{
-    Deserialize,
-    Serialize,
-};
+use serde::{Deserialize, Serialize};
 
 use crate::{
-    errors::{
-        AppError,
-        AppResult,
-    },
+    errors::{AppError, AppResult},
     models::identity::user::UserRow,
-    service::identity::account_keys,
+    service::identity::{account_keys, kdf::KdfKind},
 };
 
 // For /accounts/prelogin response
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PreloginResponse {
-    pub kdf:             i32,
-    pub kdf_iterations:  i32,
+    pub kdf: i32,
+    pub kdf_iterations: i32,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub kdf_memory:      Option<i32>,
+    pub kdf_memory: Option<i32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub kdf_parallelism: Option<i32>,
-    pub kdf_settings:    KdfParams,
-    pub salt:            String,
+    pub kdf_settings: KdfParams,
+    pub salt: String,
 }
 
 // For /accounts/register request
@@ -53,16 +47,16 @@ pub struct RegisterRequest {
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct RegisterPayload {
-    name:                     Option<String>,
-    email:                    String,
-    master_password_hint:     Option<String>,
+    name: Option<String>,
+    email: String,
+    master_password_hint: Option<String>,
     #[serde(alias = "keys")]
-    user_asymmetric_keys:     Option<AccountKeyPairRequest>,
-    account_keys:             Option<account_keys::AccountKeysRequest>,
+    user_asymmetric_keys: Option<AccountKeyPairRequest>,
+    account_keys: Option<account_keys::AccountKeysRequest>,
     #[serde(alias = "token")]
     email_verification_token: Option<String>,
     #[serde(flatten)]
-    credentials:              RegisterCredentials,
+    credentials: RegisterCredentials,
 }
 
 #[derive(Deserialize)]
@@ -74,22 +68,19 @@ enum RegisterCredentials {
             alias = "MasterPasswordAuthentication"
         )]
         authentication: RegisterAuthentication,
-        #[serde(
-            rename = "masterPasswordUnlock",
-            alias = "MasterPasswordUnlock"
-        )]
-        unlock:         RegisterUnlock,
+        #[serde(rename = "masterPasswordUnlock", alias = "MasterPasswordUnlock")]
+        unlock: RegisterUnlock,
     },
     Legacy {
         #[serde(rename = "masterPasswordHash")]
-        hash:        String,
+        hash: String,
         #[serde(rename = "userSymmetricKey", alias = "key")]
-        key:         String,
-        kdf:         i32,
+        key: String,
+        kdf: i32,
         #[serde(rename = "kdfIterations")]
-        iterations:  i32,
+        iterations: i32,
         #[serde(rename = "kdfMemory")]
-        memory:      Option<i32>,
+        memory: Option<i32>,
         #[serde(rename = "kdfParallelism")]
         parallelism: Option<i32>,
     },
@@ -98,7 +89,7 @@ enum RegisterCredentials {
 #[derive(Deserialize)]
 struct RegisterAuthentication {
     #[serde(alias = "Kdf")]
-    kdf:  KdfParams,
+    kdf: KdfParams,
     #[serde(alias = "Salt")]
     salt: String,
     #[serde(
@@ -111,13 +102,10 @@ struct RegisterAuthentication {
 #[derive(Deserialize)]
 struct RegisterUnlock {
     #[serde(alias = "Kdf")]
-    kdf:              KdfParams,
-    salt:             String,
-    #[serde(
-        alias = "masterKeyWrappedUserKey",
-        alias = "MasterKeyWrappedUserKey"
-    )]
-    key:              String,
+    kdf: KdfParams,
+    salt: String,
+    #[serde(alias = "masterKeyWrappedUserKey", alias = "MasterKeyWrappedUserKey")]
+    key: String,
     #[serde(rename = "containedKeyId")]
     contained_key_id: Option<String>,
 }
@@ -130,8 +118,8 @@ impl TryFrom<RegisterPayload> for RegisterRequest {
         if email.is_empty() {
             return Err("Email is required".to_string());
         }
-        let account_keys = if let Some(keys) = &payload.account_keys {
-            keys.validate().map_err(|e| e.to_string())?
+        let account_keys = if let Some(keys) = payload.account_keys {
+            keys.into_validated().map_err(|e| e.to_string())?
         } else {
             let pair = payload
                 .user_asymmetric_keys
@@ -142,9 +130,7 @@ impl TryFrom<RegisterPayload> for RegisterRequest {
             )
         };
         let user_key_id = match &payload.credentials {
-            RegisterCredentials::Current { unlock, .. } => {
-                unlock.contained_key_id.clone()
-            }
+            RegisterCredentials::Current { unlock, .. } => unlock.contained_key_id.clone(),
             RegisterCredentials::Legacy { .. } => None,
         };
         if user_key_id
@@ -158,9 +144,9 @@ impl TryFrom<RegisterPayload> for RegisterRequest {
                 authentication,
                 unlock,
             } => {
-                if authentication.kdf != unlock.kdf ||
-                    authentication.salt != email ||
-                    unlock.salt != email
+                if authentication.kdf != unlock.kdf
+                    || authentication.salt != email
+                    || unlock.salt != email
                 {
                     return Err("Authentication and unlock KDF/salt must \
                                 match the account"
@@ -183,9 +169,7 @@ impl TryFrom<RegisterPayload> for RegisterRequest {
             }),
         };
         if hash.is_empty() || key.is_empty() {
-            return Err(
-                "Password hash and encrypted key are required".to_string()
-            );
+            return Err("Password hash and encrypted key are required".to_string());
         }
         Ok(Self {
             name: payload.name,
@@ -211,15 +195,13 @@ impl TryFrom<RegisterPayload> for RegisterRequest {
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AccountKeyPairRequest {
-    pub public_key:            String,
+    pub public_key: String,
     pub encrypted_private_key: String,
 }
 
 impl AccountKeyPairRequest {
     pub fn validate_password_rewrap(&self, user: &UserRow) -> AppResult<()> {
-        if self.public_key.trim().is_empty() ||
-            self.encrypted_private_key.trim().is_empty()
-        {
+        if self.public_key.trim().is_empty() || self.encrypted_private_key.trim().is_empty() {
             return Err(AppError::bad_request(
                 "Both public key and wrapped private key are required",
             ));
@@ -229,12 +211,11 @@ impl AccountKeyPairRequest {
                 "Changing the asymmetric public key is not allowed",
             ));
         }
-        let version =
-            if super::is_v2(user) || user.private_key.starts_with("7.") {
-                "7"
-            } else {
-                "2"
-            };
+        let version = if super::is_v2(user) || user.private_key.starts_with("7.") {
+            "7"
+        } else {
+            "2"
+        };
         if !self
             .encrypted_private_key
             .split_once('.')
@@ -256,8 +237,8 @@ impl AccountKeyPairRequest {
 #[serde(rename_all = "camelCase")]
 pub struct AccountVerificationRequest {
     #[serde(alias = "MasterPasswordHash")]
-    pub master_password_hash:    Option<String>,
-    pub otp:                     Option<String>,
+    pub master_password_hash: Option<String>,
+    pub otp: Option<String>,
     pub user_verification_token: Option<String>,
 }
 
@@ -281,141 +262,63 @@ pub struct SetPasswordRequest {
 
 pub struct ValidatedSetPassword {
     pub master_password_hash: String,
-    pub wrapped_user_key:     String,
-    pub key_pair:             Option<AccountKeyPairRequest>,
+    pub wrapped_user_key: String,
+    pub key_pair: Option<AccountKeyPairRequest>,
     pub master_password_hint: Option<String>,
-    pub kdf:                  KdfParams,
+    pub kdf: KdfParams,
+}
+
+enum PasswordInitWire {
+    Modern {
+        authentication: RegisterAuthentication,
+        unlock: RegisterUnlock,
+    },
+    Legacy,
 }
 
 impl SetPasswordRequest {
-    #[allow(
-        clippy::too_many_lines,
-        reason = "Validate each complete password initialization format \
-                  before accepting key material"
-    )]
-    pub fn resolve(self, user: &UserRow) -> AppResult<ValidatedSetPassword> {
+    pub fn resolve(mut self, user: &UserRow) -> AppResult<ValidatedSetPassword> {
         if self.keys.is_some() && self.user_asymmetric_keys.is_some() {
-            return Err(AppError::bad_request(
-                "Provide only one keypair field",
-            ));
+            return Err(AppError::bad_request("Provide only one keypair field"));
         }
         if self.account_keys.is_some() {
             return Err(AppError::bad_request(
-                "V2 JIT password registration is not available in this \
-                 personal vault",
+                "V2 JIT password registration is not available in this personal vault",
             ));
         }
-        let (hash, key, kdf, keys) = match (
-            self.master_password_authentication,
-            self.master_password_unlock,
+        let wire = match (
+            self.master_password_authentication.take(),
+            self.master_password_unlock.take(),
         ) {
-            (Some(authentication), Some(unlock)) => {
-                if self.master_password_hash.is_some() ||
-                    self.key.is_some() ||
-                    self.kdf.is_some() ||
-                    self.kdf_iterations.is_some() ||
-                    self.kdf_memory.is_some() ||
-                    self.kdf_parallelism.is_some()
-                {
-                    return Err(AppError::bad_request(
-                        "Cannot mix modern and legacy password fields",
-                    ));
-                }
-                if authentication.kdf != unlock.kdf ||
-                    authentication.salt != user.email ||
-                    unlock.salt != user.email
-                {
-                    return Err(AppError::bad_request(
-                        "Authentication and unlock KDF/salt must match the \
-                         account",
-                    ));
-                }
-                if let Some(id) = &unlock.contained_key_id {
-                    if !account_keys::is_valid_key_id(id) {
-                        return Err(AppError::bad_request(
-                            "Invalid contained key ID",
-                        ));
-                    }
-                    if user
-                        .user_key_id
-                        .as_ref()
-                        .is_some_and(|current| current != id)
-                    {
-                        return Err(AppError::bad_request(
-                            "Contained key id must match the current user key \
-                             id",
-                        ));
-                    }
-                    // V1 registration validates this optional client metadata
-                    // without establishing a V2 key id on the account.
-                }
-                (
-                    authentication.hash,
-                    unlock.key,
-                    authentication.kdf,
-                    self.user_asymmetric_keys.or(self.keys),
-                )
-            }
-            (None, None) => {
-                if self.user_asymmetric_keys.is_some() {
-                    return Err(AppError::bad_request(
-                        "Cannot mix modern and legacy keypair fields",
-                    ));
-                }
-                let hash = self.master_password_hash.ok_or_else(|| {
-                    AppError::bad_request("Missing masterPasswordHash")
-                })?;
-                let key = self.key.ok_or_else(|| {
-                    AppError::bad_request("Missing encrypted user key")
-                })?;
-                let kdf = match (self.kdf, self.kdf_iterations) {
-                    (Some(kind), Some(iterations)) => KdfParams {
-                        kdf_type: kind,
-                        iterations,
-                        memory: if kind == 1 {
-                            self.kdf_memory.or(Some(64))
-                        } else {
-                            None
-                        },
-                        parallelism: if kind == 1 {
-                            self.kdf_parallelism.or(Some(4))
-                        } else {
-                            None
-                        },
-                    },
-                    (None, None)
-                        if self.kdf_memory.is_none() &&
-                            self.kdf_parallelism.is_none() =>
-                    {
-                        KdfParams {
-                            kdf_type:    user.kdf_type,
-                            iterations:  user.kdf_iterations,
-                            memory:      user.kdf_memory,
-                            parallelism: user.kdf_parallelism,
-                        }
-                    }
-                    _ => {
-                        return Err(AppError::bad_request(
-                            "KDF type and iterations must be provided together",
-                        ));
-                    }
-                };
-                (hash, key, kdf, self.keys)
-            }
+            (Some(authentication), Some(unlock)) => PasswordInitWire::Modern {
+                authentication,
+                unlock,
+            },
+            (None, None) => PasswordInitWire::Legacy,
             _ => {
                 return Err(AppError::bad_request(
                     "Authentication and unlock data must be provided together",
                 ));
             }
         };
-        if hash.trim().is_empty() || key.trim().is_empty() {
+        let resolved = match wire {
+            PasswordInitWire::Modern {
+                authentication,
+                unlock,
+            } => self.resolve_modern(user, authentication, unlock)?,
+            PasswordInitWire::Legacy => self.resolve_legacy(user)?,
+        };
+        if resolved.master_password_hash.trim().is_empty()
+            || resolved.wrapped_user_key.trim().is_empty()
+        {
             return Err(AppError::bad_request(
                 "Password hash and wrapped user key must not be empty",
             ));
         }
-        if let Some(keys) = &keys {
-            if keys.public_key.trim().is_empty() ||
-                keys.encrypted_private_key
+        if let Some(keys) = &resolved.key_pair {
+            if keys.public_key.trim().is_empty()
+                || keys
+                    .encrypted_private_key
                     .strip_prefix("2.")
                     .is_none_or(str::is_empty)
             {
@@ -424,17 +327,112 @@ impl SetPasswordRequest {
                      required",
                 ));
             }
-            if !user.public_key.is_empty() && user.public_key != keys.public_key
-            {
+            if !user.public_key.is_empty() && user.public_key != keys.public_key {
                 return Err(AppError::bad_request(
                     "Changing the existing public key identity is not allowed",
                 ));
             }
         }
+        Ok(resolved)
+    }
+
+    fn resolve_modern(
+        self,
+        user: &UserRow,
+        authentication: RegisterAuthentication,
+        unlock: RegisterUnlock,
+    ) -> AppResult<ValidatedSetPassword> {
+        if self.master_password_hash.is_some()
+            || self.key.is_some()
+            || self.kdf.is_some()
+            || self.kdf_iterations.is_some()
+            || self.kdf_memory.is_some()
+            || self.kdf_parallelism.is_some()
+        {
+            return Err(AppError::bad_request(
+                "Cannot mix modern and legacy password fields",
+            ));
+        }
+        if authentication.kdf != unlock.kdf
+            || authentication.salt != user.email
+            || unlock.salt != user.email
+        {
+            return Err(AppError::bad_request(
+                "Authentication and unlock KDF/salt must match the \
+                         account",
+            ));
+        }
+        if let Some(id) = &unlock.contained_key_id {
+            if !account_keys::is_valid_key_id(id) {
+                return Err(AppError::bad_request("Invalid contained key ID"));
+            }
+            if user
+                .user_key_id
+                .as_ref()
+                .is_some_and(|current| current != id)
+            {
+                return Err(AppError::bad_request(
+                    "Contained key id must match the current user key \
+                             id",
+                ));
+            }
+            // V1 registration validates this optional client metadata
+            // without establishing a V2 key id on the account.
+        }
+        Ok(ValidatedSetPassword {
+            master_password_hash: authentication.hash,
+            wrapped_user_key: unlock.key,
+            key_pair: self.user_asymmetric_keys.or(self.keys),
+            master_password_hint: self.master_password_hint,
+            kdf: authentication.kdf,
+        })
+    }
+
+    fn resolve_legacy(self, user: &UserRow) -> AppResult<ValidatedSetPassword> {
+        if self.user_asymmetric_keys.is_some() {
+            return Err(AppError::bad_request(
+                "Cannot mix modern and legacy keypair fields",
+            ));
+        }
+        let hash = self
+            .master_password_hash
+            .ok_or_else(|| AppError::bad_request("Missing masterPasswordHash"))?;
+        let key = self
+            .key
+            .ok_or_else(|| AppError::bad_request("Missing encrypted user key"))?;
+        let kdf = match (self.kdf, self.kdf_iterations) {
+            (Some(kind), Some(iterations)) => KdfParams {
+                kdf_type: kind,
+                iterations,
+                memory: if kind == KdfKind::Argon2id as i32 {
+                    self.kdf_memory.or(Some(64))
+                } else {
+                    None
+                },
+                parallelism: if kind == KdfKind::Argon2id as i32 {
+                    self.kdf_parallelism.or(Some(4))
+                } else {
+                    None
+                },
+            },
+            (None, None) if self.kdf_memory.is_none() && self.kdf_parallelism.is_none() => {
+                KdfParams {
+                    kdf_type: user.kdf_type,
+                    iterations: user.kdf_iterations,
+                    memory: user.kdf_memory,
+                    parallelism: user.kdf_parallelism,
+                }
+            }
+            _ => {
+                return Err(AppError::bad_request(
+                    "KDF type and iterations must be provided together",
+                ));
+            }
+        };
         Ok(ValidatedSetPassword {
             master_password_hash: hash,
             wrapped_user_key: key,
-            key_pair: keys,
+            key_pair: self.keys,
             master_password_hint: self.master_password_hint,
             kdf,
         })
@@ -447,21 +445,18 @@ impl SetPasswordRequest {
 pub struct ChangePasswordRequest {
     pub master_password_hash: String,
     #[serde(flatten)]
-    data:                     CredentialChangePayload,
+    data: CredentialChangePayload,
     pub master_password_hint: Option<String>,
     pub user_asymmetric_keys: Option<AccountKeyPairRequest>,
 }
 
 impl ChangePasswordRequest {
-    pub fn resolve(
-        &self,
-        user: &UserRow,
-    ) -> AppResult<(&str, &str, KdfParams)> {
+    pub fn resolve(&self, user: &UserRow) -> AppResult<(&str, &str, KdfParams)> {
         let resolved = self.data.resolve(user, false)?;
         let expected = KdfParams {
-            kdf_type:    user.kdf_type,
-            iterations:  user.kdf_iterations,
-            memory:      if user.kdf_type == 1 {
+            kdf_type: user.kdf_type,
+            iterations: user.kdf_iterations,
+            memory: if user.kdf_type == 1 {
                 user.kdf_memory
             } else {
                 None
@@ -489,9 +484,9 @@ impl ChangePasswordRequest {
 #[serde(rename_all = "camelCase")]
 pub struct KdfParams {
     #[serde(alias = "kdfType")]
-    pub kdf_type:    i32,
-    pub iterations:  i32,
-    pub memory:      Option<i32>,
+    pub kdf_type: i32,
+    pub iterations: i32,
+    pub memory: Option<i32>,
     pub parallelism: Option<i32>,
 }
 
@@ -518,7 +513,7 @@ pub struct MasterPasswordUnlockPayload {
 pub struct ChangeKdfRequest {
     pub master_password_hash: String,
     #[serde(flatten)]
-    data:                     CredentialChangePayload,
+    data: CredentialChangePayload,
 }
 
 #[derive(Debug, Deserialize)]
@@ -536,129 +531,39 @@ struct CredentialChangePayload {
 
 impl ChangeKdfRequest {
     /// Resolve one complete protocol format before deriving or writing keys.
-    pub fn resolve(
-        &self,
-        user: &UserRow,
-    ) -> AppResult<(&str, &str, KdfParams)> {
+    pub fn resolve(&self, user: &UserRow) -> AppResult<(&str, &str, KdfParams)> {
         self.data.resolve(user, true)
     }
 }
 
+enum CredentialChangeWire<'a> {
+    Modern {
+        authentication: &'a MasterPasswordAuthenticationPayload,
+        unlock: &'a MasterPasswordUnlockPayload,
+    },
+    Legacy,
+}
+
 impl CredentialChangePayload {
-    #[allow(
-        clippy::too_many_lines,
-        reason = "Validate each complete credential-change format without \
-                  mixing protocol variants"
-    )]
-    fn resolve(
-        &self,
-        user: &UserRow,
-        changing_kdf: bool,
-    ) -> AppResult<(&str, &str, KdfParams)> {
-        let resolved = match (&self.authentication_data, &self.unlock_data) {
-            (Some(authentication), Some(unlock)) => {
-                if authentication.kdf != unlock.kdf {
-                    return Err(AppError::bad_request(
-                        "KDF settings must be equal for authentication and \
-                         unlock",
-                    ));
-                }
-                if authentication.salt != user.email ||
-                    unlock.salt != user.email
-                {
-                    return Err(AppError::bad_request(
-                        "Invalid master password salt",
-                    ));
-                }
-                // Older clients may repeat complete flat fields. They may
-                // confirm this pair, never supply an independent fallback.
-                if self.key.is_some() != self.new_master_password_hash.is_some() ||
-                    self.kdf.is_some() != self.kdf_iterations.is_some() ||
-                    self.key.as_ref().is_some_and(|key| {
-                        key != &unlock.master_key_wrapped_user_key
-                    }) ||
-                    self.new_master_password_hash.as_ref().is_some_and(
-                        |hash| {
-                            hash != &authentication
-                                .master_password_authentication_hash
-                        },
-                    ) ||
-                    self.kdf.is_some_and(|kind| kind != unlock.kdf.kdf_type) ||
-                    self.kdf_iterations.is_some_and(|iterations| {
-                        iterations != unlock.kdf.iterations
-                    }) ||
-                    self.kdf_memory.is_some_and(|memory| {
-                        Some(memory) != unlock.kdf.memory
-                    }) ||
-                    self.kdf_parallelism.is_some_and(|parallelism| {
-                        Some(parallelism) != unlock.kdf.parallelism
-                    })
-                {
-                    return Err(AppError::bad_request(
-                        "Conflicting or incomplete credential request formats",
-                    ));
-                }
-                if unlock
-                    .contained_key_id
-                    .as_ref()
-                    .is_some_and(|id| user.user_key_id.as_ref() != Some(id))
-                {
-                    return Err(AppError::bad_request(
-                        "Contained key id must match the current user key id",
-                    ));
-                }
-                (
-                    authentication.master_password_authentication_hash.as_str(),
-                    unlock.master_key_wrapped_user_key.as_str(),
-                    unlock.kdf.clone(),
-                )
-            }
-            (None, None) => {
-                let hash = self
-                    .new_master_password_hash
-                    .as_deref()
-                    .ok_or_else(|| {
-                        AppError::bad_request("Missing newMasterPasswordHash")
-                    })?;
-                let key = self.key.as_deref().ok_or_else(|| {
-                    AppError::bad_request("Missing encrypted user key")
-                })?;
-                let kdf = self
-                    .kdf
-                    .or_else(|| (!changing_kdf).then_some(user.kdf_type))
-                    .ok_or_else(|| AppError::bad_request("Missing KDF type"))?;
-                let iterations = self
-                    .kdf_iterations
-                    .or_else(|| (!changing_kdf).then_some(user.kdf_iterations))
-                    .ok_or_else(|| {
-                        AppError::bad_request("Missing KDF iterations")
-                    })?;
-                (hash, key, KdfParams {
-                    kdf_type: kdf,
-                    iterations,
-                    memory: if kdf == 1 {
-                        self.kdf_memory.or_else(|| {
-                            (!changing_kdf).then_some(user.kdf_memory).flatten()
-                        })
-                    } else {
-                        None
-                    },
-                    parallelism: if kdf == 1 {
-                        self.kdf_parallelism.or_else(|| {
-                            (!changing_kdf)
-                                .then_some(user.kdf_parallelism)
-                                .flatten()
-                        })
-                    } else {
-                        None
-                    },
-                })
-            }
+    fn resolve(&self, user: &UserRow, changing_kdf: bool) -> AppResult<(&str, &str, KdfParams)> {
+        let wire = match (&self.authentication_data, &self.unlock_data) {
+            (Some(authentication), Some(unlock)) => CredentialChangeWire::Modern {
+                authentication,
+                unlock,
+            },
+            (None, None) => CredentialChangeWire::Legacy,
             _ => {
                 return Err(AppError::bad_request(
                     "Authentication and unlock data must be provided together",
                 ));
             }
+        };
+        let resolved = match wire {
+            CredentialChangeWire::Modern {
+                authentication,
+                unlock,
+            } => self.resolve_modern(user, authentication, unlock)?,
+            CredentialChangeWire::Legacy => self.resolve_legacy(user, changing_kdf)?,
         };
         if resolved.0.trim().is_empty() || resolved.1.trim().is_empty() {
             return Err(AppError::bad_request(
@@ -666,6 +571,103 @@ impl CredentialChangePayload {
             ));
         }
         Ok(resolved)
+    }
+
+    fn resolve_modern<'a>(
+        &self,
+        user: &UserRow,
+        authentication: &'a MasterPasswordAuthenticationPayload,
+        unlock: &'a MasterPasswordUnlockPayload,
+    ) -> AppResult<(&'a str, &'a str, KdfParams)> {
+        if authentication.kdf != unlock.kdf {
+            return Err(AppError::bad_request(
+                "KDF settings must be equal for authentication and \
+                         unlock",
+            ));
+        }
+        if authentication.salt != user.email || unlock.salt != user.email {
+            return Err(AppError::bad_request("Invalid master password salt"));
+        }
+        // Older clients may repeat complete flat fields. They may
+        // confirm this pair, never supply an independent fallback.
+        if self.key.is_some() != self.new_master_password_hash.is_some()
+            || self.kdf.is_some() != self.kdf_iterations.is_some()
+            || self
+                .key
+                .as_ref()
+                .is_some_and(|key| key != &unlock.master_key_wrapped_user_key)
+            || self
+                .new_master_password_hash
+                .as_ref()
+                .is_some_and(|hash| hash != &authentication.master_password_authentication_hash)
+            || self.kdf.is_some_and(|kind| kind != unlock.kdf.kdf_type)
+            || self
+                .kdf_iterations
+                .is_some_and(|iterations| iterations != unlock.kdf.iterations)
+            || self
+                .kdf_memory
+                .is_some_and(|memory| Some(memory) != unlock.kdf.memory)
+            || self
+                .kdf_parallelism
+                .is_some_and(|parallelism| Some(parallelism) != unlock.kdf.parallelism)
+        {
+            return Err(AppError::bad_request(
+                "Conflicting or incomplete credential request formats",
+            ));
+        }
+        if unlock
+            .contained_key_id
+            .as_ref()
+            .is_some_and(|id| user.user_key_id.as_ref() != Some(id))
+        {
+            return Err(AppError::bad_request(
+                "Contained key id must match the current user key id",
+            ));
+        }
+        Ok((
+            authentication.master_password_authentication_hash.as_str(),
+            unlock.master_key_wrapped_user_key.as_str(),
+            unlock.kdf.clone(),
+        ))
+    }
+
+    fn resolve_legacy(
+        &self,
+        user: &UserRow,
+        changing_kdf: bool,
+    ) -> AppResult<(&str, &str, KdfParams)> {
+        let hash = self
+            .new_master_password_hash
+            .as_deref()
+            .ok_or_else(|| AppError::bad_request("Missing newMasterPasswordHash"))?;
+        let key = self
+            .key
+            .as_deref()
+            .ok_or_else(|| AppError::bad_request("Missing encrypted user key"))?;
+        let kdf = self
+            .kdf
+            .or_else(|| (!changing_kdf).then_some(user.kdf_type))
+            .ok_or_else(|| AppError::bad_request("Missing KDF type"))?;
+        let iterations = self
+            .kdf_iterations
+            .or_else(|| (!changing_kdf).then_some(user.kdf_iterations))
+            .ok_or_else(|| AppError::bad_request("Missing KDF iterations"))?;
+        Ok((hash, key, KdfParams {
+            kdf_type: kdf,
+            iterations,
+            memory: if kdf == KdfKind::Argon2id as i32 {
+                self.kdf_memory
+                    .or_else(|| (!changing_kdf).then_some(user.kdf_memory).flatten())
+            } else {
+                None
+            },
+            parallelism: if kdf == KdfKind::Argon2id as i32 {
+                self.kdf_parallelism
+                    .or_else(|| (!changing_kdf).then_some(user.kdf_parallelism).flatten())
+            } else {
+                None
+            },
+        }))
     }
 }
 
@@ -714,8 +716,8 @@ mod tests {
     fn initial_password_current_fields_are_paired_without_requiring_keys() {
         let value = json!({"masterPasswordAuthentication":{"hash":"client-hash","salt":"owner@example.test","kdf":{"kdfType":0,"iterations":600_000}},
             "masterPasswordUnlock":{"key":"2.new-wrapper","salt":"owner@example.test","kdf":{"kdfType":0,"iterations":600_000}}});
-        let request: SetPasswordRequest = serde_json::from_value(value.clone())
-            .expect("valid account request fixture");
+        let request: SetPasswordRequest =
+            serde_json::from_value(value.clone()).expect("valid account request fixture");
         assert!(
             request
                 .resolve(&user())
@@ -725,8 +727,8 @@ mod tests {
         );
         let mut mixed = value;
         mixed["masterPasswordHash"] = json!("legacy-fallback");
-        let request: SetPasswordRequest = serde_json::from_value(mixed)
-            .expect("valid account request fixture");
+        let request: SetPasswordRequest =
+            serde_json::from_value(mixed).expect("valid account request fixture");
         assert!(request.resolve(&user()).is_err());
     }
 
@@ -739,9 +741,8 @@ mod tests {
     #[test]
     fn current_only_password_and_kdf_requests_need_no_flat_placeholders() {
         let user = user();
-        let request: ChangeKdfRequest =
-            serde_json::from_value(current_credential_change())
-                .expect("valid account request fixture");
+        let request: ChangeKdfRequest = serde_json::from_value(current_credential_change())
+            .expect("valid account request fixture");
         assert_eq!(
             request
                 .resolve(&user)
@@ -750,9 +751,10 @@ mod tests {
             "new-hash"
         );
         let mut value = current_credential_change();
-        value["userAsymmetricKeys"] = json!({"publicKey":"public","encryptedPrivateKey":"2.rewrapped-private"});
-        let request: ChangePasswordRequest = serde_json::from_value(value)
-            .expect("valid account request fixture");
+        value["userAsymmetricKeys"] =
+            json!({"publicKey":"public","encryptedPrivateKey":"2.rewrapped-private"});
+        let request: ChangePasswordRequest =
+            serde_json::from_value(value).expect("valid account request fixture");
         assert_eq!(
             request
                 .resolve(&user)
@@ -771,10 +773,10 @@ mod tests {
 
     #[test]
     fn flat_password_and_kdf_requests_preserve_their_protocol() {
-        let mut value = json!({"masterPasswordHash":"hash","newMasterPasswordHash":"next","key":"2.wrapper"});
+        let mut value =
+            json!({"masterPasswordHash":"hash","newMasterPasswordHash":"next","key":"2.wrapper"});
         let request: ChangePasswordRequest =
-            serde_json::from_value(value.clone())
-                .expect("valid account request fixture");
+            serde_json::from_value(value.clone()).expect("valid account request fixture");
         assert_eq!(
             request
                 .resolve(&user())
@@ -785,8 +787,8 @@ mod tests {
         );
         value["kdf"] = json!(0);
         value["kdfIterations"] = json!(700_000);
-        let request: ChangeKdfRequest = serde_json::from_value(value)
-            .expect("valid account request fixture");
+        let request: ChangeKdfRequest =
+            serde_json::from_value(value).expect("valid account request fixture");
         assert_eq!(
             request
                 .resolve(&user())
@@ -815,10 +817,8 @@ mod tests {
     }
 
     #[test]
-    fn current_registration_normalizes_to_existing_model()
-    -> Result<(), serde_json::Error> {
-        let request: RegisterRequest =
-            serde_json::from_value(current_registration())?;
+    fn current_registration_normalizes_to_existing_model() -> Result<(), serde_json::Error> {
+        let request: RegisterRequest = serde_json::from_value(current_registration())?;
         assert_eq!(request.email, "user@example.com");
         assert_eq!(request.master_password_hash, "hash");
         assert_eq!(request.user_symmetric_key, "wrapped-key");
@@ -837,8 +837,7 @@ mod tests {
     }
 
     #[test]
-    fn legacy_registration_remains_supported() -> Result<(), serde_json::Error>
-    {
+    fn legacy_registration_remains_supported() -> Result<(), serde_json::Error> {
         let request: RegisterRequest = serde_json::from_value(json!({
             "email": "User@Example.com", "masterPasswordHash": "hash",
             "key": "wrapped-key", "kdf": 0, "kdfIterations": 600_000,

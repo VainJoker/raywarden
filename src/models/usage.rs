@@ -1,18 +1,35 @@
-use serde::Deserialize;
-use worker::{
-    D1Database,
-    query,
-};
+use serde::{Deserialize, Serialize};
+use worker::{D1Database, query};
 
-use crate::{
-    errors::AppResult,
-    infra::db,
-};
+use crate::{errors::AppResult, infra::db};
 
 #[derive(Deserialize)]
 pub struct UsageRow {
-    pub name:  String,
+    pub name: UsageCategory,
     pub bytes: i64,
+}
+
+#[derive(Clone, Copy, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum UsageCategory {
+    Ciphers,
+    Folders,
+    Sends,
+    Devices,
+    TwoFactor,
+    Account,
+    AttachmentFiles,
+    PendingAttachmentFiles,
+    SendFiles,
+}
+
+impl UsageCategory {
+    pub const fn is_file(self) -> bool {
+        matches!(
+            self,
+            Self::AttachmentFiles | Self::PendingAttachmentFiles | Self::SendFiles
+        )
+    }
 }
 
 pub async fn for_user(db: &D1Database, user: &str) -> AppResult<Vec<UsageRow>> {

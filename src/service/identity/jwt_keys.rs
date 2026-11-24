@@ -1,40 +1,20 @@
 //! Signing-key loading, envelope encryption and first-use policy.
 use aes_gcm::{
-    Aes256Gcm,
-    KeyInit,
-    Nonce,
-    aead::{
-        Aead,
-        Payload,
-    },
+    Aes256Gcm, KeyInit, Nonce,
+    aead::{Aead, Payload},
 };
-use base64::{
-    Engine,
-    engine::general_purpose::URL_SAFE_NO_PAD,
-};
-use worker::{
-    D1Database,
-    Env,
-};
+use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
+use worker::{D1Database, Env};
 
 use crate::{
-    app::JwtKeys,
-    errors::{
-        AppError,
-        AppResult,
-    },
-    infra::env::string_binding,
-    models::identity::jwt_keys::{
-        JwtKeysRow,
-        JwtKeysStore,
-    },
+    errors::{AppError, AppResult, ConfigError},
+    infra::config::string_binding,
+    models::identity::jwt_keys::{self, JwtKeysRow},
 };
 
 const CIPHERTEXT_PREFIX: &str = "v1.";
-const ACCESS_CONTEXT: &[u8] =
-    b"raywarden/jwt-key-encryption/v1/global/access_secret";
-const REFRESH_CONTEXT: &[u8] =
-    b"raywarden/jwt-key-encryption/v1/global/refresh_secret";
+const ACCESS_CONTEXT: &[u8] = b"raywarden/jwt-key-encryption/v1/global/access_secret";
+const REFRESH_CONTEXT: &[u8] = b"raywarden/jwt-key-encryption/v1/global/refresh_secret";
 
 struct KeyEncryptionKey([u8; 32]);
 
@@ -49,14 +29,8 @@ impl KeyEncryptionKey {
         Ok(Self(bytes.try_into().map_err(AppError::internal_error)?))
     }
 
-    fn seal_with_nonce(
-        &self,
-        value: &str,
-        context: &[u8],
-        nonce: [u8; 12],
-    ) -> AppResult<String> {
-        let cipher = Aes256Gcm::new_from_slice(&self.0)
-            .map_err(AppError::internal_error)?;
+    fn seal_with_nonce(&self, value: &str, context: &[u8], nonce: [u8; 12]) -> AppResult<String> {
+        let cipher = Aes256Gcm::new_from_slice(&self.0).map_err(AppError::internal_error)?;
         let encrypted = cipher
             .encrypt(&Nonce::from(nonce), Payload {
                 msg: value.as_bytes(),
@@ -87,10 +61,8 @@ impl KeyEncryptionKey {
         if packed.len() < 28 || URL_SAFE_NO_PAD.encode(&packed) != encoded {
             return Err(AppError::Internal);
         }
-        let nonce: [u8; 12] =
-            packed[..12].try_into().map_err(AppError::internal_error)?;
-        let cipher = Aes256Gcm::new_from_slice(&self.0)
-            .map_err(AppError::internal_error)?;
+        let nonce: [u8; 12] = packed[..12].try_into().map_err(AppError::internal_error)?;
+        let cipher = Aes256Gcm::new_from_slice(&self.0).map_err(AppError::internal_error)?;
         let plaintext = cipher
             .decrypt(&Nonce::from(nonce), Payload {
                 msg: &packed[12..],
@@ -102,36 +74,42 @@ impl KeyEncryptionKey {
 
     fn wrap(&self, keys: &JwtKeys) -> AppResult<JwtKeysRow> {
         Ok(JwtKeysRow {
-            access_secret:  self.seal(&keys.access_secret, ACCESS_CONTEXT)?,
+            access_secret: self.seal(&keys.access_secret, ACCESS_CONTEXT)?,
             refresh_secret: self.seal(&keys.refresh_secret, REFRESH_CONTEXT)?,
         })
     }
 
     fn unwrap(&self, row: &JwtKeysRow) -> AppResult<JwtKeys> {
-        JwtKeys {
-            access_secret:  self.open(&row.access_secret, ACCESS_CONTEXT)?,
+        let keys = JwtKeys {
+            access_secret: self.open(&row.access_secret, ACCESS_CONTEXT)?,
             refresh_secret: self.open(&row.refresh_secret, REFRESH_CONTEXT)?,
-        }
-        .validate()
+        };
+        validate_stored_keys(&keys.access_secret, &keys.refresh_secret)?;
+        Ok(keys)
     }
+}
+
+pub(crate) struct JwtKeys {
+    pub access_secret: String,
+    pub refresh_secret: String,
 }
 
 impl JwtKeys {
     fn into_row(self) -> JwtKeysRow {
         JwtKeysRow {
-            access_secret:  self.access_secret,
+            access_secret: self.access_secret,
             refresh_secret: self.refresh_secret,
         }
     }
+}
 
-    fn validate(self) -> AppResult<Self> {
-        if self.access_secret.trim().is_empty() ||
-            self.refresh_secret.trim().is_empty()
-        {
-            return Err(AppError::bad_request("Stored JWT keys are empty"));
-        }
-        Ok(self)
+fn validate_stored_keys(access: &str, refresh: &str) -> AppResult<()> {
+    if access.trim().is_empty() || refresh.trim().is_empty() {
+        return Err(AppError::InternalFailure(
+            "Stored JWT keys are empty".into(),
+        ));
     }
+    Ok(())
 }
 
 enum StoredJwtKeys {
@@ -141,6 +119,7 @@ enum StoredJwtKeys {
 
 impl StoredJwtKeys {
     fn parse(row: JwtKeysRow) -> AppResult<Self> {
+        validate_stored_keys(&row.access_secret, &row.refresh_secret)?;
         let access = row.access_secret.starts_with(CIPHERTEXT_PREFIX);
         let refresh = row.refresh_secret.starts_with(CIPHERTEXT_PREFIX);
         if access != refresh {
@@ -152,49 +131,36 @@ impl StoredJwtKeys {
         // Reserve version-looking prefixes so unsupported envelopes cannot
         // be mistaken for legacy plaintext and encrypted a second time.
         for value in [&row.access_secret, &row.refresh_secret] {
-            if let Some((version, _)) = value.split_once('.') &&
-                version.strip_prefix('v').is_some_and(|digits| {
-                    !digits.is_empty() &&
-                        digits.bytes().all(|byte| byte.is_ascii_digit())
+            if let Some((version, _)) = value.split_once('.')
+                && version.strip_prefix('v').is_some_and(|digits| {
+                    !digits.is_empty() && digits.bytes().all(|byte| byte.is_ascii_digit())
                 })
             {
                 return Err(AppError::Internal);
             }
         }
-        Ok(Self::Legacy(
-            JwtKeys {
-                access_secret:  row.access_secret,
-                refresh_secret: row.refresh_secret,
-            }
-            .validate()?,
-        ))
+        Ok(Self::Legacy(JwtKeys {
+            access_secret: row.access_secret,
+            refresh_secret: row.refresh_secret,
+        }))
     }
 }
 
 fn random_secret() -> AppResult<String> {
     let mut bytes = [0; 64];
-    getrandom::fill(&mut bytes).map_err(|error| {
-        AppError::internal_with_context(
-            "auth",
-            "JWT key generation failed",
-            error,
-        )
-    })?;
+    getrandom::fill(&mut bytes)
+        .map_err(|error| AppError::internal_with_context("JWT key generation failed", error))?;
     Ok(URL_SAFE_NO_PAD.encode(bytes))
 }
 
-fn initial_keys(
-    access: Option<String>,
-    refresh: Option<String>,
-) -> AppResult<JwtKeys> {
+fn initial_keys(access: Option<String>, refresh: Option<String>) -> AppResult<JwtKeys> {
     match (access, refresh) {
         (None, None) => Ok(JwtKeys {
-            access_secret:  random_secret()?,
+            access_secret: random_secret()?,
             refresh_secret: random_secret()?,
         }),
         (Some(access_secret), Some(refresh_secret))
-            if !access_secret.trim().is_empty() &&
-                !refresh_secret.trim().is_empty() =>
+            if !access_secret.trim().is_empty() && !refresh_secret.trim().is_empty() =>
         {
             // Preserve the original bytes: the access key also wraps API keys.
             Ok(JwtKeys {
@@ -202,10 +168,12 @@ fn initial_keys(
                 refresh_secret,
             })
         }
-        _ => Err(AppError::bad_request(
-            "First JWT initialization requires both legacy JWT secrets or \
-             neither",
-        )),
+        _ => Err(ConfigError::Invalid(
+            "First JWT initialization requires both nonblank legacy JWT \
+             secrets or neither"
+                .into(),
+        )
+        .into()),
     }
 }
 
@@ -216,40 +184,41 @@ pub(crate) async fn load(env: &Env, db: &D1Database) -> AppResult<JwtKeys> {
     // Neither a database error nor a missing/wrong external key permits a
     // plaintext or random-key fallback.
     let key = KeyEncryptionKey::parse(
-        &string_binding(env, "KEY_ENCRYPTION_KEY")?
-            .ok_or(AppError::Internal)?,
+        &string_binding(env, "KEY_ENCRYPTION_KEY")?.ok_or(AppError::Internal)?,
     )?;
-    if let Some(row) = JwtKeysStore::find(db).await? {
+    if let Some(row) = jwt_keys::find(db).await? {
         return match StoredJwtKeys::parse(row)? {
             StoredJwtKeys::Wrapped(row) => key.unwrap(&row),
             StoredJwtKeys::Legacy(keys) => {
                 let wrapped = key.wrap(&keys)?;
-                JwtKeysStore::wrap_if_current(db, keys.into_row(), wrapped)
-                    .await?;
+                jwt_keys::wrap_if_current(db, keys.into_row(), wrapped).await?;
                 // Read the winner of the guarded write, which may be another
                 // Worker. It must already be encrypted.
-                let row =
-                    JwtKeysStore::find(db).await?.ok_or(AppError::Internal)?;
+                let row = jwt_keys::find(db).await?.ok_or(AppError::Internal)?;
                 key.unwrap(&row)
             }
         };
     }
-    let access = string_binding(env, "JWT_SECRET")?;
-    let refresh = string_binding(env, "JWT_REFRESH_SECRET")?;
+    let legacy_key = |name| {
+        string_binding(env, name)
+            .map_err(|_error| ConfigError::Invalid(format!("{name} must be a readable string")))
+    };
+    let access = legacy_key("JWT_SECRET")?;
+    let refresh = legacy_key("JWT_REFRESH_SECRET")?;
     let importing_legacy = access.is_some() && refresh.is_some();
     let wrapped = key.wrap(&initial_keys(access, refresh)?)?;
-    JwtKeysStore::initialize_if_allowed(db, wrapped, importing_legacy).await?;
+    jwt_keys::initialize_if_allowed(db, wrapped, importing_legacy).await?;
     // A concurrent initializer may have won; never use an unpersisted
     // candidate.
-    let row = JwtKeysStore::find(db).await?.ok_or_else(|| {
+    let row = jwt_keys::find(db).await?.ok_or_else(|| {
         // Generating replacement keys here would invalidate persisted API
         // key ciphertext as well as tokens after a partial database
         // restore.
-        log::error!(
+        AppError::InternalFailure(
             "JWT keys are missing from a populated database; restore the key \
              row or import both original legacy secrets"
-        );
-        AppError::Internal
+                .into(),
+        )
     })?;
     key.unwrap(&row)
 }
@@ -278,18 +247,16 @@ mod tests {
 
     #[test]
     fn wrapping_preserves_original_utf8_bytes_with_independent_nonces() {
-        let key = KeyEncryptionKey::parse(TEST_KEY)
-            .expect("test fixture should be valid");
+        let key = KeyEncryptionKey::parse(TEST_KEY).expect("test fixture should be valid");
         let original = JwtKeys {
-            access_secret:  " access \0bytes-é ".into(),
+            access_secret: " access \0bytes-é ".into(),
             refresh_secret: " refresh \r\n ".into(),
         };
         let first = key.wrap(&original).expect("test fixture should be valid");
         let second = key.wrap(&original).expect("test fixture should be valid");
         assert_ne!(first.access_secret, second.access_secret);
         assert_ne!(first.refresh_secret, second.refresh_secret);
-        let Ok(StoredJwtKeys::Wrapped(first)) = StoredJwtKeys::parse(first)
-        else {
+        let Ok(StoredJwtKeys::Wrapped(first)) = StoredJwtKeys::parse(first) else {
             panic!("wrapped keys should be recognized");
         };
         let opened = key.unwrap(&first).expect("test fixture should be valid");
@@ -303,8 +270,7 @@ mod tests {
 
     #[test]
     fn wrapping_rejects_wrong_key_tampering_truncation_and_wrong_context() {
-        let key = KeyEncryptionKey::parse(TEST_KEY)
-            .expect("test fixture should be valid");
+        let key = KeyEncryptionKey::parse(TEST_KEY).expect("test fixture should be valid");
         let value = key
             .seal_with_nonce(" original access ", ACCESS_CONTEXT, [7; 12])
             .expect("test fixture should be valid");
@@ -356,7 +322,7 @@ mod tests {
         ] {
             assert!(
                 StoredJwtKeys::parse(JwtKeysRow {
-                    access_secret:  access.into(),
+                    access_secret: access.into(),
                     refresh_secret: refresh.into(),
                 })
                 .is_err()
@@ -366,8 +332,7 @@ mod tests {
 
     #[test]
     fn missing_legacy_keys_generate_two_independent_secrets() {
-        let keys =
-            initial_keys(None, None).expect("test fixture should be valid");
+        let keys = initial_keys(None, None).expect("test fixture should be valid");
         assert_eq!(
             URL_SAFE_NO_PAD
                 .decode(&keys.access_secret)
@@ -386,11 +351,9 @@ mod tests {
     }
 
     #[test]
-    fn legacy_bootstrap_preserves_exact_bytes_and_rejects_partial_configuration()
-     {
-        let keys =
-            initial_keys(Some(" access ".into()), Some(" refresh ".into()))
-                .expect("test fixture should be valid");
+    fn legacy_bootstrap_preserves_exact_bytes_and_rejects_partial_configuration() {
+        let keys = initial_keys(Some(" access ".into()), Some(" refresh ".into()))
+            .expect("test fixture should be valid");
         assert_eq!(keys.access_secret, " access ");
         assert_eq!(keys.refresh_secret, " refresh ");
         for pair in [
@@ -399,15 +362,27 @@ mod tests {
             (Some(String::new()), Some("two".into())),
             (Some("one".into()), Some(" ".into())),
         ] {
-            assert!(initial_keys(pair.0, pair.1).is_err());
+            assert!(matches!(
+                initial_keys(pair.0, pair.1),
+                Err(AppError::Config(ConfigError::Invalid(_)))
+            ));
         }
-        assert!(
-            JwtKeys {
-                access_secret:  " ".into(),
-                refresh_secret: "valid".into(),
-            }
-            .validate()
-            .is_err()
-        );
+    }
+
+    #[test]
+    fn a_decrypted_blank_jwt_key_is_an_internal_failure() {
+        let key = KeyEncryptionKey::parse(TEST_KEY).expect("valid fixture key");
+        let row = JwtKeysRow {
+            access_secret: key
+                .seal_with_nonce(" ", ACCESS_CONTEXT, [1; 12])
+                .expect("valid fixture envelope"),
+            refresh_secret: key
+                .seal_with_nonce("refresh", REFRESH_CONTEXT, [2; 12])
+                .expect("valid fixture envelope"),
+        };
+        assert!(matches!(
+            key.unwrap(&row),
+            Err(AppError::InternalFailure(_))
+        ));
     }
 }

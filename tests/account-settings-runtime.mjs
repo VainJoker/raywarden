@@ -1,14 +1,9 @@
+import { bearerJsonHeaders, equal, expectStatus as expect, ok } from "./runtime-assertions.mjs";
+import { captureNotifications } from "./runtime-fixture.mjs";
+
 /** API-key, domain-setting and logical storage contracts in real Worker WASM. */
 export async function runAccountSettingsChecks({ fixture, check, sql, accessToken, USER, CIPHER, SEND }) {
-  const equal = (actual, expected, label = "value") => {
-    if (actual !== expected) throw new Error(`${label}: expected ${expected}, received ${actual}`);
-  };
-  const ok = (value, label) => { if (!value) throw new Error(label); };
-  const expect = async (response, code) => {
-    if (response.status !== code) throw new Error(`Expected HTTP ${code}, received ${response.status}: ${await response.text()}`);
-    return response;
-  };
-  const owner = async () => ({ Authorization: `Bearer ${await accessToken()}`, "Content-Type": "application/json" });
+  const owner = async () => bearerJsonHeaders(await accessToken());
   const api = async (f, rotate = false, hash = "hash") => f.fetch(`/api/accounts/${rotate ? "rotate-api-key" : "api-key"}`, {
     method: "POST", headers: await owner(), body: JSON.stringify({ masterPasswordHash: hash }),
   });
@@ -28,6 +23,69 @@ export async function runAccountSettingsChecks({ fixture, check, sql, accessToke
     equal(waiting, 2, "both verified API requests must reach the conditional write");
     return result;
   }
+
+  await check("profile and avatar writes wait for the two-factor status read", async () => {
+    for (const [action, field, column, value] of [
+      ["profile", "name", "name", "Updated name"],
+      ["avatar", "avatarColor", "avatar_color", "#abcdef"],
+    ]) {
+      const f = fixture(), before = state();
+      const request = async () => f.fetch(`/api/accounts/${action}`, {
+        method: "PUT", headers: await owner(), body: JSON.stringify({ [field]: value }),
+      });
+      const execute = f.db.execute;
+      let reads = 0;
+      f.db.execute = function (query, params) {
+        if (query.includes("FROM two_factors")) {
+          reads++;
+          throw new Error("injected profile two-factor query failure");
+        }
+        return execute.call(this, query, params);
+      };
+
+      await expect(await request(), 500);
+      equal(reads, 1, `${action} two-factor reads`);
+      unchanged(before);
+
+      f.db.execute = execute;
+      const response = await expect(await request(), 200);
+      equal((await response.json())[field], value);
+      equal(f.db.row("users", USER)[column], value);
+    }
+  });
+
+  await check("profile and avatar writes advance a sync revision ahead of the Worker clock", async () => {
+    const f = fixture();
+    let revision = "2099-01-01T00:00:00.000Z";
+    sql.exec("UPDATE users SET updated_at=? WHERE id=?", revision, USER);
+    for (const [path, body] of [
+      ["/api/accounts/profile", { name: "Profile" }],
+      ["/api/accounts/avatar", { avatarColor: "#abcdef" }],
+    ]) {
+      await expect(await f.fetch(path, { method: "PUT", headers: await owner(), body: JSON.stringify(body) }), 200);
+      const updated = f.db.row("users", USER).updated_at;
+      equal(Date.parse(updated), Date.parse(revision) + 1);
+      revision = updated;
+    }
+
+    // Revoking the device session between Claims validation and the write batch rejects with 409.
+    for (const [path, method, body] of [
+      ["/api/accounts/profile", "PUT", { name: "Revoked" }],
+      ["/api/accounts/avatar", "PUT", { avatarColor: "#112233" }],
+      ["/api/accounts/key-management/user-key-id", "POST", { userKeyId: "0123456789abcdef0123456789abcdef" }],
+    ]) {
+      const fRace = fixture();
+      const batch = fRace.db.batch.bind(fRace.db);
+      let expected;
+      fRace.db.batch = async statements => {
+        sql.exec("UPDATE devices SET session_token='revoked' WHERE user_id=?", USER);
+        expected = state();
+        return batch(statements);
+      };
+      await expect(await fRace.fetch(path, { method, headers: await owner(), body: JSON.stringify(body) }), 409);
+      unchanged(expected);
+    }
+  });
 
   await check("API-key current reads reuse the persisted value without writes and reject incorrect passwords", async () => {
     const f = fixture(), first = await apiJson(f), before = state();
@@ -56,21 +114,17 @@ export async function runAccountSettingsChecks({ fixture, check, sql, accessToke
   await check("API-key rotation rejects changed credentials, envelope, nonce, stamp and prior key before revocation", async () => {
     for (const mode of ["stamp", "nonce", "hash", "salt", "cost", "envelope", "key"]) {
       const f = fixture(); await apiJson(f);
-      const batch = f.db.batch.bind(f.db); let reached = false, expected;
-      f.db.batch = async statements => {
-        if (!reached && isApi(statements)) {
-          reached = true;
-          if (mode === "nonce") sql.exec("UPDATE devices SET session_token='new-session' WHERE user_id=?", USER);
-          else if (mode === "key") sql.exec("UPDATE user_api_keys SET key_hash='concurrent-api-hash' WHERE user_id=?", USER);
-          else {
-            const columns = { stamp: "security_stamp", hash: "master_password_hash", salt: "password_salt", cost: "password_iterations", envelope: "key" };
-            sql.exec(`UPDATE users SET ${columns[mode]}=? WHERE id=?`, mode === "cost" ? 1200000 : `new-${mode}`, USER);
-          }
-          expected = state();
+      let expected;
+      const reached = f.db.beforeNextBatch(isApi, () => {
+        if (mode === "nonce") sql.exec("UPDATE devices SET session_token='new-session' WHERE user_id=?", USER);
+        else if (mode === "key") sql.exec("UPDATE user_api_keys SET key_hash='concurrent-api-hash' WHERE user_id=?", USER);
+        else {
+          const columns = { stamp: "security_stamp", hash: "master_password_hash", salt: "password_salt", cost: "password_iterations", envelope: "key" };
+          sql.exec(`UPDATE users SET ${columns[mode]}=? WHERE id=?`, mode === "cost" ? 1200000 : `new-${mode}`, USER);
         }
-        return batch(statements);
-      };
-      await expect(await api(f, true), 409); ok(reached, "API rotation race missed the production batch"); unchanged(expected);
+        expected = state();
+      });
+      await expect(await api(f, true), 409); ok(reached(), "API rotation race missed the production batch"); unchanged(expected);
     }
   });
 
@@ -146,14 +200,9 @@ export async function runAccountSettingsChecks({ fixture, check, sql, accessToke
     await expect(await f.fetch("/api/accounts/profile", { headers }), 200);
   });
 
-  class DurableObjectNamespace {
-    constructor(captured) { this.captured = captured; }
-    idFromName(name) { return { name }; }
-    get(id) { return { fetch: async request => {
-      equal(id.name, "global"); this.captured.push(await request.json()); return new Response(null, { status: 204 });
-    } }; }
-  }
-  const domains = async (f, body, method = "POST") => f.fetch("/api/settings/domains", { method, headers: await owner(), body: JSON.stringify(body) });
+  const domains = async (f, body, method = "POST", authorized = true) => f.fetch("/api/settings/domains", {
+    method, headers: authorized ? await owner() : { "Content-Type": "application/json" }, body: JSON.stringify(body),
+  });
   const settings = () => sql.exec("SELECT equivalent_domains,excluded_globals,updated_at FROM users WHERE id=?", USER).one();
   const payload = { equivalentDomains: [["one.example", "two.example"]], excludedGlobalEquivalentDomains: [1, 2] };
   const isDomains = statements => statements.some(value => value.sql.startsWith("UPDATE users SET equivalent_domains"));
@@ -165,15 +214,20 @@ export async function runAccountSettingsChecks({ fixture, check, sql, accessToke
     throw new Error("Notification frame has no Type entry");
   }
 
-  await check("domain POST and PUT advance the cursor and each publish exactly one type-10 settings event", async () => {
-    const f = fixture(), captured = []; f.env.NOTIFY_DO = new DurableObjectNamespace(captured);
+  await check("domain POST and PUT require a session, advance the cursor and notify once per write", async () => {
+    const f = fixture(), captured = captureNotifications(f);
     sql.exec("UPDATE users SET updated_at='2099-01-01T00:00:00.000Z' WHERE id=?", USER);
     const other = JSON.stringify(sql.exec("SELECT * FROM users WHERE id='other-owner'").one());
     let previous = settings().updated_at;
     for (const method of ["POST", "PUT"]) {
+      const notifications = captured.length;
       await expect(await domains(f, payload, method), 200);
       const current = settings(); ok(Date.parse(current.updated_at) > Date.parse(previous), "domain cursor did not increase"); previous = current.updated_at;
       equal(current.equivalent_domains, JSON.stringify(payload.equivalentDomains)); equal(current.excluded_globals, JSON.stringify(payload.excludedGlobalEquivalentDomains));
+      equal(captured.length, notifications + 1);
+      await expect(await domains(f, {}, method, false), 401);
+      equal(JSON.stringify(settings()), JSON.stringify(current));
+      equal(captured.length, notifications + 1);
     }
     equal(captured.length, 2); for (const event of captured) { equal(notificationType(event), 10); equal(event.selector.user_id, USER); }
     equal(JSON.stringify(sql.exec("SELECT * FROM users WHERE id='other-owner'").one()), other);
@@ -199,23 +253,36 @@ export async function runAccountSettingsChecks({ fixture, check, sql, accessToke
     }
   });
 
-  await check("domain mutations reject changed sessions or old settings and roll back late cursor failures", async () => {
-    for (const mode of ["nonce", "stamp", "settings", "cursor-failure"]) {
-      const f = fixture(), captured = []; f.env.NOTIFY_DO = new DurableObjectNamespace(captured);
+  await check("invalid persisted equivalent domains leave settings and sync readable", async () => {
+    const f = fixture(), headers = await owner();
+    sql.exec("INSERT INTO global_domains_cache VALUES(1, 4000000000)");
+    for (const invalid of ["[", '{"domains":[]}', '[1]', '[[false]]']) {
+      sql.exec("UPDATE users SET equivalent_domains=? WHERE id=?", invalid, USER);
+      const settings = await (await expect(await f.fetch("/api/settings/domains", { headers }), 200)).json();
+      const sync = await (await expect(await f.fetch("/api/sync", { headers }), 200)).json();
+      equal(JSON.stringify(settings.equivalentDomains), "[]");
+      equal(JSON.stringify(sync.domains.equivalentDomains), "[]");
+      equal(sql.exec("SELECT equivalent_domains FROM users WHERE id=?", USER).one().equivalent_domains, invalid);
+    }
+    await expect(await domains(f, payload), 200);
+    const corrected = await (await expect(await f.fetch("/api/settings/domains", { headers }), 200)).json();
+    equal(JSON.stringify(corrected.equivalentDomains), JSON.stringify(payload.equivalentDomains));
+  });
+
+  await check("domain mutations reject stale sessions, keys or settings and roll back late cursor failures", async () => {
+    for (const [mode, status] of [["nonce", 401], ["stamp", 401], ["key", 400], ["settings", 400], ["cursor-failure", 500]]) {
+      const f = fixture(), captured = captureNotifications(f);
       if (mode === "cursor-failure") sql.exec("CREATE TRIGGER misc_domain_failure BEFORE UPDATE OF updated_at ON users BEGIN SELECT RAISE(ABORT,'injected domain cursor failure'); END");
-      const batch = f.db.batch.bind(f.db); let reached = false, expected;
-      f.db.batch = async statements => {
-        if (!reached && isDomains(statements)) {
-          reached = true;
-          if (mode === "nonce") sql.exec("UPDATE devices SET session_token='new-session' WHERE user_id=?", USER);
-          else if (mode === "stamp") sql.exec("UPDATE users SET security_stamp='new-stamp' WHERE id=?", USER);
-          else if (mode === "settings") sql.exec("UPDATE users SET equivalent_domains='[[\"concurrent.example\"]]' WHERE id=?", USER);
-          expected = state();
-        }
-        return batch(statements);
-      };
-      await expect(await domains(f, payload), mode === "cursor-failure" ? 500 : mode === "settings" ? 400 : 401);
-      ok(reached, "domain race missed the actual batch"); unchanged(expected); equal(captured.length, 0);
+      let expected;
+      const reached = f.db.beforeNextBatch(isDomains, () => {
+        if (mode === "nonce") sql.exec("UPDATE devices SET session_token='new-session' WHERE user_id=?", USER);
+        else if (mode === "stamp") sql.exec("UPDATE users SET security_stamp='new-stamp' WHERE id=?", USER);
+        else if (mode === "key") sql.exec("UPDATE users SET key='new-wrapped-key' WHERE id=?", USER);
+        else if (mode === "settings") sql.exec("UPDATE users SET equivalent_domains='[[\"concurrent.example\"]]' WHERE id=?", USER);
+        expected = state();
+      });
+      await expect(await domains(f, payload), status);
+      ok(reached(), "domain race missed the actual batch"); unchanged(expected); equal(captured.length, 0);
     }
   });
 

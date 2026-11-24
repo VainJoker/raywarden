@@ -1,6 +1,4 @@
-function equal(actual, expected, label = "value") {
-  if (actual !== expected) throw new Error(`${label}: expected ${expected}, received ${actual}`);
-}
+import { equal, expectJson, ok } from "./runtime-assertions.mjs";
 
 export async function runConfigurationCompatibility({ fixture, check }) {
   const origin = "https://client.test";
@@ -9,32 +7,31 @@ export async function runConfigurationCompatibility({ fixture, check }) {
     equal(response.headers.get("Access-Control-Allow-Credentials"), null, "cookie credentials");
   }
 
-  await check("DOMAIN is a canonical origin and rejects credentials, paths and insecure public addresses", async () => {
+  await check("Worker config serves a canonical DOMAIN and redacts rejected configuration", async () => {
+    // The Rust parser tests cover the full set of accepted and rejected origins.
+    const f = fixture();
+    f.env.DOMAIN = " HTTPS://VAULT.TEST:443/ ";
+    const config = await expectJson(await f.fetch("/api/config"), 200);
+    equal(config.environment.vault, "https://vault.test");
+
     for (const value of [
-      "https://user:private-password@vault.test", "https://vault.test/api", "https://vault.test?token=private-token",
-      "https://vault.test#fragment", "http://vault.test", "https://vault.test\\path", "https://vault. test",
+      "https://user:private-password@vault.test",
+      "https://vault.test?token=private-token",
     ]) {
-      const f = fixture();
       f.env.DOMAIN = value;
       const response = await f.fetch("/api/config");
       equal(response.status, 500);
       const body = await response.text();
-      if (body.includes("private-password") || body.includes("private-token")) throw new Error("invalid DOMAIN exposed configuration credentials");
-    }
-    for (const [value, expected] of [[" HTTPS://VAULT.TEST:443/ ", "https://vault.test"], ["http://localhost:8787/", "http://localhost:8787"]]) {
-      const f = fixture();
-      f.env.DOMAIN = value;
-      const response = await f.fetch("/api/config");
-      equal(response.status, 200);
-      equal((await response.json()).environment.vault, expected);
+      ok(!body.includes("private-password") && !body.includes("private-token"), "invalid DOMAIN exposed configuration credentials");
     }
   });
 
   await check("CORS applies the same policy to routes, preflight and errors", async () => {
     for (const [origins, expected] of [
-      [undefined, "*"], ["", "*"], ["*", "*"], [origin, origin],
+      [undefined, "*"], ["", "*"], ["  ", "*"], ["*", "*"], [origin, origin],
       ["https://other.test", null], ["not-an-origin", null],
       ["https://user:pass@client.test", null], [",,,", null],
+      [null, null], [true, null], [["*"], null], [{ origin }, null],
     ]) {
       const f = fixture();
       if (origins === undefined) delete f.env.CORS_ALLOWED_ORIGINS;
@@ -51,6 +48,28 @@ export async function runConfigurationCompatibility({ fixture, check }) {
       const failure = await f.fetch("/api/alive", { headers: { Origin: origin } });
       equal(failure.status, 500); headers(failure, expected);
     }
+  });
+
+  await check("readiness reports the verified release while public reads need no signing keys", async () => {
+    const f = fixture();
+    const releaseId = "a1".repeat(32);
+    f.env.RAYWARDEN_RELEASE_ID = releaseId;
+    const ready = await f.fetch("/api/alive");
+    equal(ready.status, 200);
+    equal(ready.headers.get("X-Raywarden-Release-Id"), releaseId);
+    equal(ready.headers.get("Cache-Control"), "private, no-store");
+    if (typeof await ready.json() !== "string") throw new Error("readiness timestamp changed shape");
+    f.env.RAYWARDEN_RELEASE_ID = releaseId.toUpperCase();
+    equal((await f.fetch("/api/alive")).headers.get("X-Raywarden-Release-Id"), null);
+
+    delete f.env.DB;
+    delete f.env.KEY_ENCRYPTION_KEY;
+    for (const path of ["/api/now", "/api/version", "/css/vaultwarden.css", "/js/raywarden.js", "/.well-known/apple-app-site-association"]) {
+      equal((await f.fetch(path)).status, 200, path);
+    }
+    equal((await f.fetch("/api/version", { method: "POST" })).status, 405);
+    equal((await f.fetch("/api/alive")).status, 500);
+    equal((await f.fetch("/api/sync")).status, 500);
   });
 
   await check("demo stays disabled by default, is opt-in with no-store and keeps ordinary API authorization", async () => {

@@ -1,39 +1,27 @@
 //! Equivalent-domain request data and shared upstream cache refresh.
 use std::collections::HashSet;
 
+use futures_util::StreamExt;
 use log::warn;
-use serde::{
-    Deserialize,
-    Serialize,
-};
-use worker::{
-    AbortSignal,
-    D1Database,
-    Fetch,
-    Method,
-    Request,
-};
+use serde::{Deserialize, Serialize};
+use serde_json::value::RawValue;
+use worker::{AbortSignal, D1Database, Env, Fetch, Method, Request};
 
 use crate::{
-    app::AppContext,
-    errors::{
-        AppError,
-        AppResult,
-    },
+    errors::{AppError, AppResult},
     models::vault::domains::DomainsRow,
     service::{
         identity::session::Claims,
-        notifications::{
-            UpdateType,
-            admin::Event,
-        },
+        notifications::{UpdateType, admin::Event},
         vault_write::VaultWrite,
     },
 };
 
-const GLOBAL_DOMAINS_URL: &str = "https://raw.githubusercontent.com/dani-garcia/vaultwarden/main/src/static/global_domains.json";
+const GLOBAL_DOMAINS_URL: &str =
+    "https://raw.githubusercontent.com/dani-garcia/vaultwarden/main/src/static/global_domains.json";
 const REFRESH_INTERVAL_SECONDS: i64 = 24 * 60 * 60;
 const RETRY_INTERVAL_SECONDS: i64 = 60 * 60;
+const MAX_GLOBAL_DOMAINS_BYTES: usize = 2 * 1024 * 1024;
 
 #[derive(Debug, Deserialize, Serialize)]
 struct GlobalDomain {
@@ -43,12 +31,9 @@ struct GlobalDomain {
 }
 
 fn validated_global_domains(raw: &str) -> AppResult<String> {
-    let groups: Vec<GlobalDomain> =
-        serde_json::from_str(raw).map_err(AppError::upstream_error)?;
+    let groups: Vec<GlobalDomain> = serde_json::from_str(raw).map_err(AppError::upstream_error)?;
     if groups.is_empty() {
-        return Err(AppError::upstream_error(
-            "Global domains dataset is empty",
-        ));
+        return Err(AppError::upstream_error("Global domains dataset is empty"));
     }
     let mut types = HashSet::with_capacity(groups.len());
     for group in &groups {
@@ -57,9 +42,7 @@ fn validated_global_domains(raw: &str) -> AppResult<String> {
                 "Invalid or duplicate global domain type",
             ));
         }
-        if group.domains.is_empty() ||
-            group.domains.iter().any(|domain| domain.trim().is_empty())
-        {
+        if group.domains.is_empty() || group.domains.iter().any(|domain| domain.trim().is_empty()) {
             return Err(AppError::upstream_error(
                 "Global domain group contains no usable domains",
             ));
@@ -72,35 +55,28 @@ fn validated_global_domains(raw: &str) -> AppResult<String> {
 #[serde(rename_all = "camelCase")]
 pub struct UpdateDomainsRequest {
     pub excluded_global_equivalent_domains: Option<Vec<i32>>,
-    pub equivalent_domains:                 Option<Vec<Vec<String>>>,
+    pub equivalent_domains: Option<Vec<Vec<String>>>,
 }
 
 /// Refresh the shared cache at most daily. Claiming the attempt first also
 /// backs off failures and prevents concurrent sync requests from fetching.
 pub(crate) async fn refresh_global_domains(db: &D1Database) -> AppResult<()> {
     let now = crate::utils::time::now_seconds();
-    if !DomainsRow::claim_global_domains_refresh(
-        db,
-        now,
-        now + RETRY_INTERVAL_SECONDS,
-    )
-    .await?
-    {
+    if !DomainsRow::claim_global_domains_refresh(db, now, now + RETRY_INTERVAL_SECONDS).await? {
         return Ok(());
     }
 
     let request = Request::new(GLOBAL_DOMAINS_URL, Method::Get)?;
-    let signal =
-        AbortSignal::from(web_sys::AbortSignal::timeout_with_u32(5_000));
-    let mut response =
-        Fetch::Request(request).send_with_signal(&signal).await?;
+    let signal = AbortSignal::from(web_sys::AbortSignal::timeout_with_u32(5_000));
+    let mut response = Fetch::Request(request).send_with_signal(&signal).await?;
     if !(200..300).contains(&response.status_code()) {
         return Err(AppError::upstream_error(format_args!(
             "Global domains upstream returned HTTP {}",
             response.status_code()
         )));
     }
-    let groups = validated_global_domains(&response.text().await?)?;
+    let raw = read_bounded_upstream_text(&mut response, MAX_GLOBAL_DOMAINS_BYTES).await?;
+    let groups = validated_global_domains(&raw)?;
     DomainsRow::replace_global_domains(
         db,
         &groups,
@@ -110,7 +86,35 @@ pub(crate) async fn refresh_global_domains(db: &D1Database) -> AppResult<()> {
     Ok(())
 }
 
-pub(crate) async fn global_equivalent_domains_json(
+async fn read_bounded_upstream_text(
+    response: &mut worker::Response,
+    max_bytes: usize,
+) -> AppResult<String> {
+    if response
+        .headers()
+        .get("content-length")?
+        .and_then(|value| value.trim().parse::<usize>().ok())
+        .is_some_and(|length| length > max_bytes)
+    {
+        return Err(AppError::upstream_error(
+            "Global domains upstream response exceeds size limit",
+        ));
+    }
+    let mut stream = response.stream()?;
+    let mut bytes = Vec::new();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk?;
+        if chunk.len() > max_bytes - bytes.len() {
+            return Err(AppError::upstream_error(
+                "Global domains upstream response exceeds size limit",
+            ));
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+    String::from_utf8(bytes).map_err(AppError::upstream_error)
+}
+
+async fn global_equivalent_domains_json(
     db: &D1Database,
     excluded_globals_json: &str,
     include_excluded: bool,
@@ -130,12 +134,7 @@ pub(crate) async fn global_equivalent_domains_json(
                 "Global domain query failed; retrying without exclusions: \
                  {error}"
             );
-            DomainsRow::query_global_equivalent_domains(
-                db,
-                "[]",
-                include_excluded,
-            )
-            .await
+            DomainsRow::query_global_equivalent_domains(db, "[]", include_excluded).await
         }
         result => result,
     };
@@ -157,34 +156,58 @@ fn normalize_cached_domains(row: Option<serde_json::Value>) -> String {
     .unwrap_or_else(|| "[]".to_string())
 }
 
-pub async fn settings(
-    state: &AppContext,
-    claims: &Claims,
-) -> AppResult<String> {
-    let db = state.database();
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct DomainsResponse {
+    equivalent_domains: Vec<Vec<String>>,
+    global_equivalent_domains: Box<RawValue>,
+    object: &'static str,
+}
 
-    let domains = DomainsRow::fetch_by_user_id(db, &claims.sub).await?;
-    let equivalent_domains = domains.equivalent_domains;
-    let excluded_globals = domains.excluded_globals;
+pub(crate) async fn settings(db: &D1Database, user_id: &str) -> AppResult<DomainsResponse> {
+    let domains = DomainsRow::fetch_by_user_id(db, user_id).await?;
+    Ok(render_settings(
+        db,
+        &domains.equivalent_domains,
+        &domains.excluded_globals,
+        true,
+    )
+    .await)
+}
 
-    // Include ALL global groups and mark `excluded` (settings UI semantics).
-    // An unavailable upstream leaves the last cached dataset (or []) usable.
-    let global_equivalent_domains =
-        global_equivalent_domains_json(db, &excluded_globals, true).await;
+pub(crate) async fn render_settings(
+    db: &D1Database,
+    equivalent_domains: &str,
+    excluded_globals: &str,
+    include_excluded: bool,
+) -> DomainsResponse {
+    let equivalent_domains = serde_json::from_str(equivalent_domains).unwrap_or_else(|_error| {
+        warn!("Invalid stored equivalent domains; using an empty list");
+        Vec::new()
+    });
+    let raw_globals = global_equivalent_domains_json(db, excluded_globals, include_excluded).await;
+    let global_equivalent_domains = RawValue::from_string(raw_globals).unwrap_or_else(|_error| {
+        warn!("Invalid cached global domains; using an empty list");
+        empty_domains()
+    });
+    DomainsResponse {
+        equivalent_domains,
+        global_equivalent_domains,
+        object: "domains",
+    }
+}
 
-    let response = format!(
-        r#"{{"equivalentDomains":{equivalent_domains},"globalEquivalentDomains":{global_equivalent_domains},"object":"domains"}}"#
-    );
-    Ok(response)
+fn empty_domains() -> Box<RawValue> {
+    serde_json::value::to_raw_value(&[(); 0]).expect("empty array serializes")
 }
 
 pub async fn update_settings(
-    state: &AppContext,
+    db: &D1Database,
+    env: &Env,
     claims: &Claims,
     payload: UpdateDomainsRequest,
 ) -> AppResult<()> {
-    let mut mutation = VaultWrite::new(state, claims);
-    let db = mutation.database();
+    let mut mutation = VaultWrite::new(db, env, claims);
     let previous = DomainsRow::fetch_by_user_id(db, mutation.user_id()).await?;
     mutation.guard_account_key().await?;
     mutation.add_guard(previous.snapshot_guard(db, mutation.user_id())?);
@@ -194,16 +217,14 @@ pub async fn update_settings(
         .unwrap_or_default();
     let equivalent_domains = payload.equivalent_domains.unwrap_or_default();
 
-    let excluded_globals_json = serde_json::to_string(&excluded_globals)
-        .map_err(|err| {
-            log::warn!("Failed to serialize excluded globals: {err}");
-            AppError::Params("Invalid excluded globals".to_string())
-        })?;
-    let equivalent_domains_json = serde_json::to_string(&equivalent_domains)
-        .map_err(|err| {
-            log::warn!("Failed to serialize equivalent domains: {err}");
-            AppError::Params("Invalid equivalent domains".to_string())
-        })?;
+    let excluded_globals_json = serde_json::to_string(&excluded_globals).map_err(|err| {
+        log::warn!("Failed to serialize excluded globals: {err}");
+        AppError::Params("Invalid excluded globals".into())
+    })?;
+    let equivalent_domains_json = serde_json::to_string(&equivalent_domains).map_err(|err| {
+        log::warn!("Failed to serialize equivalent domains: {err}");
+        AppError::Params("Invalid equivalent domains".into())
+    })?;
 
     let write = DomainsRow::update_for_user(
         db,

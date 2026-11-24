@@ -3,7 +3,7 @@ import json
 import sqlite3
 import unittest
 
-from sql_regression import apply_migrations
+from sql_fixtures import apply_migrations
 
 
 CANONICAL_COLUMNS = {

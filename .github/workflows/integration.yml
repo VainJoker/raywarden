@@ -39,6 +39,8 @@ jobs:
         run: just dry-run
       - name: Exercise compiled Rust Worker in workerd without a listener
         run: just test-worker
+      - name: Exercise fresh D1 migrations and file lifecycle with native Worker bindings
+        run: just test-d1
       - name: Record artifact source, configuration and file digests
         if: startsWith(github.ref, 'refs/tags/v')
         run: just artifact

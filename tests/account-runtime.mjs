@@ -1,4 +1,6 @@
-import { openFixtureJwtKeys } from "./jwt-runtime.mjs";
+import { DurableObjectNamespace } from "./runtime-fixture.mjs";
+import { equal, expectStatus } from "./runtime-assertions.mjs";
+import { emailCodeHash, fixtureAccessSecret, oauthToken } from "./runtime-auth.mjs";
 
 /** Account HTTP regressions against the compiled Worker and workerd SQLite. */
 export async function runAccountCompatibility({ fixture, check, accessToken, USER, CIPHER, sql }) {
@@ -11,23 +13,14 @@ export async function runAccountCompatibility({ fixture, check, accessToken, USE
     publicKeyEncryptionKeyPair: { publicKey: "public", wrappedPrivateKey: "7.wrapped-private", signedPublicKey: "signed-public" },
     signatureKeyPair: { ...signature }, securityState: { securityState: "encrypted-security-state", securityVersion: 2 },
   });
-  const equal = (actual, expected, label = "value") => {
-    if (actual !== expected) throw new Error(`${label}: expected ${expected}, received ${actual}`);
-  };
-  const expectStatus = async (response, expected) => {
-    if (response.status !== expected) throw new Error(`Expected HTTP ${expected}, received ${response.status}: ${await response.text()}`);
-    return response;
-  };
   const json = async (f, path, body, bearer, method = "POST", extraHeaders = {}) => f.fetch(path, {
     method, headers: { "Content-Type": "application/json", ...(bearer ? { Authorization: `Bearer ${bearer}` } : {}), ...extraHeaders },
     body: JSON.stringify(body),
   });
-  const login = (f, email, password, version, deviceType = "14") => f.fetch("/identity/connect/token", {
-    method: "POST", headers: { "Content-Type": "application/x-www-form-urlencoded", "device-type": deviceType,
-      ...(version ? { "Bitwarden-Client-Version": version } : {}) },
-    body: new URLSearchParams({ grant_type: "password", username: email, password,
-      deviceIdentifier: "account-runtime-login", deviceName: "Runtime Browser", deviceType: "14" }),
-  });
+  const login = (f, email, password, version, deviceType = "14") => oauthToken(f, {
+    grant_type: "password", username: email, password,
+    deviceIdentifier: "account-runtime-login", deviceName: "Runtime Browser", deviceType: "14",
+  }, { "device-type": deviceType, ...(version ? { "Bitwarden-Client-Version": version } : {}) });
   const removeVault = () => {
     sql.exec("DELETE FROM attachments_pending; DELETE FROM attachments; DELETE FROM ciphers; DELETE FROM folders; DELETE FROM sends;");
   };
@@ -51,31 +44,64 @@ export async function runAccountCompatibility({ fixture, check, accessToken, USE
         "prf-public", "prf-user", "prf-private", snapshot, "2026-01-01T00:00:00.000Z", "2026-01-01T00:00:00.000Z");
     }
   };
-  const readyEmailCode = async (f, recipient) => {
-    const parts = [USER, "change-email", recipient, "", "123456"];
-    const encode = new TextEncoder();
-    const chunks = [];
-    for (const part of parts) {
-      const bytes = encode.encode(part), prefix = new Uint8Array(8);
-      new DataView(prefix.buffer).setBigUint64(0, BigInt(bytes.length), false);
-      chunks.push(prefix, bytes);
-    }
-    const bytes = new Uint8Array(chunks.reduce((n, part) => n + part.length, 0));
-    let offset = 0; for (const part of chunks) { bytes.set(part, offset); offset += part.length; }
-    const { access_secret: secret } = await openFixtureJwtKeys(
-      sql.exec("SELECT access_secret,refresh_secret FROM jwt_keys WHERE id='global'").one(), f.env.KEY_ENCRYPTION_KEY);
-    const key = await crypto.subtle.importKey("raw", encode.encode(secret), { name: "HMAC", hash: "SHA-256" }, false, ["sign"]);
-    const digest = Array.from(new Uint8Array(await crypto.subtle.sign("HMAC", key, bytes)), byte => byte.toString(16).padStart(2, "0")).join("");
+  const readyEmailCode = async (f, recipient, purpose = "change-email", session = "session") => {
+    const secret = await fixtureAccessSecret(sql, f.env.KEY_ENCRYPTION_KEY);
+    const digest = await emailCodeHash(secret, { owner: USER, purpose, recipient, context: "", code: "123456" });
     const now = Math.floor(Date.now() / 1000);
-    sql.exec("INSERT INTO verification_codes(id,owner_key,user_id,purpose,recipient,context,code_hash,security_stamp,session_token,issued_at,expires_at,ready) VALUES('email-runtime',?,?,'change-email',?,'',?,'owner-stamp','session',?,?,1)", USER, USER, recipient, digest, now, now + 600);
+    sql.exec("INSERT INTO verification_codes(id,owner_key,user_id,purpose,recipient,context,code_hash,security_stamp,session_token,issued_at,expires_at,ready) VALUES('email-runtime',?,?,?,?,'',?,'owner-stamp',?,?,?,1)", USER, USER, purpose, recipient, digest, session, now, now + 600);
   };
 
-  await check("both account deletion routes send logout and unregister captured push devices only after commit", async () => {
-    class DurableObjectNamespace {
-      constructor(deliver) { this.deliver = deliver; }
-      idFromName(name) { return { name }; }
-      get() { return { fetch: this.deliver }; }
+  await check("protected account deletion rejects stale sessions and keeps the OTP reusable on failed writes", async () => {
+    for (const change of ["nonce", "stamp", "verifier", "delete failure"]) {
+      const f = fixture(), bearer = await accessToken();
+      await readyEmailCode(f, "owner@example.test", "protected-action");
+      const previous = sql.exec("SELECT updated_at FROM users WHERE id=?", USER).one().updated_at;
+      const batch = f.db.batch.bind(f.db);
+      let reached = false;
+      f.db.batch = async statements => {
+        if (!reached && statements.some(statement => statement.sql.startsWith("DELETE FROM users WHERE id = "))) {
+          reached = true;
+          if (change === "nonce") sql.exec("UPDATE devices SET session_token='next' WHERE user_id=? AND device_id='device'", USER);
+          else if (change === "stamp") sql.exec("UPDATE users SET security_stamp='next' WHERE id=?", USER);
+          else if (change === "verifier") sql.exec("UPDATE users SET master_password_hash='fresh' WHERE id=?", USER);
+          else sql.exec("CREATE TRIGGER protect_delete_failure BEFORE DELETE ON users BEGIN SELECT RAISE(ABORT, 'fixture deletion denied'); END;");
+        }
+        return batch(statements);
+      };
+      const body = { otp: "123456" };
+      await expectStatus(await json(f, "/api/accounts/delete", body, bearer), change === "delete failure" ? 500 : 409);
+      equal(reached, true);
+      equal(sql.exec("SELECT updated_at FROM users WHERE id=?", USER).one().updated_at, previous, change);
+      const proof = sql.exec("SELECT attempts,consumed_at FROM verification_codes WHERE id='email-runtime'").one();
+      equal(proof.attempts, 0, change); equal(proof.consumed_at, null, change);
+      if (change === "delete failure") {
+        sql.exec("DROP TRIGGER protect_delete_failure");
+        await expectStatus(await json(f, "/api/accounts/delete", body, bearer), 200);
+      }
     }
+  });
+
+  await check("factor disable does not remove a newly replaced provider or consume its authorization", async () => {
+    const f = fixture();
+    await readyEmailCode(f, "owner@example.test", "protected-action");
+    sql.exec("INSERT INTO two_factors VALUES('email-factor',?,1,1,?,0)", USER, JSON.stringify({ email: "owner@example.test" }));
+    const batch = f.db.batch.bind(f.db);
+    let reached = false;
+    f.db.batch = async statements => {
+      if (!reached && statements.some(statement => statement.sql.startsWith("DELETE FROM two_factors WHERE user_id="))) {
+        reached = true;
+        sql.exec("UPDATE two_factors SET id='replacement' WHERE id='email-factor'");
+      }
+      return batch(statements);
+    };
+    await expectStatus(await json(f, "/api/two-factor/disable", { type: 1, otp: "123456" }, await accessToken()), 409);
+    equal(reached, true);
+    equal(sql.exec("SELECT id FROM two_factors WHERE user_id=? AND provider_type=1", USER).one().id, "replacement");
+    const proof = sql.exec("SELECT attempts,consumed_at FROM verification_codes WHERE id='email-runtime'").one();
+    equal(proof.attempts, 0); equal(proof.consumed_at, null);
+  });
+
+  await check("both account deletion routes send logout and unregister captured push devices only after commit", async () => {
     for (const recovery of [false, true]) {
       for (const fail of [true, false]) {
         const f = fixture(), effects = [];
@@ -89,7 +115,7 @@ export async function runAccountCompatibility({ fixture, check, accessToken, USE
           PUSH_IDENTITY_URI: "https://deletion-push.runtime.test",
           PUSH_RELAY_URI: "https://deletion-push.runtime.test",
         });
-        f.env.NOTIFY_DO = new DurableObjectNamespace(async request => {
+        f.env.notifydo = new DurableObjectNamespace(async request => {
           const update = await request.json();
           equal(owners(), 0, "WebSocket logout precedes deletion");
           equal(update.selector.user_id, USER);
@@ -103,6 +129,7 @@ export async function runAccountCompatibility({ fixture, check, accessToken, USE
         globalThis.fetch = async input => {
           const request = input instanceof Request ? input : new Request(input);
           const url = new URL(request.url);
+          equal(request.redirect, "manual", "credential-bearing notification redirect policy");
           if (url.hostname === "deletion-mail.runtime.test") {
             const message = await request.json();
             equal(message.purpose, "delete-recover");
@@ -137,10 +164,44 @@ export async function runAccountCompatibility({ fixture, check, accessToken, USE
           await expectStatus(response, fail ? 500 : 200);
           equal(owners(), fail ? 1 : 0);
           equal(effects.join(","), fail ? "" : "logout,/push/send,/push/delete/fixture-push");
+          if (recovery && fail) {
+            const proof = sql.exec("SELECT attempts, consumed_at FROM verification_codes WHERE user_id=? AND purpose='delete-recover'", USER).one();
+            equal(proof.attempts, 0);
+            equal(proof.consumed_at, null);
+            sql.exec("DROP TRIGGER reject_account_deletion");
+            await expectStatus(await json(f, "/api/accounts/delete-recover-token", { userId: USER, token: code }), 200);
+            equal(owners(), 0);
+            equal(effects.join(","), "logout,/push/send,/push/delete/fixture-push");
+            await expectStatus(await json(f, "/api/accounts/delete-recover-token", { userId: USER, token: code }), 404);
+          }
         } finally {
           globalThis.fetch = fetch;
         }
       }
+    }
+  });
+
+  await check("email confirmation and two-factor enrollment preserve valid proofs on failed writes", async () => {
+    for (const purpose of ["verify-email", "email-setup"]) {
+      const f = fixture(), enrollment = purpose === "email-setup";
+      await readyEmailCode(f, "owner@example.test", purpose, enrollment ? "session" : "");
+      const path = enrollment ? "/api/two-factor/email" : "/api/accounts/verify-email-token";
+      const body = enrollment ? { masterPasswordHash: "hash", token: "123456" } : { userId: USER, token: "123456" };
+      const bearer = enrollment ? await accessToken() : undefined;
+      const write = enrollment ? "INSERT ON two_factors" : "UPDATE OF is_email_verified ON users";
+      sql.exec(`CREATE TRIGGER reject_mailbox_mutation BEFORE ${write} BEGIN SELECT RAISE(ABORT, 'fixture mailbox failure'); END`);
+      await expectStatus(await json(f, path, body, bearer), 500);
+      const proof = sql.exec("SELECT attempts, consumed_at FROM verification_codes WHERE id='email-runtime'").one();
+      equal(proof.attempts, 0);
+      equal(proof.consumed_at, null);
+      sql.exec("DROP TRIGGER reject_mailbox_mutation");
+      await expectStatus(await json(f, path, body, bearer), 200);
+      if (enrollment) {
+        equal(sql.exec("SELECT is_enabled FROM two_factors WHERE user_id=? AND provider_type=1", USER).one().is_enabled, 1);
+      } else {
+        equal(sql.exec("SELECT is_email_verified FROM users WHERE id=?", USER).one().is_email_verified, 1);
+      }
+      await expectStatus(await json(f, path, body, bearer), 400);
     }
   });
 
@@ -302,7 +363,7 @@ export async function runAccountCompatibility({ fixture, check, accessToken, USE
     sql.exec("INSERT INTO two_factors(id,user_id,provider_type,data) VALUES('email-remember',?,5,'{}')", USER);
     const batch = f.db.batch.bind(f.db); let changed = false;
     f.db.batch = async (statements) => {
-      if (!changed && statements[0]?.sql.startsWith("UPDATE users SET email=")) {
+      if (!changed && statements.some(statement => statement.sql.startsWith("UPDATE users SET email="))) {
         changed = true;
         sql.exec("UPDATE users SET key='7.concurrent-upgrade',private_key='7.new-private',signed_public_key='signed',security_state='new-state',security_version=2,signature_key_pair=?,user_key_id=? WHERE id=?", JSON.stringify(signature), id, USER);
       }
@@ -313,6 +374,7 @@ export async function runAccountCompatibility({ fixture, check, accessToken, USE
     const user = sql.exec("SELECT email,key,security_stamp FROM users WHERE id=?", USER).one();
     equal(user.email, "owner@example.test"); equal(user.key, "7.concurrent-upgrade"); equal(user.security_stamp, "owner-stamp");
     equal(sql.exec("SELECT COUNT(*) AS n FROM two_factors WHERE user_id=? AND provider_type=5", USER).one().n, 1);
+    equal(sql.exec("SELECT consumed_at FROM verification_codes WHERE id='email-runtime'").one().consumed_at, null);
   });
 
   await check("an email claimed by another account during commit returns a conflict and preserves account state", async () => {
@@ -322,27 +384,33 @@ export async function runAccountCompatibility({ fixture, check, accessToken, USE
     sql.exec("INSERT INTO two_factors(id,user_id,provider_type,data) VALUES('contended-remember',?,5,'{}')", USER);
     const batch = f.db.batch.bind(f.db); let claimed = false;
     f.db.batch = async statements => {
-      if (!claimed && statements[0]?.sql.startsWith("UPDATE users SET email=")) {
+      if (!claimed && statements.some(statement => statement.sql.startsWith("UPDATE users SET email="))) {
         claimed = true;
         sql.exec("UPDATE users SET email=? WHERE id='other-owner'", recipient);
       }
       return batch(statements);
     };
-    await expectStatus(await json(f, "/api/accounts/email", { masterPasswordHash: "hash", newMasterPasswordHash: "new-auth",
-      newEmail: recipient, key: "2.rewrapped", token: "123456" }, await accessToken()), 409);
+    const bearer = await accessToken();
+    const body = { masterPasswordHash: "hash", newMasterPasswordHash: "new-auth",
+      newEmail: recipient, key: "2.rewrapped", token: "123456" };
+    await expectStatus(await json(f, "/api/accounts/email", { ...body, token: "654321" }, bearer), 400);
+    await expectStatus(await json(f, "/api/accounts/email", body, bearer), 409);
     equal(claimed, true);
     const user = sql.exec("SELECT email,key,security_stamp FROM users WHERE id=?", USER).one();
     equal(user.email, "owner@example.test"); equal(user.key, "2.wrapped"); equal(user.security_stamp, "owner-stamp");
     equal(sql.exec("SELECT email FROM users WHERE id='other-owner'").one().email, recipient);
     equal(sql.exec("SELECT COUNT(*) AS n FROM two_factors WHERE id='contended-remember'").one().n, 1);
+    const proof = sql.exec("SELECT attempts, consumed_at FROM verification_codes WHERE id='email-runtime'").one();
+    equal(proof.attempts, 1);
+    equal(proof.consumed_at, null);
+
+    sql.exec("UPDATE users SET email='other@example.test' WHERE id='other-owner'");
+    await expectStatus(await json(f, "/api/accounts/email", body, bearer), 200);
+    equal(sql.exec("SELECT email FROM users WHERE id=?", USER).one().email, recipient);
+    equal(sql.exec("SELECT count(*) AS n FROM verification_codes WHERE id='email-runtime'").one().n, 0);
   });
 
   await check("password and email changes retag only a current PRF wrapper without replacing its ciphertext", async () => {
-    class DurableObjectNamespace {
-      constructor(handler) { this.handler = handler; }
-      idFromName(name) { return { name }; }
-      get() { return { fetch: req => this.handler(req) }; }
-    }
     for (const kind of ["password", "email"]) {
       const f = fixture(); seedPrf();
       const bearer = await accessToken(); const wrapper = `2.${kind}-rewrapped-user`;
@@ -356,7 +424,7 @@ export async function runAccountCompatibility({ fixture, check, accessToken, USE
         body = { masterPasswordHash: "hash", newMasterPasswordHash: "new-auth", key: wrapper };
       }
       const captured = [];
-      f.env.NOTIFY_DO = new DurableObjectNamespace(async req => {
+      f.env.notifydo = new DurableObjectNamespace(async req => {
         const update = await req.json();
         const key = sql.exec("SELECT key FROM users WHERE id=?", USER).one().key;
         captured.push({ update, key });

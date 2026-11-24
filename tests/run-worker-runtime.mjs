@@ -11,12 +11,13 @@ import { parseJsonc } from "../scripts/deploy.mjs";
 const root = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const config = parseJsonc(readFileSync(resolve(root, "wrangler.jsonc"), "utf8"));
 const entry = "worker-runtime.mjs";
+const support = ["runtime-assertions.mjs", "runtime-auth.mjs", "runtime-fixture.mjs"];
 const runner = basename(fileURLToPath(import.meta.url));
 const suites = readdirSync(join(root, "tests"))
   .filter(name => name.endsWith("-runtime.mjs") && name !== entry && name !== runner)
   .sort();
 const inputs = [
-  ...[entry, ...suites].map(name => `tests/${name}`),
+  ...[entry, ...support, ...suites].map(name => `tests/${name}`),
   "build/index.js", "build/index_bg.wasm",
 ];
 const schemaModule = "runtime-schema.mjs";

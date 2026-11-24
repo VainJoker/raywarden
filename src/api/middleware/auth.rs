@@ -1,66 +1,93 @@
 //! Bearer authentication for handlers that request `Claims`.
+use std::sync::Arc;
+
 use axum::{
     extract::FromRequestParts,
-    http::{
-        HeaderMap,
-        header,
-        request::Parts,
-    },
+    http::{HeaderMap, HeaderValue, header, request::Parts},
+    response::{IntoResponse, Response},
 };
 
 use crate::{
     api::AppState,
-    errors::{
-        AppError,
-        AppResult,
-        AuthError,
-    },
-    infra::jwt::{
-        ValidationOptions,
-        decode,
-    },
-    service::identity::session::Claims,
+    errors::{AppError, AuthError},
+    infra::jwt::{ValidationOptions, decode},
+    service::identity::session::{Claims, TokenUse},
+    utils::parse_bearer,
 };
 
-pub(in crate::api) fn request_device_type(
-    headers: &HeaderMap,
-) -> AppResult<i32> {
-    let value = headers
-        .get("device-type")
-        .and_then(|value| value.to_str().ok())
-        .ok_or_else(|| AppError::bad_request("Missing device-type header"))?;
-    value
-        .trim()
-        .parse::<i32>()
-        .ok()
-        .filter(|value| (0..=40).contains(value))
-        .ok_or_else(|| AppError::bad_request("Invalid device-type header"))
-}
-
-fn bearer_token(parts: &Parts) -> AppResult<&str> {
-    parts
-        .headers
+pub(in crate::api) fn bearer_token(headers: &HeaderMap) -> Option<&str> {
+    headers
         .get(header::AUTHORIZATION)
         .and_then(|value| value.to_str().ok())
-        .and_then(|value| value.strip_prefix("Bearer "))
-        .filter(|value| !value.is_empty())
-        .ok_or(AppError::Auth(AuthError::MissingToken))
+        .and_then(parse_bearer)
 }
 
-impl FromRequestParts<AppState> for Claims {
-    type Rejection = AppError;
+pub(in crate::api) struct BearerRejection {
+    error: AppError,
+    challenge: Option<&'static str>,
+}
+
+impl BearerRejection {
+    pub(in crate::api) const fn missing(error: AppError) -> Self {
+        Self {
+            error,
+            challenge: Some("Bearer"),
+        }
+    }
+
+    pub(in crate::api) const fn invalid(error: AppError) -> Self {
+        Self {
+            error,
+            challenge: Some("Bearer error=\"invalid_token\""),
+        }
+    }
+}
+
+impl From<AppError> for BearerRejection {
+    fn from(error: AppError) -> Self {
+        Self {
+            error,
+            challenge: None,
+        }
+    }
+}
+
+impl IntoResponse for BearerRejection {
+    fn into_response(self) -> Response {
+        let mut response = self.error.into_response();
+        if let Some(challenge) = self.challenge {
+            response.headers_mut().insert(
+                header::WWW_AUTHENTICATE,
+                HeaderValue::from_static(challenge),
+            );
+        }
+        response
+    }
+}
+
+impl FromRequestParts<Arc<AppState>> for Claims {
+    type Rejection = BearerRejection;
 
     #[worker::send]
     async fn from_request_parts(
         parts: &mut Parts,
-        state: &AppState,
+        state: &Arc<AppState>,
     ) -> Result<Self, Self::Rejection> {
+        let token = bearer_token(&parts.headers)
+            .ok_or_else(|| BearerRejection::missing(AuthError::MissingToken.into()))?;
         let claims = decode::<Self>(
-            bearer_token(parts)?,
+            token,
             state.jwt_keys.access_secret.as_bytes(),
             &ValidationOptions::default(),
-        )?;
-        claims.validate_session(state.database(), "access").await?;
+        )
+        .map_err(|error| BearerRejection::invalid(error.into()))?;
+        claims
+            .validate_session(state.database(), TokenUse::Access)
+            .await
+            .map_err(|error| match error {
+                AppError::Auth(AuthError::InvalidCredentials(_)) => BearerRejection::invalid(error),
+                _ => error.into(),
+            })?;
         Ok(claims)
     }
 }

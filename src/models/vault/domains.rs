@@ -1,74 +1,54 @@
+use serde::{Deserialize, Deserializer};
 use serde_json::Value;
-use worker::{
-    D1Database,
-    D1PreparedStatement,
-    query,
+use worker::{D1Database, D1PreparedStatement, query};
+
+use crate::{
+    errors::{AppResult, AuthError, DatabaseError},
+    infra::db,
 };
 
-use crate::errors::{
-    AppResult,
-    AuthError,
-    DatabaseError,
-};
-
-#[derive(Debug)]
+#[derive(Debug, Deserialize)]
 pub struct DomainsRow {
+    #[serde(default = "empty_domains", deserialize_with = "domain_json")]
     pub equivalent_domains: String,
-    pub excluded_globals:   String,
+    #[serde(default = "empty_domains", deserialize_with = "domain_json")]
+    pub excluded_globals: String,
+}
+
+fn empty_domains() -> String {
+    "[]".into()
+}
+
+fn domain_json<'de, D: Deserializer<'de>>(deserializer: D) -> Result<String, D::Error> {
+    Ok(match Value::deserialize(deserializer)? {
+        Value::String(value) => value,
+        _ => empty_domains(),
+    })
 }
 
 impl DomainsRow {
-    pub fn snapshot_guard(
-        &self,
-        db: &D1Database,
-        user_id: &str,
-    ) -> AppResult<D1PreparedStatement> {
+    pub fn snapshot_guard(&self, db: &D1Database, user_id: &str) -> AppResult<D1PreparedStatement> {
         crate::models::mutation::guard(
             db,
             "EXISTS(SELECT 1 FROM users WHERE id=?1 AND equivalent_domains=?2 \
              AND excluded_globals=?3)",
-            &[
-                user_id.into(),
-                self.equivalent_domains.clone().into(),
-                self.excluded_globals.clone().into(),
-            ],
+            &db::d1_params![user_id, self.equivalent_domains, self.excluded_globals],
         )
     }
 
-    pub async fn fetch_by_user_id(
-        db: &D1Database,
-        user_id: &str,
-    ) -> AppResult<Self> {
-        let row: Option<Value> = db
+    pub async fn fetch_by_user_id(db: &D1Database, user_id: &str) -> AppResult<Self> {
+        let row = db
             .prepare(
                 "SELECT equivalent_domains, excluded_globals FROM users WHERE \
                  id = ?1",
             )
             .bind(&[user_id.into()])
-            .map_err(|e| DatabaseError::query("query user domains failed", e))?
-            .first(None)
+            .map_err(|e| DatabaseError::query("query user domains failed", &e))?
+            .first::<Self>(None)
             .await
-            .map_err(|e| {
-                DatabaseError::query("query user domains failed", e)
-            })?;
+            .map_err(|e| DatabaseError::query("query user domains failed", &e))?;
 
-        let row = row.ok_or(AuthError::UserNotFound)?;
-
-        let equivalent_domains = row
-            .get("equivalent_domains")
-            .and_then(|v| v.as_str())
-            .unwrap_or("[]")
-            .to_string();
-        let excluded_globals = row
-            .get("excluded_globals")
-            .and_then(|v| v.as_str())
-            .unwrap_or("[]")
-            .to_string();
-
-        Ok(Self {
-            equivalent_domains,
-            excluded_globals,
-        })
+        row.ok_or_else(|| AuthError::UserNotFound.into())
     }
 
     pub fn update_for_user(
@@ -137,10 +117,10 @@ impl DomainsRow {
     /// Build `globalEquivalentDomains` JSON (as a raw JSON string) in
     /// SQLite/D1.
     ///
-    /// - `include_excluded=true`  => returns all groups, each with `excluded`
-    ///   boolean (settings UI).
-    /// - `include_excluded=false` => returns only non-excluded groups, with
-    ///   `excluded=false` (sync payload).
+    /// - `include_excluded=true`  => returns all groups, each with `excluded` boolean (settings
+    ///   UI).
+    /// - `include_excluded=false` => returns only non-excluded groups, with `excluded=false` (sync
+    ///   payload).
     ///
     /// Return the raw query row; retry and response defaults belong to service.
     pub(crate) async fn query_global_equivalent_domains(
@@ -172,18 +152,12 @@ FROM (
                 i32::from(include_excluded).into(),
             ])
             .map_err(|err| {
-                DatabaseError::query(
-                    "Failed to prepare globalEquivalentDomains query",
-                    err,
-                )
+                DatabaseError::query("Failed to prepare globalEquivalentDomains query", &err)
             })?
             .first(None)
             .await
             .map_err(|err| {
-                DatabaseError::query(
-                    "Failed to execute globalEquivalentDomains query",
-                    err,
-                )
+                DatabaseError::query("Failed to execute globalEquivalentDomains query", &err)
             })
     }
 }

@@ -116,6 +116,9 @@ test-js:
 test-worker:
     node tests/run-worker-runtime.mjs
 
+test-d1:
+    node tests/run-d1-schema.mjs
+
 test-sql:
     python3 -m unittest discover -s tests -p '*sql*.py'
 
@@ -210,8 +213,14 @@ resources:
 config:
     node scripts/deploy.mjs config
 
+deploy-preflight:
+    node scripts/deploy.mjs preflight
+
 health:
     node scripts/deploy.mjs health
+
+deploy-health:
+    node scripts/deploy.mjs release-health
 
 # Select the local environment and local persistence explicitly.
 dev: setup-node setup-worker-build ui (db-migrate "local")
@@ -238,7 +247,8 @@ deploy:
     just dry-run
     just artifact
     just artifact-check
+    just deploy-preflight
     just resources
     just db-migrate production
     just deploy-worker
-    just health
+    just deploy-health

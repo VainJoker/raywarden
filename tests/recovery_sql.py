@@ -2,14 +2,15 @@
 import sqlite3
 import unittest
 
-from sql_regression import database, statements
+from sql_fixtures import database
+from sql_source import statements
 
 
 class AtomicTwoFactorRecovery(unittest.TestCase):
     def setUp(self):
         self.db = database()
         self.addCleanup(self.db.close)
-        self.sql = statements("two_factor", "recover_if_current")
+        self.sql = statements("two_factor", "recovery_statements")
         self.assertEqual(len(self.sql), 4)
         for owner in ("alice", "bob"):
             self.db.execute("UPDATE users SET two_factor_recovery_code=?,password_salt=NULL,password_iterations=100000,account_write_token='before-recovery' WHERE id=?", (f"Recovery-{owner}", owner))

@@ -1,17 +1,12 @@
+import { bearerJsonHeaders, equal, expectStatus as expect, ok } from "./runtime-assertions.mjs";
+import { oauthToken, totp } from "./runtime-auth.mjs";
+
 /** Account and Send verifiers exercised through compiled Rust and native SQL. */
 export async function runPasswordCompatibility({ fixture, check, sql, accessToken, USER }) {
   const CLIENT_HASH = "password-runtime-client-authentication-hash";
   const NEXT_HASH = "password-runtime-replacement-authentication-hash";
   const EMAIL = "owner@example.test";
   const DEVICE = "password-runtime-new-session";
-  const equal = (actual, expected, label = "value") => {
-    if (actual !== expected) throw new Error(`${label}: expected ${expected}, received ${actual}`);
-  };
-  const ok = (value, label) => { if (!value) throw new Error(label); };
-  const expect = async (response, status) => {
-    if (response.status !== status) throw new Error(`Expected HTTP ${status}, received ${response.status}: ${await response.text()}`);
-    return response;
-  };
   const bytes = salt => Uint8Array.from(atob(salt), char => char.charCodeAt(0));
   const salt = length => btoa(String.fromCharCode(...new Uint8Array(length).fill(42)));
   const derive = async (candidate, encodedSalt, iterations) => {
@@ -20,12 +15,11 @@ export async function runPasswordCompatibility({ fixture, check, sql, accessToke
     return btoa(String.fromCharCode(...new Uint8Array(bits)));
   };
   const row = () => sql.exec("SELECT master_password_hash,password_salt,password_iterations,security_stamp,updated_at FROM users WHERE id=?", USER).one();
-  const login = (f, password = CLIENT_HASH, extra = {}) => f.fetch("/identity/connect/token", {
-    method: "POST", headers: { "Content-Type": "application/x-www-form-urlencoded", "device-type": "14", "Bitwarden-Client-Version": "2026.11.0" },
-    body: new URLSearchParams({ grant_type: "password", username: EMAIL, password,
-      deviceIdentifier: DEVICE, deviceName: "Password Runtime", deviceType: "14", ...extra }),
-  });
-  const owner = async () => ({ Authorization: `Bearer ${await accessToken()}`, "Content-Type": "application/json" });
+  const login = (f, password = CLIENT_HASH, extra = {}) => oauthToken(f, {
+    grant_type: "password", username: EMAIL, password,
+    deviceIdentifier: DEVICE, deviceName: "Password Runtime", deviceType: "14", ...extra,
+  }, { "device-type": "14", "Bitwarden-Client-Version": "2026.11.0" });
+  const owner = async () => bearerJsonHeaders(await accessToken());
   const salted = async (iterations = 100000) => {
     const f = fixture(), encodedSalt = salt(16);
     const hash = await derive(CLIENT_HASH, encodedSalt, iterations);
@@ -35,16 +29,6 @@ export async function runPasswordCompatibility({ fixture, check, sql, accessToke
   const validStoredPassword = async (candidate, current = row()) => {
     ok(await derive(candidate, current.password_salt, current.password_iterations) === current.master_password_hash, "Stored verifier does not match its own salt and iteration count");
   };
-  const totp = async () => {
-    const counter = new Uint8Array(8);
-    new DataView(counter.buffer).setBigUint64(0, BigInt(Math.floor(Date.now() / 30000)), false);
-    const key = await crypto.subtle.importKey("raw", new TextEncoder().encode("12345678901234567890"), { name: "HMAC", hash: "SHA-1" }, false, ["sign"]);
-    const digest = new Uint8Array(await crypto.subtle.sign("HMAC", key, counter));
-    const offset = digest[digest.length - 1] & 15;
-    const value = new DataView(digest.buffer).getUint32(offset, false) & 0x7fffffff;
-    return String(value % 1000000).padStart(6, "0");
-  };
-
   await check("raw password verifiers upgrade only after success without moving the vault cursor or revoking another session", async () => {
     const f = fixture();
     sql.exec("UPDATE users SET master_password_hash=?,updated_at='2099-12-31T23:59:59.999Z' WHERE id=?", CLIENT_HASH, USER);
@@ -90,13 +74,14 @@ export async function runPasswordCompatibility({ fixture, check, sql, accessToke
 
   await check("password cost is upgraded only after completing the required second factor", async () => {
     const f = await salted();
-    sql.exec("INSERT INTO two_factors(id,user_id,provider_type,is_enabled,data,last_used_step) VALUES('password-runtime-totp',?,0,1,'GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ',0)", USER);
+    const secret = "GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ";
+    sql.exec("INSERT INTO two_factors(id,user_id,provider_type,is_enabled,data,last_used_step) VALUES('password-runtime-totp',?,0,1,?,0)", USER, secret);
     const before = row();
     await expect(await login(f), 400);
     equal(JSON.stringify(row()), JSON.stringify(before), "a second-factor challenge upgraded the verifier");
     await expect(await login(f, CLIENT_HASH, { twoFactorProvider: "0", twoFactorToken: "invalid" }), 401);
     equal(JSON.stringify(row()), JSON.stringify(before), "a failed second factor upgraded the verifier");
-    await expect(await login(f, CLIENT_HASH, { twoFactorProvider: "0", twoFactorToken: await totp() }), 200);
+    await expect(await login(f, CLIENT_HASH, { twoFactorProvider: "0", twoFactorToken: await totp(secret) }), 200);
     equal(row().password_iterations, 600000);
     await validStoredPassword(CLIENT_HASH);
   });
@@ -272,9 +257,8 @@ export async function runPasswordCompatibility({ fixture, check, sql, accessToke
         text: { text: "encrypted-content", hidden: false }, deletionDate: new Date(Date.now() + 86400000).toISOString() }) }), 200);
     return response.json();
   };
-  const issueSend = (f, accessId, password = CLIENT_HASH) => f.fetch("/identity/connect/token", {
-    method: "POST", headers: { "Content-Type": "application/x-www-form-urlencoded" },
-    body: new URLSearchParams({ grant_type: "send_access", send_id: accessId, password_hash_b64: password }),
+  const issueSend = (f, accessId, password = CLIENT_HASH) => oauthToken(f, {
+    grant_type: "send_access", send_id: accessId, password_hash_b64: password,
   });
 
   await check("Send passwords keep their independent creation cost and honor stored non-default and legacy missing costs", async () => {

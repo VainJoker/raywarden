@@ -1,24 +1,12 @@
 use serde::Deserialize;
-use worker::{
-    D1Database,
-    query,
-    wasm_bindgen::JsValue,
-};
+use worker::{D1Database, query, wasm_bindgen::JsValue};
 
 use crate::{
-    errors::{
-        AppError,
-        AppResult,
-        DatabaseError,
-        worker_failure,
-    },
+    errors::{AppError, AppResult, DatabaseError, DbSentinel, worker_failure},
     infra::db,
     models::identity::{
         account_keys::AccountSnapshot,
-        device::{
-            DeviceRow,
-            SessionSnapshot,
-        },
+        device::{DeviceRow, NewDeviceSession, SessionSnapshot},
         user::UserRow,
     },
 };
@@ -26,9 +14,17 @@ use crate::{
 #[derive(Deserialize)]
 pub struct ApiKeyRow {
     pub encrypted_key: String,
-    pub key_hash:      String,
-    pub updated_at:    String,
+    pub key_hash: String,
+    pub updated_at: String,
 }
+
+#[derive(Clone, Copy)]
+pub struct ApiKeyReplacement<'a> {
+    pub previous: Option<&'a ApiKeyRow>,
+    pub encrypted: &'a str,
+    pub hash: &'a str,
+}
+
 impl ApiKeyRow {
     pub async fn find(db: &D1Database, user: &str) -> AppResult<Option<Self>> {
         db::run_query(
@@ -76,10 +72,13 @@ impl ApiKeyRow {
         db: &D1Database,
         user: &UserRow,
         session: &SessionSnapshot<'_>,
-        previous: Option<&Self>,
-        encrypted: &str,
-        hash: &str,
+        replacement: ApiKeyReplacement<'_>,
     ) -> AppResult<Option<Self>> {
+        let ApiKeyReplacement {
+            previous,
+            encrypted,
+            hash,
+        } = replacement;
         let now = crate::utils::time::now_rfc3339();
         let marker = uuid::Uuid::new_v4().to_string();
         let revision_sql = crate::models::mutation::next_user_revision_sql(10);
@@ -95,19 +94,13 @@ impl ApiKeyRow {
              key_hash=?12 AND updated_at=?13)) RETURNING id",
             AccountSnapshot::matches_sql(6)
         );
-        let mut values = account_bindings(user, session)?;
-        values.extend([
-            marker.clone().into(),
-            now.into(),
-            previous
-                .map(|key| key.encrypted_key.as_str())
-                .map_or(JsValue::NULL, Into::into),
-            previous
-                .map(|key| key.key_hash.as_str())
-                .map_or(JsValue::NULL, Into::into),
-            previous
-                .map(|key| key.updated_at.as_str())
-                .map_or(JsValue::NULL, Into::into),
+        let mut values = Vec::from(account_bindings(user, session)?);
+        values.extend(db::d1_params![
+            marker,
+            now,
+            previous.map(|key| key.encrypted_key.as_str()),
+            previous.map(|key| key.key_hash.as_str()),
+            previous.map(|key| key.updated_at.as_str()),
         ]);
         let claim = db.prepare(sql).bind(&values)?;
         let results = db::run_query(
@@ -165,70 +158,52 @@ impl ApiKeyRow {
     }
     /// Attach the nonce to the authenticated key in the same transaction as the
     /// device upsert. A failed bind rolls back the nonce rotation.
-    pub async fn start_session(
+    pub(crate) async fn start_session(
         db: &D1Database,
-        user: &str,
-        device: &str,
-        name: &str,
-        kind: i32,
-        session: &str,
+        user: &UserRow,
+        session: &NewDeviceSession<'_>,
         key_hash: &str,
-    ) -> AppResult<DeviceRow> {
-        let results = db
-            .batch(vec![
-                DeviceRow::persist_session_statement(
-                    db, user, device, name, kind, session,
-                )?,
-                query!(
-                    db,
-                    "INSERT INTO \
-                     user_api_key_sessions(user_id,device_id,session_token) \
-                     SELECT ?1,?2,?3 WHERE changes()=1 AND EXISTS(SELECT 1 \
-                     FROM user_api_keys WHERE user_id=?1 AND key_hash=?4) AND \
-                     EXISTS( SELECT 1 FROM devices WHERE user_id=?1 AND \
-                     device_id=?2 AND session_token=?3) ON \
-                     CONFLICT(user_id,device_id) DO UPDATE SET \
-                     session_token=excluded.session_token",
-                    user,
-                    device,
-                    session,
-                    key_hash
-                )?,
-                db.prepare(
-                    "SELECT CASE WHEN changes()=1 THEN 1 ELSE \
-                     json_extract('[]', 'RAY_API_KEY_SESSION_CONFLICT') END",
-                ),
-            ])
-            .await
-            .map_err(DatabaseError::api_key_session)?;
-        results
-            .first()
-            .ok_or(AppError::Internal)?
-            .results::<DeviceRow>()?
-            .into_iter()
-            .next()
-            .ok_or(AppError::Internal)
+    ) -> AppResult<()> {
+        let abort = DbSentinel::ApiKeySessionConflict.sql_abort_expr();
+        db.batch(vec![
+            DeviceRow::guard_current_login_account(db, user)?,
+            session.upsert_statement(db, &user.id)?,
+            query!(
+                db,
+                "INSERT INTO \
+                 user_api_key_sessions(user_id,device_id,session_token) \
+                 SELECT ?1,?2,?3 WHERE changes()=1 AND EXISTS(SELECT 1 FROM \
+                 user_api_keys WHERE user_id=?1 AND key_hash=?4) AND EXISTS( \
+                 SELECT 1 FROM devices WHERE user_id=?1 AND device_id=?2 AND \
+                 session_token=?3) ON CONFLICT(user_id,device_id) DO UPDATE \
+                 SET session_token=excluded.session_token",
+                user.id,
+                session.device_id,
+                session.nonce,
+                key_hash
+            )?,
+            db.prepare(format!(
+                "SELECT CASE WHEN changes()=1 THEN 1 ELSE {abort} END"
+            )),
+        ])
+        .await
+        .map_err(|error| DatabaseError::api_key_session(&error))?;
+        Ok(())
     }
 }
 
-fn account_bindings(
-    user: &UserRow,
-    session: &SessionSnapshot<'_>,
-) -> worker::Result<Vec<JsValue>> {
+fn account_bindings(user: &UserRow, session: &SessionSnapshot<'_>) -> worker::Result<[JsValue; 8]> {
     if user.id != session.user_id {
         return Err(worker_failure("Account does not match session"));
     }
-    Ok(vec![
-        user.id.clone().into(),
-        session.security_stamp.into(),
-        user.master_password_hash.clone().into(),
-        user.password_salt.clone().map_or(JsValue::NULL, Into::into),
-        user.password_iterations.into(),
-        AccountSnapshot::from_user(user)
-            .to_json()
-            .map_err(worker::Error::from)?
-            .into(),
-        session.device_id.into(),
-        session.session_token.into(),
+    Ok(db::d1_params![
+        user.id,
+        session.security_stamp,
+        user.master_password_hash,
+        user.password_salt,
+        user.password_iterations,
+        AccountSnapshot::json_from_user(user).map_err(worker::Error::from)?,
+        session.device_id,
+        session.session_token,
     ])
 }

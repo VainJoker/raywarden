@@ -4,8 +4,8 @@ import re
 import sqlite3
 import unittest
 
-from sql_regression import NOW, database, statements, statement
-from sql_source import source
+from sql_fixtures import NOW, database
+from sql_source import source, statement, statements
 
 
 def clear_recovery_sql():

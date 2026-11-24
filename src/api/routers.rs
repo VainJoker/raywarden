@@ -1,16 +1,18 @@
+//! Router composition for the single application state shared by handlers.
 mod identity;
 mod send;
 mod server;
 mod vault;
 
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 
 use axum::Router;
+pub(super) use server::public_router;
 
 use crate::api::AppState;
 
-pub(super) fn router() -> Router<AppState> {
-    static ROUTER: OnceLock<Router<AppState>> = OnceLock::new();
+pub(super) fn router() -> Router<Arc<AppState>> {
+    static ROUTER: OnceLock<Router<Arc<AppState>>> = OnceLock::new();
     ROUTER
         .get_or_init(|| {
             Router::new()

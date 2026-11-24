@@ -7,22 +7,15 @@ import {
   parseJsonc, PROJECT_ROOT, readTargetConfig,
   CloudflareApi, verifyResources, resolveAccountId, checkHealth, main as deployMain,
 } from "../scripts/deploy.mjs";
+import { databaseId as uuid, productionConfig } from "./fixtures/production-config.mjs";
 
 const account = "a".repeat(32);
-const uuid = "11111111-1111-4111-8111-111111111111";
 function fixture(t, transform = (value) => value) {
   const dir = mkdtempSync(join(tmpdir(), "raywarden-deployment-test-"));
   t.after(() => rmSync(dir, { recursive: true, force: true }));
-  const binding = { binding: "DB", database_name: "configured-database", database_id: uuid, migrations_dir: "sql/migrations" };
-  const config = transform({
-    name: "configured-worker", secrets: { required: ["DOMAIN", "KEY_ENCRYPTION_KEY"] }, routes: [{ pattern: "vault.example.test", custom_domain: true }],
-    observability: { redact_query_string: true, logs: { enabled: true, invocation_logs: false } },
-    d1_databases: [binding], r2_buckets: [{ binding: "ATTACHMENTS_BUCKET", bucket_name: "configured-files" }],
-    ratelimits: [
-      { name: "LOGIN_RATE_LIMITER", namespace_id: "3101", simple: { limit: 5, period: 60 } },
-      { name: "SEND_ACCESS_RATE_LIMITER", namespace_id: "3103", simple: { limit: 15, period: 60 } },
-    ],
-  });
+  const config = transform(productionConfig({
+    name: "configured-worker", databaseName: "configured-database", bucketName: "configured-files",
+  }));
   const configPath = join(dir, "wrangler.jsonc");
   writeFileSync(configPath, JSON.stringify(config));
   return { dir, configPath, config };
@@ -177,12 +170,50 @@ test("health checks configured /api/alive, retries failures and rejects SPA/redi
   const result = await checkHealth({ configPath, attempts: 3 }, async (url, options) => {
     assert.equal(url, "https://vault.example.test/api/alive");
     assert.equal(options.redirect, "error");
+    assert.equal(options.cache, "no-store");
     assert.equal(options.headers["User-Agent"], "raywarden-health/0.1");
     return ++calls === 1 ? new Response("<html>SPA</html>") : new Response('"2026-11-13T00:00:00Z"');
   }, async () => { waits++; });
   assert.equal(result.url, "https://vault.example.test/api/alive");
   assert.equal(waits, 1);
   await assert.rejects(checkHealth({ configPath, attempts: 1 }, async () => new Response("unavailable", { status: 503 })), /HTTP 503/);
+});
+
+test("deployment health accepts only timestamps served by the expected release", async (t) => {
+  const { configPath } = fixture(t);
+  const expectedReleaseId = "a".repeat(64);
+  const header = "X-Raywarden-Release-Id";
+  const timestamp = "2024-02-29T00:00:00.123456Z";
+  const options = { configPath, attempts: 1, expectedReleaseId };
+  for (const value of [null, [], {}, "ok", "2026-02-29T00:00:00Z", "2026-11-13T25:00:00Z"]) {
+    await assert.rejects(checkHealth(options, async () => Response.json(value, {
+      headers: { [header]: expectedReleaseId },
+    })), /Expected an RFC3339 timestamp/);
+  }
+  for (const headers of [{}, { [header]: "b".repeat(64) }]) {
+    await assert.rejects(checkHealth(options, async () => Response.json(timestamp, { headers })), /expected release artifact/);
+  }
+  let calls = 0;
+  await checkHealth({ ...options, attempts: 2 }, async () => Response.json(timestamp, {
+    headers: { [header]: ++calls === 2 ? expectedReleaseId : "b".repeat(64) },
+  }), async () => {});
+  assert.equal(calls, 2);
+});
+
+test("production preflight validates supplied Secrets before remote steps and permits inherited ones", async () => {
+  for (const name of ["KEY_ENCRYPTION_KEY", "OWNER_SETUP_TOKEN", "ALLOWED_EMAILS"]) {
+    const value = "malformed-fixture-value";
+    await assert.rejects(deployMain(["preflight"], { [name]: value }), error => {
+      assert.match(error.message, new RegExp(`^${name} `));
+      assert.ok(!error.message.includes(value));
+      return true;
+    });
+  }
+  await deployMain(["preflight"], {});
+  await deployMain(["preflight"], {
+    ALLOWED_EMAILS: "owner@example.test", OWNER_SETUP_TOKEN: "fixture-only-setup-token-value-long-enough",
+    KEY_ENCRYPTION_KEY: Buffer.alloc(32, 3).toString("base64url"),
+  });
 });
 
 test("configuration rejects unsupported bindings", (t) => {
@@ -246,7 +277,7 @@ test("resources and health discover workers.dev without a custom domain or DOMAI
     }
     assert.equal(url, "https://configured-worker.my-account.workers.dev/api/alive");
     assert.equal(options.headers.Authorization, undefined);
-    return new Response('"healthy"');
+    return new Response('"2026-11-13T00:00:00Z"');
   };
   const output = await verifyResources(env, fetch, { configPath });
   assert.equal(output.worker_url, "https://configured-worker.my-account.workers.dev");
@@ -275,7 +306,7 @@ test("Integration gates same-run deployment on both checks and coverage, and onl
   assert.match(deployCall, /needs: \[check, coverage\]/);
   assert.match(deployCall, /uses: \.\/\.github\/workflows\/cloudflare\.yml/);
   assert.match(coverage, /just coverage$/m);
-  assert.match(check, /run: just ci[\s\S]*run: just dry-run[\s\S]*run: just test-worker[\s\S]*run: just artifact/);
+  assert.match(check, /run: just ci[\s\S]*run: just dry-run[\s\S]*run: just test-worker[\s\S]*run: just test-d1[\s\S]*run: just artifact/);
   assert.match(check, /if: startsWith\(github.ref, 'refs\/tags\/v'\)\s+run: just artifact/);
   assert.match(check, /if: startsWith\(github.ref, 'refs\/tags\/v'\)\s+uses: actions\/upload-artifact@/);
   assert.match(deploy, /on:\n  workflow_call:/);
@@ -283,7 +314,7 @@ test("Integration gates same-run deployment on both checks and coverage, and onl
   assert.match(deploy, /queue: max/);
   assert.match(deploy, /cancel-in-progress: false/);
   assert.match(deploy, /environment: production/);
-  assert.match(deploy, /run: just artifact-check[\s\S]*just db-migrate production[\s\S]*run: just deploy-worker[\s\S]*run: just health/);
+  assert.match(deploy, /run: just artifact-check[\s\S]*run: just deploy-preflight[\s\S]*just db-migrate production[\s\S]*run: just deploy-worker[\s\S]*run: just deploy-health/);
   assert.doesNotMatch(deploy, /just ci|just dry-run|just build|rust: "true"/);
   assert.match(deploy, /ref: \$\{\{ github\.sha \}\}/);
   assert.match(deploy, /ARTIFACT_SOURCE_SHA: \$\{\{ github\.sha \}\}/);

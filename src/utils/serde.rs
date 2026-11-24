@@ -5,11 +5,7 @@
 /// Accept only integer `0` and `1`, preserving the numeric representation on
 /// serialization. Boolean and string inputs are rejected.
 pub mod bool_from_int {
-    use serde::{
-        Deserialize,
-        Deserializer,
-        Serializer,
-    };
+    use serde::{Deserialize, Deserializer, Serializer};
 
     pub fn deserialize<'de, D>(deserializer: D) -> Result<bool, D::Error>
     where
@@ -38,10 +34,7 @@ pub mod bool_from_int {
 
 #[cfg(test)]
 mod tests {
-    use serde::{
-        Deserialize,
-        Serialize,
-    };
+    use serde::{Deserialize, Serialize};
     use serde_json::json;
 
     #[derive(Debug, PartialEq, Serialize, Deserialize)]
@@ -54,8 +47,8 @@ mod tests {
     fn numeric_booleans_round_trip_as_integers() {
         for (value, enabled) in [(0, false), (1, true)] {
             let wire = json!({"enabled": value});
-            let record: Record = serde_json::from_value(wire.clone())
-                .expect("integer boolean should decode");
+            let record: Record =
+                serde_json::from_value(wire.clone()).expect("integer boolean should decode");
             assert_eq!(record, Record { enabled });
             assert_eq!(
                 serde_json::to_value(record).expect("record should encode"),
@@ -74,10 +67,7 @@ mod tests {
             json!("1"),
             json!(null),
         ] {
-            assert!(
-                serde_json::from_value::<Record>(json!({"enabled": value}))
-                    .is_err()
-            );
+            assert!(serde_json::from_value::<Record>(json!({"enabled": value})).is_err());
         }
     }
 }

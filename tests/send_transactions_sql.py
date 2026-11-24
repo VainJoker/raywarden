@@ -1,59 +1,16 @@
 """Run production Send/guard SQL against SQLite; no network or fake D1 policy."""
 from concurrent.futures import ThreadPoolExecutor
 import json
-import re
 import sqlite3
 import tempfile
 from pathlib import Path
 from threading import Barrier
 import unittest
 
-from sql_source import account_guard, literal, source as read_source
-from sql_regression import NOW, OLD, FUTURE, database, function_source, rust_strings, statement
+from sql_fixtures import NOW, OLD, FUTURE, database, guard_sql, key_guard, send_guard, session_sql
+from sql_source import literal, statement
 
-REVISION = statement("send", "revision_statement").replace(
-    "{NEXT_USER_REVISION_SQL}", literal("cipher_mutation", "CASE WHEN julianday(updated_at)")
-)
-
-
-def literals(name):
-    return list(rust_strings(function_source("send", name)))
-
-
-def guard_sql(predicate):
-    source = read_source("cipher_mutation")
-    template = next(text for text in rust_strings(source) if "({predicate})" in text)
-    sentinel = re.search(r'CONFLICT_SENTINEL: &str = "([^"]+)"', source)[1]
-    return template.replace("{predicate}", predicate).replace("{CONFLICT_SENTINEL}", sentinel)
-
-
-def send_guard(snapshot, upload=False):
-    if upload:
-        predicate = next(text for text in literals("upload_predicate") if text.startswith("EXISTS("))
-        args = [snapshot[column] for column in (
-            "id", "user_id", "data", "encrypted_key", "file_id", "file_size_bytes", "storage_key", "upload_state"
-        )]
-    else:
-        columns = literals("snapshot_columns")
-        source = literals("snapshot_predicate")
-        column_template = next(text for text in source if "{column}" in text)
-        predicate = next(text for text in source if text.startswith("EXISTS("))
-        predicate = predicate.replace("{predicate}", " AND ".join(column_template.replace("{column}", column).replace("{}", str(index + 1)) for index, column in enumerate(columns)))
-        args = [snapshot[column] for column in columns]
-    return guard_sql(predicate), args
-
-
-def session_sql():
-    source = read_source("cipher_mutation")
-    template = next(text for text in rust_strings(source) if "{SESSION_SENTINEL}" in text)
-    sentinel = re.search(r'SESSION_SENTINEL: &str = "([^"]+)"', source)[1]
-    return template.replace("{SESSION_SENTINEL}", sentinel)
-
-
-def key_guard(snapshot):
-    source = read_source("cipher_mutation")
-    exists = next(text for text in rust_strings(source) if text.startswith("EXISTS(") and "{}" in text)
-    return guard_sql(exists.replace("{}", account_guard(2))), [snapshot["id"], json.dumps(snapshot)]
+REVISION = statement("send", "revision_statement")
 
 
 def snapshot(db, send_id="send"):
@@ -62,7 +19,7 @@ def snapshot(db, send_id="send"):
 
 
 def finalize_upload(db, before, size=7, staged="staged-object", owner=None):
-    """Execute the same session/key/source guards and writes as the Rust commit."""
+    """Exercise the session, source and metadata SQL for Send upload."""
     owner = owner or dict(db.execute("SELECT * FROM users WHERE id=?", (before["user_id"],)).fetchone())
     db.commit()
     with db:
@@ -112,6 +69,7 @@ class SendTransactionsSql(unittest.TestCase):
         for change in (
             "UPDATE users SET security_stamp='revoked' WHERE id='alice'",
             "DELETE FROM devices WHERE user_id='alice'",
+            "UPDATE devices SET session_token='new-session' WHERE user_id='alice' AND device_id='device'",
             "UPDATE users SET key='v2-rewrapped-key',security_version=2 WHERE id='alice'",
         ):
             with self.subTest(change=change):
@@ -127,6 +85,15 @@ class SendTransactionsSql(unittest.TestCase):
                     self.assertIsNone(snapshot(db)["storage_key"])
                 finally:
                     db.close()
+
+    def test_send_upload_rechecks_file_metadata_and_wrapped_key(self):
+        before = snapshot(self.db)
+        for column, value in (("user_id", "bob"), ("file_id", "wrong-file"), ("encrypted_key", "rotated-key")):
+            with self.db:
+                self.db.execute(f"UPDATE sends SET {column}=? WHERE id='send'", (value,))
+                with self.assertRaises(sqlite3.OperationalError):
+                    self.db.execute(*send_guard(before, upload=True))
+                self.db.execute(f"UPDATE sends SET {column}=? WHERE id='send'", (before[column],))
 
     def test_count_and_owner_revision_roll_back_together(self):
         finalize_upload(self.db, snapshot(self.db))
@@ -164,7 +131,7 @@ class SendTransactionsSql(unittest.TestCase):
                         consume(db)
                         return True
                     except sqlite3.OperationalError as error:
-                        if "RW_SEND_ACCESS_DENIED" not in str(error):
+                        if "RAY_SEND_ACCESS_DENIED" not in str(error):
                             raise
                         return False
                 finally:

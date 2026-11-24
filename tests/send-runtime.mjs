@@ -1,25 +1,19 @@
+import { captureNotifications } from "./runtime-fixture.mjs";
 // Compiled Rust HTTP behavior over workerd's native SQLite adapter and fixture
 // object storage. SQL below seeds data or schedules real transactional races.
-function equal(actual, expected, label = "value") {
-  if (actual !== expected) throw new Error(`${label}: expected ${expected}, received ${actual}`);
-}
-function ok(value, label) { if (!value) throw new Error(label); }
+import { bearerJsonHeaders, equal, expectJson, expectStatus, ok } from "./runtime-assertions.mjs";
 
 export async function runSendCompatibility({ fixture, check, accessToken, USER, FILE, SEND, sql }) {
   const row = (id = SEND) => sql.exec("SELECT * FROM sends WHERE id=?", id).one();
   const count = (id = SEND) => row(id).access_count;
-  async function expect(response, status) {
-    equal(response.status, status, await response.clone().text());
-    return response.json();
-  }
-  const owner = async () => ({ Authorization: `Bearer ${await accessToken()}`, "Content-Type": "application/json" });
+  const owner = async () => bearerJsonHeaders(await accessToken());
   const payload = (extra = {}) => ({ type: 0, name: "encrypted-send", key: "wrapped-key",
     text: { text: "encrypted-content", hidden: false }, deletionDate: new Date(Date.now() + 86400000).toISOString(), ...extra });
-  const create = async (f, extra = {}) => expect(await f.fetch("/api/sends", {
+  const create = async (f, extra = {}) => expectJson(await f.fetch("/api/sends", {
     method: "POST", headers: await owner(), body: JSON.stringify(payload(extra)),
   }), 200);
   async function accessId(f, id = SEND) {
-    return (await expect(await f.fetch(`/api/sends/${id}`, { headers: await owner() }), 200)).accessId;
+    return (await expectJson(await f.fetch(`/api/sends/${id}`, { headers: await owner() }), 200)).accessId;
   }
   async function issue(f, id, extra = {}) {
     return f.fetch("/identity/connect/token", { method: "POST",
@@ -27,7 +21,7 @@ export async function runSendCompatibility({ fixture, check, accessToken, USER, 
       body: new URLSearchParams({ grant_type: "send_access", send_id: id, ...extra }).toString() });
   }
   const access = (f, token, path = "/api/sends/access") => f.fetch(path, {
-    method: "POST", headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" }, body: "{}",
+    method: "POST", headers: bearerJsonHeaders(token), body: "{}",
   });
   async function upload(f, bytes, extra = false, route = `/api/sends/${SEND}/file/${FILE}`) {
     const form = new FormData();
@@ -36,16 +30,44 @@ export async function runSendCompatibility({ fixture, check, accessToken, USER, 
     return f.fetch(route, { method: "POST", headers: { Authorization: `Bearer ${await accessToken()}` }, body: form });
   }
 
-  await check("Send creation and counted access notify with the committed owner revision", async () => {
-    const f = fixture(), messages = [];
-    class DurableObjectNamespace {
-      idFromName(name) { return { name }; }
-      get() { return { fetch: async request => {
-        messages.push(await request.json());
-        return new Response(null, { status: 204 });
-      } }; }
+  await check("Send bearer routes challenge missing and invalid capabilities without labeling D1 errors", async () => {
+    const f = fixture();
+    const issued = await expectJson(await issue(f, await accessId(f)), 200);
+    const paths = ["/api/sends/access", `/api/sends/access/file/${FILE}`];
+    const post = (path, authorization) => f.fetch(path, {
+      method: "POST", headers: authorization === undefined ? {} : { Authorization: authorization },
+    });
+    const challenge = response => response.headers.get("WWW-Authenticate");
+    for (const path of paths) {
+      for (const authorization of [undefined, "Bearer", "Bearer\ttoken"]) {
+        const missing = await post(path, authorization);
+        equal(challenge(missing), "Bearer");
+        equal((await expectJson(missing, 401)).message, "Unauthorized: Send access token required");
+      }
+      const invalid = await post(path, "Bearer invalid");
+      equal(challenge(invalid), 'Bearer error="invalid_token"');
+      equal((await expectJson(invalid, 401)).code, 4);
+      await expectJson(await post(path, `bEaReR   ${issued.access_token}`), 200);
     }
-    f.env.NOTIFY_DO = new DurableObjectNamespace();
+
+    const queryProof = await f.fetch(`/api/sends/${SEND}/${FILE}?t=invalid`);
+    equal(challenge(queryProof), null);
+    await expectJson(queryProof, 401);
+
+    const execute = f.db.execute.bind(f.db);
+    f.db.execute = (query, params) => {
+      if (query.startsWith("SELECT * FROM sends WHERE id = ?1")) throw new Error("fixture Send query unavailable");
+      return execute(query, params);
+    };
+    for (const path of paths) {
+      const failure = await post(path, `Bearer ${issued.access_token}`);
+      equal(challenge(failure), null);
+      equal((await expectJson(failure, 500)).message, "Internal server error");
+    }
+  });
+
+  await check("Send creation and counted access notify with the committed owner revision", async () => {
+    const f = fixture(), messages = captureNotifications(f);
     const future = "2099-01-01T00:00:00.000Z";
     sql.exec("UPDATE users SET updated_at=? WHERE id=?", future, USER);
     let previousRevision = Date.parse(future);
@@ -72,23 +94,73 @@ export async function runSendCompatibility({ fixture, check, accessToken, USER, 
     const send = await create(f);
     equal(send.revisionDate, row(send.id).updated_at);
     assertRevision(send.id, 12);
-    const issued = await expect(await issue(f, send.accessId), 200);
-    await expect(await access(f, issued.access_token), 200);
+    const issued = await expectJson(await issue(f, send.accessId), 200);
+    await expectJson(await access(f, issued.access_token), 200);
     equal(count(send.id), 1);
     assertRevision(send.id, 13);
 
-    await expect(await f.fetch(`/api/sends/${SEND}/access/file/${FILE}`, {
+    await expectJson(await f.fetch(`/api/sends/${SEND}/access/file/${FILE}`, {
       method: "POST", headers: { "Content-Type": "application/json" }, body: "{}",
     }), 200);
     equal(count(), 1);
     assertRevision(SEND, 13);
   });
 
+  await check("a failed creator email lookup leaves the Send readable and publishes no update", async () => {
+    for (const [mode, text, legacy] of [["legacy text", true, true], ["bearer text", true, false], ["bearer file", false, false]]) {
+      const f = fixture();
+      const send = text ? await create(f, { maxAccessCount: 1 }) : {
+        id: SEND, accessId: await accessId(f),
+      };
+      const token = legacy ? null : (await expectJson(await issue(f, send.accessId), 200)).access_token;
+      const read = () => token ? access(f, token) : f.fetch(`/api/sends/access/${send.accessId}`, {
+        method: "POST", headers: { "Content-Type": "application/json" }, body: "{}",
+      });
+      const messages = captureNotifications(f);
+      const before = "2099-01-01T00:00:00.000Z";
+      sql.exec("UPDATE users SET updated_at=? WHERE id=?", before, USER);
+      const revision = () => sql.exec("SELECT updated_at FROM users WHERE id=?", USER).one().updated_at;
+      const execute = f.db.execute.bind(f.db);
+      let emailReads = 0, failEmailRead = true;
+      f.db.execute = (query, params) => {
+        if (query.includes("SELECT email FROM users WHERE id=?1")) {
+          emailReads++;
+          if (failEmailRead) throw new Error("D1_ERROR: fixture creator lookup unavailable");
+        }
+        return execute(query, params);
+      };
+
+      const failure = await expectJson(await read(), 500);
+      equal(failure.code, 1, mode);
+      equal(failure.message, "Internal server error", mode);
+      equal(emailReads, 1, mode);
+      equal(count(send.id), 0, mode);
+      equal(revision(), before, mode);
+      equal(messages.length, 0, mode);
+
+      failEmailRead = false;
+      const retry = await expectJson(await read(), 200);
+      equal(retry.creatorIdentifier, "owner@example.test", mode);
+      if (text) equal(retry.text.text, "encrypted-content", mode);
+      else equal(retry.file.id, FILE, mode);
+      equal(count(send.id), text ? 1 : 0, mode);
+      equal(Date.parse(revision()), Date.parse(before) + 1, mode);
+      equal(messages.length, 1, mode);
+      if (text) {
+        failEmailRead = true;
+        await expectJson(await read(), 404);
+        equal(emailReads, 2, mode);
+        equal(count(send.id), 1, mode);
+        equal(messages.length, 1, mode);
+      }
+    }
+  });
+
   await check("Send issuance does not count; five concurrent actual text reads enforce max two", async () => {
     const f = fixture();
     const send = await create(f, { maxAccessCount: 2, hideEmail: true });
     const before = sql.exec("SELECT updated_at FROM users WHERE id=?", USER).one().updated_at;
-    const issued = await expect(await issue(f, send.accessId), 200);
+    const issued = await expectJson(await issue(f, send.accessId), 200);
     equal(count(send.id), 0, "issuance count");
     equal(sql.exec("SELECT updated_at FROM users WHERE id=?", USER).one().updated_at, before, "issuance cursor");
     const responses = await Promise.all(Array.from({ length: 5 }, () => access(f, issued.access_token)));
@@ -104,14 +176,20 @@ export async function runSendCompatibility({ fixture, check, accessToken, USER, 
     const f = fixture();
     sql.exec("UPDATE sends SET max_access_count=1 WHERE id=?", SEND);
     const id = await accessId(f);
-    const issued = await expect(await issue(f, id), 200);
+    const issued = await expectJson(await issue(f, id), 200);
     equal(count(), 0);
-    await expect(await access(f, issued.access_token), 200); equal(count(), 0);
-    await expect(await access(f, issued.access_token, "/api/sends/access/file/wrong-file"), 404); equal(count(), 0);
-    const grant = await expect(await access(f, issued.access_token, `/api/sends/access/file/${FILE}`), 200);
+    await expectJson(await access(f, issued.access_token), 200); equal(count(), 0);
+    await expectJson(await access(f, issued.access_token, "/api/sends/access/file/wrong-file"), 404); equal(count(), 0);
+    const grant = await expectJson(await access(f, issued.access_token, `/api/sends/access/file/${FILE}`), 200);
     equal(count(), 1);
-    await expect(await access(f, issued.access_token, `/api/sends/access/file/${FILE}`), 404);
-    await expect(await access(f, issued.access_token), 200); equal(count(), 1);
+    await expectJson(await access(f, issued.access_token, `/api/sends/access/file/${FILE}`), 404);
+    const head = f.bucket.head.bind(f.bucket);
+    let storageLookups = 0;
+    f.bucket.head = async () => { storageLookups++; throw new Error("fixture storage unavailable"); };
+    await expectJson(await access(f, issued.access_token, `/api/sends/access/file/${FILE}`), 404);
+    equal(storageLookups, 0, "an exhausted bearer grant should not query storage");
+    f.bucket.head = head;
+    await expectJson(await access(f, issued.access_token), 200); equal(count(), 1);
     const path = new URL(grant.url).pathname + new URL(grant.url).search;
     for (const method of ["GET", "HEAD"]) {
       const response = await f.fetch(path, { method });
@@ -123,15 +201,15 @@ export async function runSendCompatibility({ fixture, check, accessToken, USER, 
   await check("missing Send bytes never consume a file grant", async () => {
     const f = fixture();
     f.bucket.objects.delete(`sends/${SEND}/${FILE}`);
-    const issued = await expect(await issue(f, await accessId(f)), 200);
-    await expect(await access(f, issued.access_token, `/api/sends/access/file/${FILE}`), 404);
+    const issued = await expectJson(await issue(f, await accessId(f)), 200);
+    await expectJson(await access(f, issued.access_token, `/api/sends/access/file/${FILE}`), 404);
     equal(count(), 0);
   });
 
   await check("a failed Send owner cursor rolls the actual public count back", async () => {
     const f = fixture();
     const send = await create(f, { maxAccessCount: 1 });
-    const issued = await expect(await issue(f, send.accessId), 200);
+    const issued = await expectJson(await issue(f, send.accessId), 200);
     sql.exec("CREATE TRIGGER send_runtime_revision_failure BEFORE UPDATE OF updated_at ON users BEGIN SELECT RAISE(ABORT,'synthetic Send cursor failure'); END");
     equal((await access(f, issued.access_token)).status, 500);
     equal(count(send.id), 0);
@@ -156,7 +234,7 @@ export async function runSendCompatibility({ fixture, check, accessToken, USER, 
     const f = fixture(), oldKey = `sends/${SEND}/${FILE}`;
     sql.exec("UPDATE sends SET file_size_bytes=0 WHERE id=?", SEND);
     const response = await upload(f, "");
-    equal(response.status, 201, await response.text());
+    await expectStatus(response, 201);
     const published = row(), adopted = published.storage_key;
     equal(published.upload_state, 0, "empty file is published");
     equal(published.file_size_bytes, 0, "published size remains zero");
@@ -230,7 +308,7 @@ export async function runSendCompatibility({ fixture, check, accessToken, USER, 
 
   await check("an owner Send update cannot overwrite a concurrent actual content access", async () => {
     const f = fixture(); const send = await create(f, { maxAccessCount: 2 });
-    const issued = await expect(await issue(f, send.accessId), 200);
+    const issued = await expectJson(await issue(f, send.accessId), 200);
     const batch = f.db.batch.bind(f.db); let reached, release;
     const gate = new Promise(resolve => { reached = resolve; });
     const resume = new Promise(resolve => { release = resolve; });
@@ -242,7 +320,7 @@ export async function runSendCompatibility({ fixture, check, accessToken, USER, 
       body: JSON.stringify(payload({ name: "must-not-overwrite", maxAccessCount: 2 })) });
     try {
       await Promise.race([gate, pending.then(async response => { throw new Error(`Update missed transaction gate: ${response.status} ${await response.text()}`); })]);
-      await expect(await access(f, issued.access_token), 200);
+      await expectJson(await access(f, issued.access_token), 200);
       release(); equal((await pending).status, 400);
       equal(row(send.id).name, "encrypted-send"); equal(count(send.id), 1);
     } finally { release(); await pending; }

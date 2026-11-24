@@ -3,7 +3,8 @@ import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSyn
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import test from "node:test";
-import { createArtifactManifest, deployArtifact, parseDeployArgs, verifyArtifact } from "../scripts/deploy.mjs";
+import { artifactReleaseId, createArtifactManifest, deployArtifact, parseDeployArgs, verifyArtifact } from "../scripts/deploy.mjs";
+import { productionConfig } from "./fixtures/production-config.mjs";
 
 const sha = "a".repeat(40);
 const head = async () => sha;
@@ -12,15 +13,12 @@ function fixture(t) {
   t.after(() => rmSync(dir, { recursive: true, force: true }));
   const write = (path, content) => { mkdirSync(dirname(join(dir, path)), { recursive: true }); writeFileSync(join(dir, path), content); };
   const config = {
-    name: "artifact-worker", main: "build/index.js", build: { command: "must-never-run" }, secrets: { required: ["DOMAIN", "KEY_ENCRYPTION_KEY"] }, vars: { LOG_LEVEL: "info" },
-    observability: { redact_query_string: true, logs: { enabled: true, invocation_logs: false } },
-    assets: { directory: "static/web-vault", not_found_handling: "404-page" }, routes: [{ pattern: "vault.example.test", custom_domain: true }],
-    d1_databases: [{ binding: "DB", database_name: "artifact-db", database_id: "11111111-1111-4111-8111-111111111111", migrations_dir: "sql/migrations" }],
-    r2_buckets: [{ binding: "ATTACHMENTS_BUCKET", bucket_name: "artifact-files" }], migrations: [{ tag: "v1", new_sqlite_classes: ["NotifyDo"] }],
-    ratelimits: [
-      { name: "LOGIN_RATE_LIMITER", namespace_id: "3101", simple: { limit: 5, period: 60 } },
-      { name: "SEND_ACCESS_RATE_LIMITER", namespace_id: "3103", simple: { limit: 15, period: 60 } },
-    ],
+    ...productionConfig({ name: "artifact-worker", databaseName: "artifact-db", bucketName: "artifact-files" }),
+    main: "build/index.js",
+    build: { command: "must-never-run" },
+    vars: { LOG_LEVEL: "info" },
+    assets: { directory: "static/web-vault", not_found_handling: "404-page" },
+    migrations: [{ tag: "v1", new_sqlite_classes: ["notifydo"] }],
   };
   write("wrangler.jsonc", JSON.stringify(config));
   for (const path of ["Cargo.lock", "package-lock.json"]) write(path, "fixture\n");
@@ -57,25 +55,24 @@ test("real Git subprocess receives no application Secrets while resolving the ar
   assert.deepEqual(JSON.parse(readFileSync(observation, "utf8")), { ALLOWED_EMAILS: false, OWNER_SETUP_TOKEN: false, KEY_ENCRYPTION_KEY: false });
 });
 
-test("changed final JavaScript, WASM, assets and locks prevent upload", async (t) => {
-  for (const path of [".wrangler/deploy-check/production/index.js", ".wrangler/deploy-check/production/worker.wasm", "static/web-vault/index.html", "Cargo.lock", "package-lock.json"]) {
-    const { options, write } = fixture(t);
+test("changed or missing final JavaScript, WASM, assets and locks prevent upload", async (t) => {
+  const files = [
+    ".wrangler/deploy-check/production/index.js", ".wrangler/deploy-check/production/worker.wasm",
+    "static/web-vault/index.html", "Cargo.lock", "package-lock.json",
+  ];
+  for (const path of files) {
+    const { options, dir, write } = fixture(t);
     await createArtifactManifest(options, head);
-    write(path, path.endsWith(".wasm") ? Buffer.from([0, 97, 115, 109, 1, 0, 0, 0, 0, 1, 0]) : "changed\n");
-    let deployed = false;
-    await assert.rejects(deployArtifact(options, () => { deployed = true; }, head, {}), /digest mismatch/);
-    assert.equal(deployed, false);
-  }
-});
+    const upload = () => assert.fail(`Invalid artifact reached the uploader: ${path}`);
+    const original = readFileSync(join(dir, path));
+    const tampered = path.endsWith(".wasm") ? Buffer.from([0, 97, 115, 109, 1, 0, 0, 0, 0, 1, 0]) : "changed\n";
+    write(path, tampered);
+    await assert.rejects(deployArtifact(options, upload, head, {}), /digest mismatch/, `changed ${path}`);
+    write(path, original);
 
-test("missing final JavaScript, WASM, assets and locks prevent upload", async (t) => {
-  for (const path of [".wrangler/deploy-check/production/index.js", ".wrangler/deploy-check/production/worker.wasm", "static/web-vault/index.html", "Cargo.lock", "package-lock.json"]) {
-    const { options, dir } = fixture(t);
-    await createArtifactManifest(options, head);
     rmSync(join(dir, path));
-    let deployed = false;
-    await assert.rejects(deployArtifact(options, () => { deployed = true; }, head, {}), /inventory|no WASM|Missing/);
-    assert.equal(deployed, false);
+    const missing = path === "static/web-vault/index.html" ? /Missing prepared Web Vault/ : /inventory|no WASM|Missing/;
+    await assert.rejects(deployArtifact(options, upload, head, {}), missing, `missing ${path}`);
   }
 });
 
@@ -98,19 +95,16 @@ test("wrong commit, environment or configuration cannot reuse an artifact", asyn
   await assert.rejects(verifyArtifact(options, head), /configuration changed/);
 });
 
-test("missing or added artifact modules are rejected before upload", async (t) => {
-  const { options, write, dir } = fixture(t);
+test("unexpected artifact modules are rejected by verification", async (t) => {
+  const { options, write } = fixture(t);
   await createArtifactManifest(options, head);
   write(".wrangler/deploy-check/production/unexpected.js", "export default 1;");
   await assert.rejects(verifyArtifact(options, head), /inventory/);
-  rmSync(join(dir, ".wrangler/deploy-check/production/unexpected.js"));
-  rmSync(join(dir, "static/web-vault/index.html"));
-  await assert.rejects(verifyArtifact(options, head), /Missing prepared Web Vault/);
 });
 
 test("compiled deployment disables both custom and internal builds and retains resource identities", async (t) => {
   const { options, dir, config } = fixture(t);
-  await createArtifactManifest(options, head);
+  const manifest = await createArtifactManifest(options, head);
   let temporary;
   let called = 0;
   await deployArtifact(options, (args, commandOptions) => {
@@ -138,7 +132,7 @@ test("compiled deployment disables both custom and internal builds and retains r
     assert.equal(deployed.d1_databases[0].database_name, config.d1_databases[0].database_name);
     assert.equal(deployed.d1_databases[0].migrations_dir, join(dir, "sql/migrations"));
     assert.deepEqual(deployed.routes, config.routes);
-    assert.deepEqual(deployed.vars, config.vars);
+    assert.deepEqual(deployed.vars, { ...config.vars, RAYWARDEN_RELEASE_ID: artifactReleaseId(manifest) });
     assert.deepEqual(deployed.ratelimits, config.ratelimits);
     assert.deepEqual(deployed.secrets, config.secrets);
     assert.deepEqual(deployed.observability, config.observability);
@@ -163,24 +157,9 @@ test("missing required rate limit bindings reject artifact upload before network
 
 
 
-test("failed artifact upload cleans its temporary configuration without rebuilding", async (t) => {
-  const { options } = fixture(t);
-  await createArtifactManifest(options, head);
-  let temporary, secretsFile;
-  await assert.rejects(deployArtifact(options, (args) => {
-    temporary = args[args.indexOf("--config") + 1];
-    secretsFile = args[args.indexOf("--secrets-file") + 1];
-    assert.equal(existsSync(secretsFile), true);
-    throw new Error("upload failed");
-  }, head, {}), /upload failed/);
-  assert.equal(existsSync(temporary), false);
-  assert.equal(existsSync(secretsFile), false);
-  assert.equal(existsSync(dirname(temporary)), false);
-});
-
 test("first upload supplies private owner secrets and the selected origin without putting values in argv or child environment", async (t) => {
   const { options, config } = fixture(t);
-  await createArtifactManifest(options, head);
+  const manifest = await createArtifactManifest(options, head);
   const environment = { ALLOWED_EMAILS: " Owner+Vault@Example.Test ", OWNER_SETUP_TOKEN: "fake-private-setup-token-".repeat(2), KEY_ENCRYPTION_KEY: "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8", DOMAIN: "https://ignored.example.test", CLOUDFLARE_API_TOKEN: "fake-cloudflare-token" };
   let temporary;
   await deployArtifact(options, (args, commandOptions) => {
@@ -195,10 +174,22 @@ test("first upload supplies private owner secrets and the selected origin withou
     assert.equal(commandOptions.environment.CLOUDFLARE_API_TOKEN, environment.CLOUDFLARE_API_TOKEN);
     for (const value of [environment.ALLOWED_EMAILS, environment.OWNER_SETUP_TOKEN, environment.KEY_ENCRYPTION_KEY]) assert.equal(args.join(" ").includes(value), false);
     const deployed = JSON.parse(readFileSync(args[args.indexOf("--config") + 1], "utf8"));
-    assert.deepEqual(deployed.vars, config.vars);
+    assert.deepEqual(deployed.vars, { ...config.vars, RAYWARDEN_RELEASE_ID: artifactReleaseId(manifest) });
   }, head, environment);
   assert.equal(existsSync(temporary), false);
   assert.equal(existsSync(dirname(temporary)), false);
+});
+
+test("release identity changes when the same source produces a different bundle", async t => {
+  const { options, write } = fixture(t);
+  const before = await createArtifactManifest(options, head);
+  const reversed = { ...before, files: Object.fromEntries(Object.entries(before.files).reverse()) };
+  assert.equal(artifactReleaseId(reversed), artifactReleaseId(before));
+  write(".wrangler/deploy-check/production/index.js", "export default { changed: true };\n");
+  const after = await createArtifactManifest(options, head);
+  assert.equal(after.sourceSha, before.sourceSha);
+  assert.match(artifactReleaseId(after), /^[0-9a-f]{64}$/);
+  assert.notEqual(artifactReleaseId(after), artifactReleaseId(before));
 });
 
 test("private enrollment deployment accepts and canonicalizes multiple exact account emails", async (t) => {
@@ -285,15 +276,30 @@ test("workers.dev first upload resolves the account subdomain before supplying D
   await assert.rejects(deployArtifact(options, () => assert.fail("must not upload"), head, {}), /CLOUDFLARE_API_TOKEN is required/);
 });
 
-test("the default uploader propagates Wrangler process failure and removes its temporary configuration", async (t) => {
+test("Wrangler process failure propagates and removes both temporary deployment files", async (t) => {
   const { options, dir, write } = fixture(t);
-  write("node_modules/wrangler/bin/wrangler.js", 'require("node:fs").writeFileSync("invocation.json", JSON.stringify(process.argv.slice(2))); process.exitCode = 7;\n');
+  write("node_modules/wrangler/bin/wrangler.js", `
+    const fs = require("node:fs");
+    const args = process.argv.slice(2);
+    const configPath = args[args.indexOf("--config") + 1];
+    const secretsPath = args[args.indexOf("--secrets-file") + 1];
+    const config = JSON.parse(fs.readFileSync(configPath, "utf8"));
+    fs.writeFileSync("invocation.json", JSON.stringify({
+      args, configPath, secretsPath,
+      secretsExisted: fs.existsSync(secretsPath), hasBuild: Object.hasOwn(config, "build"),
+    }));
+    process.exitCode = 7;
+  `);
   await createArtifactManifest(options, head);
   await assert.rejects(deployArtifact(options, undefined, head, {}), { code: 7 });
-  const args = JSON.parse(readFileSync(join(dir, "invocation.json"), "utf8"));
+  const { args, configPath, secretsPath, secretsExisted, hasBuild } = JSON.parse(readFileSync(join(dir, "invocation.json"), "utf8"));
   assert.deepEqual(args.slice(0, 2), ["deploy", "--no-bundle"]);
   assert.deepEqual(args.slice(-2), ["--env", ""]);
-  assert.equal(existsSync(args[args.indexOf("--config") + 1]), false);
+  assert.equal(hasBuild, false);
+  assert.equal(secretsExisted, true);
+  assert.equal(existsSync(configPath), false);
+  assert.equal(existsSync(secretsPath), false);
+  assert.equal(existsSync(dirname(configPath)), false);
 });
 
 test("deployment CLI requires a subcommand with command-specific flags and always targets production", () => {

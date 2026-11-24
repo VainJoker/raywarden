@@ -2,30 +2,16 @@
 use std::collections::HashSet;
 
 use serde_json::Value;
-use worker::{
-    D1Database,
-    D1PreparedStatement,
-    query,
-    wasm_bindgen::JsValue,
-};
+use worker::{D1Database, D1PreparedStatement, query, wasm_bindgen::JsValue};
 
 use super::AccountSnapshot;
 use crate::{
-    errors::{
-        AppError,
-        AppResult,
-        DatabaseError,
-    },
+    errors::{AppError, AppResult, DatabaseError},
     infra::db,
     models::{
-        identity::{
-            device::SessionSnapshot,
-            user::UserRow,
-        },
-        mutation::{
-            CONFLICT_SENTINEL,
-            map_database_error,
-        },
+        identity::{device::SessionSnapshot, user::UserRow},
+        mutation::map_database_error,
+        page::{PageOrder, PageQuery},
     },
 };
 
@@ -42,12 +28,32 @@ const CIPHERS: &[&str] = &[
     "created_at",
     "updated_at",
 ];
+const CIPHER_TEXT_COLUMNS: &[&str] = &[
+    "id",
+    "user_id",
+    "organization_id",
+    "data",
+    "folder_id",
+    "deleted_at",
+    "archived_at",
+    "created_at",
+    "updated_at",
+];
 const FOLDERS: &[&str] = &["id", "name", "created_at", "updated_at"];
 const ATTACHMENTS: &[&str] = &[
     "id",
     "cipher_id",
     "file_name",
     "file_size_bytes",
+    "encrypted_key",
+    "storage_key",
+    "created_at",
+    "updated_at",
+];
+const ATTACHMENT_TEXT_COLUMNS: &[&str] = &[
+    "id",
+    "cipher_id",
+    "file_name",
     "encrypted_key",
     "storage_key",
     "created_at",
@@ -67,57 +73,92 @@ const PASSKEYS: &[&str] = &[
     "account_snapshot",
     "updated_at",
 ];
+const PASSKEY_TEXT_COLUMNS: &[&str] = &[
+    "id",
+    "credential_id",
+    "public_key",
+    "credential_use",
+    "encrypted_public_key",
+    "encrypted_user_key",
+    "encrypted_private_key",
+    "account_snapshot",
+    "updated_at",
+];
 
 pub struct CollectionSnapshot {
-    table:   &'static str,
+    table: &'static str,
     columns: &'static [&'static str],
-    filter:  &'static str,
-    rows:    Vec<Value>,
+    filter: &'static str,
+    rows: Vec<Value>,
 }
 impl CollectionSnapshot {
     pub async fn ciphers(db: &D1Database, owner: &str) -> AppResult<Self> {
-        Self::load(db, "ciphers", CIPHERS, owner, "user_id=?1").await
+        Self::load(
+            db,
+            "ciphers",
+            CIPHERS,
+            CIPHER_TEXT_COLUMNS,
+            owner,
+            "user_id=?1",
+            "user_id=?",
+        )
+        .await
     }
     pub async fn folders(db: &D1Database, owner: &str) -> AppResult<Self> {
-        Self::load(db, "folders", FOLDERS, owner, "user_id=?1").await
+        Self::load(
+            db,
+            "folders",
+            FOLDERS,
+            FOLDERS,
+            owner,
+            "user_id=?1",
+            "user_id=?",
+        )
+        .await
     }
     pub async fn attachments(db: &D1Database, owner: &str) -> AppResult<Self> {
         Self::load(
             db,
             "attachments",
             ATTACHMENTS,
+            ATTACHMENT_TEXT_COLUMNS,
             owner,
             "cipher_id IN (SELECT id FROM ciphers WHERE user_id=?1)",
+            "cipher_id IN (SELECT id FROM ciphers WHERE user_id=?)",
         )
         .await
     }
     pub async fn passkeys(db: &D1Database, owner: &str) -> AppResult<Self> {
-        Self::load(db, "webauthn_credentials", PASSKEYS, owner, "user_id=?1")
-            .await
+        Self::load(
+            db,
+            "webauthn_credentials",
+            PASSKEYS,
+            PASSKEY_TEXT_COLUMNS,
+            owner,
+            "user_id=?1",
+            "user_id=?",
+        )
+        .await
     }
 
     async fn load(
         db: &D1Database,
         table: &'static str,
         columns: &'static [&'static str],
+        text_columns: &'static [&'static str],
         owner: &str,
         filter: &'static str,
+        page_filter: &'static str,
     ) -> AppResult<Self> {
-        let sql = format!(
-            "SELECT {} FROM {table} WHERE {filter} ORDER BY id",
-            columns.join(",")
-        );
-        let rows = db::run_query(
-            async {
-                db.prepare(&sql)
-                    .bind(&[owner.into()])?
-                    .all()
-                    .await?
-                    .results::<Value>()
-            },
-            "Failed to read rotation source rows",
-        )
-        .await?;
+        let query = PageQuery {
+            table,
+            filter: page_filter,
+            text_columns,
+            order: PageOrder::RowId,
+            related_bytes: None,
+        };
+        let mut rows = query.fetch_all::<Value>(db, &db::d1_params![owner]).await?;
+        rows.sort_by(|left, right| left["id"].as_str().cmp(&right["id"].as_str()));
         Ok(Self {
             table,
             columns,
@@ -125,18 +166,14 @@ impl CollectionSnapshot {
             rows,
         })
     }
-    pub fn guards(
-        &self,
-        db: &D1Database,
-        owner: &str,
-    ) -> AppResult<Vec<D1PreparedStatement>> {
+    pub fn guards(&self, db: &D1Database, owner: &str) -> AppResult<Vec<D1PreparedStatement>> {
         let mut guards = vec![crate::models::mutation::guard(
             db,
             &format!(
                 "(SELECT COUNT(*) FROM {} WHERE {})=?2",
                 self.table, self.filter
             ),
-            &[owner.into(), JsValue::from_f64(self.rows.len() as f64)],
+            &db::d1_params![owner, self.rows.len() as f64],
         )?];
         let predicates = self
             .columns
@@ -150,22 +187,22 @@ impl CollectionSnapshot {
             self.table, self.filter
         );
         for row in &self.rows {
-            let mut values = vec![owner.into()];
+            let mut values = Vec::with_capacity(self.columns.len() + 1);
+            values.push(JsValue::from_str(owner));
             for column in self.columns {
                 values.push(json_scalar_binding(&row[*column])?);
             }
-            guards
-                .push(crate::models::mutation::guard(db, &predicate, &values)?);
+            guards.push(crate::models::mutation::guard(db, &predicate, &values)?);
         }
         Ok(guards)
     }
     pub fn rows(&self) -> &[Value] {
         &self.rows
     }
-    pub fn ids(&self) -> HashSet<String> {
+    pub fn ids(&self) -> HashSet<&str> {
         self.rows
             .iter()
-            .filter_map(|row| row["id"].as_str().map(str::to_string))
+            .filter_map(|row| row["id"].as_str())
             .collect()
     }
 }
@@ -173,9 +210,7 @@ fn json_scalar_binding(value: &Value) -> AppResult<JsValue> {
     Ok(match value {
         Value::Null => JsValue::NULL,
         Value::String(value) => value.as_str().into(),
-        Value::Number(value) => {
-            JsValue::from_f64(value.as_f64().ok_or(AppError::Internal)?)
-        }
+        Value::Number(value) => JsValue::from_f64(value.as_f64().ok_or(AppError::Internal)?),
         Value::Bool(value) => JsValue::from_f64(f64::from(u8::from(*value))),
         _ => return Err(AppError::Internal),
     })
@@ -189,7 +224,7 @@ pub fn claim_rotation(
     write_token: &str,
     now: &str,
 ) -> AppResult<D1PreparedStatement> {
-    let snapshot = AccountSnapshot::from_user(user).to_json()?;
+    let snapshot = AccountSnapshot::json_from_user(user)?;
     let revision_sql = crate::models::mutation::next_user_revision_sql(19);
     let sql = format!(
         "UPDATE users SET \
@@ -205,38 +240,38 @@ pub fn claim_rotation(
          EXISTS(SELECT 1 FROM attachments_pending p JOIN ciphers c ON \
          c.id=p.cipher_id WHERE c.user_id=?20) AND EXISTS(SELECT 1 FROM \
          devices WHERE user_id=?20 AND device_id=?24 AND session_token=?25) \
-         RETURNING id",
+         RETURNING id, updated_at",
         AccountSnapshot::matches_sql(23)
     );
-    let bind: Vec<JsValue> = vec![
-        next.key.clone().into(),
-        next.private_key.clone().into(),
-        next.public_key.clone().into(),
-        nullable_binding(next.signed_public_key.clone()),
-        nullable_binding(next.security_state.clone()),
-        nullable_binding(next.security_version),
-        nullable_binding(next.signature_key_pair.clone()),
-        nullable_binding(next.user_key_id.clone()),
-        nullable_binding(next.v2_upgrade_token.clone()),
-        next.security_stamp.clone().into(),
-        write_token.into(),
-        next.master_password_hash.clone().into(),
-        nullable_binding(next.password_salt.clone()),
-        next.kdf_type.into(),
-        next.kdf_iterations.into(),
-        nullable_binding(next.kdf_memory),
-        nullable_binding(next.kdf_parallelism),
-        nullable_binding(next.master_password_hint.clone()),
-        now.into(),
-        session.user_id.into(),
-        session.security_stamp.into(),
-        user.master_password_hash.clone().into(),
-        snapshot.into(),
-        session.device_id.into(),
-        session.session_token.into(),
-        nullable_binding(user.password_salt.clone()),
-        user.password_iterations.into(),
-        next.password_iterations.into(),
+    let bind = db::d1_params![
+        next.key,
+        next.private_key,
+        next.public_key,
+        next.signed_public_key,
+        next.security_state,
+        next.security_version,
+        next.signature_key_pair,
+        next.user_key_id,
+        next.v2_upgrade_token,
+        next.security_stamp,
+        write_token,
+        next.master_password_hash,
+        next.password_salt,
+        next.kdf_type,
+        next.kdf_iterations,
+        next.kdf_memory,
+        next.kdf_parallelism,
+        next.master_password_hint,
+        now,
+        session.user_id,
+        session.security_stamp,
+        user.master_password_hash,
+        snapshot,
+        session.device_id,
+        session.session_token,
+        user.password_salt,
+        user.password_iterations,
+        next.password_iterations,
     ];
     Ok(db.prepare(&sql).bind(&bind)?)
 }
@@ -260,21 +295,30 @@ pub fn cipher_write(
         write_token
     )?)
 }
-#[allow(
-    clippy::too_many_arguments,
-    reason = "Bind complete attachment metadata and the rotation capability \
-              in one guarded statement"
-)]
+#[derive(Clone, Copy)]
+pub struct RotatedAttachmentWrite<'a> {
+    pub owner: &'a str,
+    pub cipher: &'a str,
+    pub attachment_id: &'a str,
+    pub file_name: &'a str,
+    pub key: &'a str,
+    pub now: &'a str,
+    pub write_token: &'a str,
+}
+
 pub fn attachment_write(
     db: &D1Database,
-    owner: &str,
-    cipher: &str,
-    attachment_id: &str,
-    file_name: &str,
-    key: &str,
-    now: &str,
-    write_token: &str,
+    write: RotatedAttachmentWrite<'_>,
 ) -> AppResult<D1PreparedStatement> {
+    let RotatedAttachmentWrite {
+        owner,
+        cipher,
+        attachment_id,
+        file_name,
+        key,
+        now,
+        write_token,
+    } = write;
     Ok(query!(
         db,
         "UPDATE attachments SET file_name=?1,encrypted_key=?2,updated_at=?3 \
@@ -309,21 +353,30 @@ pub fn folder_write(
         write_token
     )?)
 }
-#[allow(
-    clippy::too_many_arguments,
-    reason = "Bind complete passkey material and the rotation capability in \
-              one guarded statement"
-)]
+#[derive(Clone, Copy)]
+pub struct RotatedPasskeyWrite<'a> {
+    pub owner: &'a str,
+    pub id: &'a str,
+    pub public: &'a str,
+    pub key: &'a str,
+    pub snapshot: &'a str,
+    pub now: &'a str,
+    pub write_token: &'a str,
+}
+
 pub fn passkey_write(
     db: &D1Database,
-    owner: &str,
-    id: &str,
-    public: &str,
-    key: &str,
-    snapshot: &str,
-    now: &str,
-    write_token: &str,
+    write: RotatedPasskeyWrite<'_>,
 ) -> AppResult<D1PreparedStatement> {
+    let RotatedPasskeyWrite {
+        owner,
+        id,
+        public,
+        key,
+        snapshot,
+        now,
+        write_token,
+    } = write;
     Ok(query!(
         db,
         "UPDATE webauthn_credentials SET \
@@ -365,40 +418,44 @@ pub(crate) async fn commit(
     owner: &str,
     write_token: &str,
     mut writes: Vec<D1PreparedStatement>,
-) -> AppResult<()> {
+) -> AppResult<String> {
+    use crate::models::mutation::RevisionRow;
+
     writes.extend(invalidation_writes(db, owner, write_token)?);
-    let results = db.batch(writes).await.map_err(|error| {
-        DatabaseError::account_rotation(
-            error,
-            CONFLICT_SENTINEL,
-            map_database_error,
-        )
-    })?;
-    if results
-        .first()
-        .ok_or(AppError::Internal)?
-        .results::<Value>()?
-        .is_empty()
-    {
-        return Err(DatabaseError::account_rotation_conflict());
-    }
-    Ok(())
+    let results = db
+        .batch(writes)
+        .await
+        .map_err(|error| DatabaseError::account_rotation(error, map_database_error))?;
+    let revisions = db::decode_results::<RevisionRow>(results.first().ok_or(AppError::Internal)?)?;
+    revisions
+        .into_iter()
+        .next()
+        .map(|row| row.updated_at)
+        .ok_or_else(DatabaseError::account_rotation_conflict)
 }
 
-fn nullable_binding<T: Into<JsValue>>(value: Option<T>) -> JsValue {
-    value.map_or(JsValue::NULL, Into::into)
+#[derive(Clone, Copy)]
+pub struct CredentialRotation<'a> {
+    pub user: &'a UserRow,
+    pub session: &'a SessionSnapshot<'a>,
+    pub next: &'a UserRow,
+    pub token: &'a str,
+    pub now: &'a str,
 }
 
 pub async fn change_credentials(
     db: &D1Database,
-    user: &UserRow,
-    session: &SessionSnapshot<'_>,
-    next: &UserRow,
-    token: &str,
-    now: &str,
+    rotation: CredentialRotation<'_>,
 ) -> AppResult<()> {
+    let CredentialRotation {
+        user,
+        session,
+        next,
+        token,
+        now,
+    } = rotation;
     let private_key_changed = next.private_key != user.private_key;
-    let previous = AccountSnapshot::from_user(user).to_json()?;
+    let previous = AccountSnapshot::json_from_user(user)?;
     let revision_sql = crate::models::mutation::next_user_revision_sql(10);
     let sql = format!(
         "UPDATE users SET \
@@ -414,46 +471,31 @@ pub async fn change_credentials(
          id",
         AccountSnapshot::matches_sql(14)
     );
-    let mut writes = vec![
-        db.prepare(&sql).bind(&[
-            next.master_password_hash.clone().into(),
-            next.password_salt.clone().unwrap_or_default().into(),
-            next.key.clone().into(),
-            next.kdf_type.into(),
-            next.kdf_iterations.into(),
-            nullable_binding(next.kdf_memory),
-            nullable_binding(next.kdf_parallelism),
-            nullable_binding(next.master_password_hint.clone()),
-            token.into(),
-            now.into(),
-            user.id.clone().into(),
-            session.security_stamp.into(),
-            user.master_password_hash.clone().into(),
-            previous.clone().into(),
-            session.device_id.into(),
-            session.session_token.into(),
-            nullable_binding(user.password_salt.clone()),
-            user.password_iterations.into(),
-            next.password_iterations.into(),
-            next.private_key.clone().into(),
-            next.public_key.clone().into(),
-        ])?,
-        query!(
-            &db,
-            "DELETE FROM two_factors WHERE user_id=?1 AND provider_type=5 AND \
-             EXISTS(SELECT 1 FROM users WHERE id=?1 AND \
-             account_write_token=?2)",
-            user.id,
-            token
-        )?,
-        query!(
-            &db,
-            "DELETE FROM auth_requests WHERE user_id=?1 AND EXISTS(SELECT 1 \
-             FROM users WHERE id=?1 AND account_write_token=?2)",
-            user.id,
-            token
-        )?,
-    ];
+    let claim = db.prepare(&sql).bind(&db::d1_params![
+        next.master_password_hash,
+        next.password_salt.as_deref().unwrap_or_default(),
+        next.key,
+        next.kdf_type,
+        next.kdf_iterations,
+        next.kdf_memory,
+        next.kdf_parallelism,
+        next.master_password_hint,
+        token,
+        now,
+        user.id,
+        session.security_stamp,
+        user.master_password_hash,
+        previous,
+        session.device_id,
+        session.session_token,
+        user.password_salt,
+        user.password_iterations,
+        next.password_iterations,
+        next.private_key,
+        next.public_key,
+    ])?;
+    let mut writes = vec![claim];
+    writes.extend(invalidation_writes(db, &user.id, token)?);
     writes.push(if private_key_changed {
         query!(
             &db,

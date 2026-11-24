@@ -1,34 +1,35 @@
 # D1 migrations and database design
 
-This directory is the authoritative runtime schema. The eight CREATE migrations,
-`0001` through `0008`, directly define the canonical schema for personal vaults
-and small private groups. New databases apply all eight files. Existing instances
-with older schemas or migration histories need a separately planned transfer to
-a new database. Editing baseline files does not upgrade an application database;
-do not overwrite existing tables or rewrite `d1_migrations` records.
+This directory is the authoritative runtime schema. The CREATE migrations
+`0001` through `0008` directly define the canonical schema for personal vaults,
+small private groups, and staged object writes. New databases apply the full
+chain. Existing instances with older schemas or migration histories need a
+separately planned transfer to a new database. Editing baseline files does not
+upgrade an application database; do not overwrite existing tables or rewrite
+`d1_migrations` records.
 
 Migration filenames follow `NNNN_<scope>_<subject>.sql`: a four-digit
 execution order followed by two lowercase snake_case words describing the contents.
-The same rule applies to all eight files:
+The same rule applies to all migration files:
 
 | File | Tables and responsibility |
 | --- | --- |
 | `0001_user_accounts.sql` | Account identity, server password cost, client KDF, V1/V2 envelopes and write guards |
-| `0002_personal_vault.sql` | Personal folders and ciphers, including ownership invariants |
-| `0003_access_credentials.sql` | Devices, approval requests, API keys and device-bound API-key grants |
-| `0004_authentication_methods.sql` | Second factors, passkeys and single-use WebAuthn challenges |
-| `0005_verification_records.sql` | Email/action verification codes and redeemed Turnstile hashes |
-| `0006_encrypted_sends.sql` | Encrypted Text/File Sends, access policy, object pointer and upload state |
-| `0007_instance_state.sql` | Persistent JWT keys and shared equivalent-domain dataset/refresh lease |
-| `0008_file_lifecycle.sql` | Attachments, upload reservations, cleanup outbox and storage triggers |
+| `0002_access_credentials.sql` | Devices, approval requests, API keys and device-bound API-key grants |
+| `0003_authentication_methods.sql` | Second factors, passkeys and single-use WebAuthn challenges |
+| `0004_verification_records.sql` | Email/action verification codes and redeemed Turnstile hashes |
+| `0005_personal_vault.sql` | Folders, ciphers, ownership invariants, attachment metadata and upload reservations |
+| `0006_encrypted_sends.sql` | Encrypted Text/File Sends, access policy, object pointers and upload state |
+| `0007_object_storage.sql` | Write staging, durable cleanup outbox and cross-table file lifecycle triggers |
+| `0008_instance_state.sql` | Persistent JWT keys and shared equivalent-domain dataset/refresh lease |
 
 Each table is declared once with canonical names, including V2 account fields,
 snapshots, object pointers and verifier costs. This consolidated baseline creates
 new tables; it supplies no conversion of older schemas or encrypted payloads.
 There is no single-user constraint.
 Files follow dependency order. Storage triggers are declared only after both
-vault and Send tables exist. The current schema has 19 tables and 47 explicit DDL
-objects. Runtime initialization, rather than migrations, populates signing keys
+vault and Send tables exist. Each table's indexes live with its declaration.
+The current schema has 20 tables and 54 explicit DDL objects. Runtime initialization, rather than migrations, populates signing keys
 and the shared domain cache. Migrations create no accounts or client keys.
 
 For Rust type roles, shared domain terms, and explicit wire mappings, see the
@@ -52,7 +53,7 @@ use `device_id`, `device_type`, `push_id`, `request_device_id`, `created_at`,
 Named indexes use `idx_<table>_<columns>` names directly in the CREATE files.
 The canonical schema retains primary/unique keys, composite device-session
 foreign keys, ownership constraints and file-cleanup triggers. Regression checks
-exercise these rules and schema-snapshot parity on the eight-file chain.
+exercise these rules and schema-snapshot parity on the full chain.
 
 Wrangler records migration filenames in `d1_migrations`. Renaming a baseline
 file does not rename an existing history entry, even when its numeric prefix is
@@ -102,6 +103,9 @@ durable outbox. The outbox deliberately has no account FK so cascades cannot
 erase cleanup work. Its generation token protects retry acknowledgement from
 concurrent replacement. Unfinished attachment uploads remain separate reservations
 because finalization, quota accounting and expiry have different lifecycles.
+Temporary object keys are registered before storage writes. Publication removes
+the key's staging record in the same transaction as adopting the object pointer.
+Maintenance queues expired staging keys for deletion after a one-day lease.
 
 Server password verification defaults to 600000 iterations, independently of
 client KDF settings. Credential writes record their actual cost and preserve
@@ -115,6 +119,7 @@ in any backup. Global-domain caches are rebuildable.
 ```bash
 just schema               # Regenerate sql/schema.sql in memory.
 just test-sql             # Exercise model queries and verify snapshot parity.
+just test-d1              # Verify fresh migrations and file lifecycle with native D1/R2.
 just db-migrate local     # Apply with Wrangler to the selected local database.
 just dev                  # Apply pending local migrations before serving.
 ```

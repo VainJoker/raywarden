@@ -3,14 +3,11 @@ use std::collections::HashSet;
 
 use serde_json::Value;
 use wasm_bindgen::JsValue;
-use worker::{
-    D1Database,
-    D1PreparedStatement,
-};
+use worker::{D1Database, D1PreparedStatement};
 
-use crate::errors::{
-    AppError,
-    AppResult,
+use crate::{
+    errors::{AppError, AppResult},
+    infra::db::IntoD1Param,
 };
 
 const JSON_BIND_BYTES: usize = 1_900_000;
@@ -21,12 +18,30 @@ enum ImportChunk {
     Columns(Vec<JsValue>),
 }
 
+impl ImportChunk {
+    fn json(rows: &[String]) -> Self {
+        Self::Json(format!("[{}]", rows.join(",")))
+    }
+
+    fn statement(
+        self,
+        db: &D1Database,
+        json_sql: &str,
+        columns_sql: &str,
+        shared: &[JsValue],
+    ) -> worker::Result<D1PreparedStatement> {
+        let (sql, mut values) = match self {
+            Self::Json(value) => (json_sql, vec![value.to_d1_param()]),
+            Self::Columns(values) => (columns_sql, values),
+        };
+        values.extend_from_slice(shared);
+        db.prepare(sql).bind(&values)
+    }
+}
+
 // A JSON string can exceed D1's bind limit solely because ciphertext is escaped
 // a second time. Fall back to ordinary column binds for that individual row.
-fn import_chunks(
-    rows: Vec<Value>,
-    maximum_rows: usize,
-) -> AppResult<Vec<ImportChunk>> {
+fn import_chunks(rows: Vec<Value>, maximum_rows: usize) -> AppResult<Vec<ImportChunk>> {
     let mut chunks = Vec::new();
     let mut batch = Vec::new();
     let mut bytes = 2;
@@ -41,13 +56,11 @@ fn import_chunks(
                 message: "Imported field exceeds the D1 size limit".into(),
             });
         }
-        let encoded =
-            serde_json::to_string(&row).map_err(AppError::internal_error)?;
-        if !batch.is_empty() &&
-            (batch.len() >= maximum_rows ||
-                bytes + encoded.len() + 1 > JSON_BIND_BYTES)
+        let encoded = serde_json::to_string(&row).map_err(AppError::internal_error)?;
+        if !batch.is_empty()
+            && (batch.len() >= maximum_rows || bytes + encoded.len() + 1 > JSON_BIND_BYTES)
         {
-            chunks.push(ImportChunk::Json(format!("[{}]", batch.join(","))));
+            chunks.push(ImportChunk::json(&batch));
             batch.clear();
             bytes = 2;
         }
@@ -56,12 +69,9 @@ fn import_chunks(
                 .iter()
                 .map(|value| match value {
                     Value::Null => Ok(JsValue::NULL),
-                    Value::String(v) => Ok(v.clone().into()),
+                    Value::String(v) => Ok(v.to_d1_param()),
                     Value::Bool(v) => Ok(i32::from(*v).into()),
-                    Value::Number(v) => v
-                        .as_f64()
-                        .map(JsValue::from_f64)
-                        .ok_or(AppError::Internal),
+                    Value::Number(v) => v.as_f64().map(JsValue::from_f64).ok_or(AppError::Internal),
                     _ => Err(AppError::Internal),
                 })
                 .collect::<AppResult<Vec<_>>>()?;
@@ -72,7 +82,7 @@ fn import_chunks(
         }
     }
     if !batch.is_empty() {
-        chunks.push(ImportChunk::Json(format!("[{}]", batch.join(","))));
+        chunks.push(ImportChunk::json(&batch));
     }
     Ok(chunks)
 }
@@ -86,12 +96,7 @@ fn collect_writes(
     writes: &mut Vec<D1PreparedStatement>,
 ) -> AppResult<()> {
     for chunk in import_chunks(rows, maximum_rows)? {
-        let (sql, mut values) = match chunk {
-            ImportChunk::Json(value) => (json_sql, vec![value.into()]),
-            ImportChunk::Columns(values) => (columns_sql, values),
-        };
-        values.extend_from_slice(shared);
-        writes.push(db.prepare(sql).bind(&values)?);
+        writes.push(chunk.statement(db, json_sql, columns_sql, shared)?);
     }
     Ok(())
 }
@@ -173,10 +178,8 @@ mod tests {
         // last.
         let remaining = JSON_BIND_BYTES - first_bytes - r#"[""]"#.len() - 4;
         for (extra, expected_chunks) in [(0, 1), (1, 2)] {
-            let rows =
-                vec![first.clone(), json!(["x".repeat(remaining + extra)])];
-            let chunks =
-                import_chunks(rows.clone(), 200).expect("valid import rows");
+            let rows = vec![first.clone(), json!(["x".repeat(remaining + extra)])];
+            let chunks = import_chunks(rows.clone(), 200).expect("valid import rows");
             assert_eq!(chunks.len(), expected_chunks);
             let mut result = Vec::new();
             for chunk in chunks {
@@ -184,8 +187,7 @@ mod tests {
                     panic!("both individual rows fit in JSON binds");
                 };
                 result.extend(
-                    serde_json::from_str::<Vec<Value>>(&encoded)
-                        .expect("valid JSON chunk"),
+                    serde_json::from_str::<Vec<Value>>(&encoded).expect("valid JSON chunk"),
                 );
             }
             assert_eq!(result, rows);

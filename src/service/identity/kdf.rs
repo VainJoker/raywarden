@@ -1,20 +1,44 @@
-use hmac::{
-    Hmac,
-    Mac as _,
-};
+use std::borrow::Cow;
+
+use hmac::{Hmac, Mac as _};
 use sha2::Sha256;
 
 use crate::{
-    errors::{
-        AppError,
-        AppResult,
-        AuthError,
-    },
+    errors::{AppError, AppResult, AuthError},
     service::identity::user::KdfParams,
 };
 
-pub const KDF_TYPE_PBKDF2: i32 = 0;
-pub const KDF_TYPE_ARGON2ID: i32 = 1;
+#[derive(Clone, Copy, PartialEq, Eq)]
+#[repr(i32)]
+pub(crate) enum KdfKind {
+    Pbkdf2 = 0,
+    Argon2id = 1,
+}
+
+impl TryFrom<i32> for KdfKind {
+    type Error = AppError;
+
+    fn try_from(value: i32) -> AppResult<Self> {
+        match value {
+            0 => Ok(Self::Pbkdf2),
+            1 => Ok(Self::Argon2id),
+            _ => Err(invalid_kdf(
+                "Unsupported KDF type. Only PBKDF2 (0) and Argon2id (1) are supported",
+            )),
+        }
+    }
+}
+
+pub(crate) enum ValidatedKdfParams {
+    Pbkdf2 {
+        iterations: i32,
+    },
+    Argon2id {
+        iterations: i32,
+        memory_mb: i32,
+        parallelism: i32,
+    },
+}
 
 pub const MIN_PBKDF2_ITERATIONS: i32 = 100_000;
 pub const DEFAULT_PBKDF2_ITERATIONS: i32 = 600_000;
@@ -23,113 +47,126 @@ pub const DEFAULT_PBKDF2_ITERATIONS: i32 = 600_000;
 ///
 /// The repeated Argon2 entry preserves the reference distribution. Legacy
 /// PBKDF2 settings do not change validation for real account writes.
-const UNKNOWN_EMAIL_KDFS: [(i32, i32, Option<i32>, Option<i32>); 7] = [
-    (KDF_TYPE_ARGON2ID, 3, Some(64), Some(4)),
-    (KDF_TYPE_ARGON2ID, 3, Some(64), Some(4)),
-    (KDF_TYPE_PBKDF2, 100_000, None, None),
-    (KDF_TYPE_PBKDF2, 5_000, None, None),
-    (KDF_TYPE_ARGON2ID, 3, Some(64), Some(4)),
-    (KDF_TYPE_ARGON2ID, 6, Some(32), Some(4)),
-    (KDF_TYPE_PBKDF2, DEFAULT_PBKDF2_ITERATIONS, None, None),
+const UNKNOWN_EMAIL_KDFS: [(KdfKind, i32, Option<i32>, Option<i32>); 7] = [
+    (KdfKind::Argon2id, 3, Some(64), Some(4)),
+    (KdfKind::Argon2id, 3, Some(64), Some(4)),
+    (KdfKind::Pbkdf2, 100_000, None, None),
+    (KdfKind::Pbkdf2, 5_000, None, None),
+    (KdfKind::Argon2id, 3, Some(64), Some(4)),
+    (KdfKind::Argon2id, 6, Some(32), Some(4)),
+    (KdfKind::Pbkdf2, DEFAULT_PBKDF2_ITERATIONS, None, None),
 ];
 const PRELOGIN_KDF_CONTEXT: &[u8] = b"raywarden/prelogin-kdf/v1\0";
 
 /// Derive stable decoy settings from the persisted signing key and the already
 /// normalized email. Real account parameters must come from their stored row.
 /// This reduces a fixed-response fingerprint; it cannot eliminate enumeration.
-pub fn unknown_email_kdf(
-    secret: &str,
-    normalized_email: &str,
-) -> AppResult<KdfParams> {
+pub fn unknown_email_kdf(secret: &str, normalized_email: &str) -> AppResult<KdfParams> {
     if secret.trim().is_empty() {
         return Err(AppError::Internal);
     }
-    let mut mac = <Hmac<Sha256> as hmac::digest::KeyInit>::new_from_slice(
-        secret.as_bytes(),
-    )
-    .map_err(AppError::internal_error)?;
+    let mut mac = <Hmac<Sha256> as hmac::digest::KeyInit>::new_from_slice(secret.as_bytes())
+        .map_err(AppError::internal_error)?;
     mac.update(PRELOGIN_KDF_CONTEXT);
     mac.update(normalized_email.as_bytes());
     let digest = mac.finalize().into_bytes();
     let mut first = [0; 8];
     first.copy_from_slice(&digest[..8]);
     // Reduce before converting: usize is 32-bit in the actual Worker.
-    let index =
-        (u64::from_be_bytes(first) % UNKNOWN_EMAIL_KDFS.len() as u64) as usize;
-    let (kdf_type, iterations, memory, parallelism) = UNKNOWN_EMAIL_KDFS[index];
+    let index = (u64::from_be_bytes(first) % UNKNOWN_EMAIL_KDFS.len() as u64) as usize;
+    let (kind, iterations, memory, parallelism) = UNKNOWN_EMAIL_KDFS[index];
     Ok(KdfParams {
-        kdf_type,
+        kdf_type: kind as i32,
         iterations,
         memory,
         parallelism,
     })
 }
 
-/// Validate KDF parameters coming from client payloads.
-///
-/// This is used by registration and can be reused elsewhere.
-pub fn ensure_supported_kdf(
-    kdf_type: i32,
-    iterations: i32,
-    memory: Option<i32>,
-    parallelism: Option<i32>,
-) -> AppResult<()> {
-    match kdf_type {
-        KDF_TYPE_PBKDF2 => {
-            if iterations < MIN_PBKDF2_ITERATIONS {
-                return Err(AppError::Auth(AuthError::InvalidKdf(format!(
-                    "PBKDF2 iterations must be at least \
-                     {MIN_PBKDF2_ITERATIONS}"
-                ))));
-            }
-        }
-        KDF_TYPE_ARGON2ID => {
-            if iterations < 1 {
-                return Err(AppError::Auth(AuthError::InvalidKdf(
-                    "Argon2 KDF iterations must be at least 1".to_string(),
-                )));
-            }
+pub(crate) fn validate_stored_kdf(params: &KdfParams) -> AppResult<()> {
+    if params.kdf_type == KdfKind::Pbkdf2 as i32 {
+        // Existing accounts may predate the current write-side minimum.
+        return if params.iterations > 0 {
+            Ok(())
+        } else {
+            Err(AppError::InternalFailure(
+                "Stored PBKDF2 iterations must be positive".into(),
+            ))
+        };
+    }
+    ValidatedKdfParams::try_from(params.clone())
+        .map(|_| ())
+        .map_err(|error| AppError::internal_with_context("Invalid stored KDF settings", error))
+}
 
-            match memory {
-                Some(m) if (15..=1024).contains(&m) => {}
-                Some(_) => {
-                    return Err(AppError::Auth(AuthError::InvalidKdf(
-                        "Argon2 memory must be between 15 MB and 1024 MB"
-                            .to_string(),
-                    )));
-                }
-                None => {
-                    return Err(AppError::Auth(AuthError::InvalidKdf(
-                        "Argon2 memory parameter is required".to_string(),
-                    )));
-                }
-            }
+impl TryFrom<KdfParams> for ValidatedKdfParams {
+    type Error = AppError;
 
-            match parallelism {
-                Some(p) if (1..=16).contains(&p) => {}
-                Some(_) => {
-                    return Err(AppError::Auth(AuthError::InvalidKdf(
-                        "Argon2 parallelism must be between 1 and 16"
-                            .to_string(),
+    fn try_from(params: KdfParams) -> AppResult<Self> {
+        let iterations = params.iterations;
+        match KdfKind::try_from(params.kdf_type)? {
+            KdfKind::Pbkdf2 => {
+                if iterations < MIN_PBKDF2_ITERATIONS {
+                    return Err(invalid_kdf(format!(
+                        "PBKDF2 iterations must be at least {MIN_PBKDF2_ITERATIONS}"
                     )));
                 }
-                None => {
-                    return Err(AppError::Auth(AuthError::InvalidKdf(
-                        "Argon2 parallelism parameter is required".to_string(),
-                    )));
-                }
+                Ok(Self::Pbkdf2 { iterations })
             }
-        }
-        _ => {
-            return Err(AppError::Auth(AuthError::InvalidKdf(
-                "Unsupported KDF type. Only PBKDF2 (0) and Argon2id (1) are \
-                 supported"
-                    .to_string(),
-            )));
+            KdfKind::Argon2id => {
+                if iterations < 1 {
+                    return Err(invalid_kdf("Argon2 KDF iterations must be at least 1"));
+                }
+                let memory_mb = params
+                    .memory
+                    .ok_or_else(|| invalid_kdf("Argon2 memory parameter is required"))?;
+                if !(15..=1024).contains(&memory_mb) {
+                    return Err(invalid_kdf(
+                        "Argon2 memory must be between 15 MB and 1024 MB",
+                    ));
+                }
+                let parallelism = params
+                    .parallelism
+                    .ok_or_else(|| invalid_kdf("Argon2 parallelism parameter is required"))?;
+                if !(1..=16).contains(&parallelism) {
+                    return Err(invalid_kdf("Argon2 parallelism must be between 1 and 16"));
+                }
+                Ok(Self::Argon2id {
+                    iterations,
+                    memory_mb,
+                    parallelism,
+                })
+            }
         }
     }
+}
 
-    Ok(())
+impl From<ValidatedKdfParams> for KdfParams {
+    fn from(params: ValidatedKdfParams) -> Self {
+        let (kind, iterations, memory, parallelism) = match params {
+            ValidatedKdfParams::Pbkdf2 { iterations } => (KdfKind::Pbkdf2, iterations, None, None),
+            ValidatedKdfParams::Argon2id {
+                iterations,
+                memory_mb,
+                parallelism,
+            } => (
+                KdfKind::Argon2id,
+                iterations,
+                Some(memory_mb),
+                Some(parallelism),
+            ),
+        };
+        Self {
+            kdf_type: kind as i32,
+            iterations,
+            memory,
+            parallelism,
+        }
+    }
+}
+
+fn invalid_kdf(message: impl Into<Cow<'static, str>>) -> AppError {
+    AppError::Auth(AuthError::InvalidKdf(message.into()))
 }
 
 #[cfg(test)]
@@ -151,15 +188,17 @@ mod tests {
     fn unknown_email_settings_are_stable_and_have_a_cross_target_vector() {
         let secret = "prelogin-test-secret";
         let email = "unknown@example.test";
-        let first =
-            unknown_email_kdf(secret, email).expect("valid kdf fixture");
+        let first = unknown_email_kdf(secret, email).expect("valid kdf fixture");
         assert_eq!(
             unknown_email_kdf(secret, email).expect("valid kdf fixture"),
             first
         );
         // The keyed digest starts with 0x410923d625a37e9b. Taking modulo 7
         // before usize conversion must select the same bucket on WASM32.
-        assert_eq!(tuple(&first), (KDF_TYPE_ARGON2ID, 6, Some(32), Some(4)));
+        assert_eq!(
+            tuple(&first),
+            (KdfKind::Argon2id as i32, 6, Some(32), Some(4))
+        );
     }
 
     #[test]
@@ -175,9 +214,21 @@ mod tests {
                 )
             })
             .collect::<BTreeSet<_>>();
-        assert_eq!(seen, UNKNOWN_EMAIL_KDFS.into_iter().collect());
+        assert_eq!(
+            seen,
+            UNKNOWN_EMAIL_KDFS
+                .into_iter()
+                .map(|(kind, i, m, p)| (kind as i32, i, m, p))
+                .collect()
+        );
         assert!(
-            ensure_supported_kdf(KDF_TYPE_PBKDF2, 5_000, None, None).is_err()
+            ValidatedKdfParams::try_from(KdfParams {
+                kdf_type: KdfKind::Pbkdf2 as i32,
+                iterations: 5_000,
+                memory: None,
+                parallelism: None,
+            })
+            .is_err()
         );
     }
 
@@ -187,11 +238,8 @@ mod tests {
             (0..32)
                 .map(|index| {
                     tuple(
-                        &unknown_email_kdf(
-                            secret,
-                            &format!("unknown-{index}@example.test"),
-                        )
-                        .expect("valid kdf fixture"),
+                        &unknown_email_kdf(secret, &format!("unknown-{index}@example.test"))
+                            .expect("valid kdf fixture"),
                     )
                 })
                 .collect::<Vec<_>>()

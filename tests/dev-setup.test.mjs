@@ -7,9 +7,9 @@ import { promisify } from "node:util";
 import test from "node:test";
 import { unstable_getVarsForDev, unstable_readConfig } from "wrangler";
 import { parseJsonc } from "../scripts/deploy.mjs";
+import { archiveVault, WEB_VAULT_VERSION, writeVault } from "./fixtures/web-vault.mjs";
 
 const run = promisify(execFile);
-const WEB_VAULT_VERSION = JSON.parse(await readFile(new URL("../package.json", import.meta.url), "utf8")).config.webVaultVersion;
 
 test("local dev serves the HTTPS origin required by the pinned Web Vault", async () => {
   const config = parseJsonc(await readFile(new URL("../wrangler.jsonc", import.meta.url), "utf8"));
@@ -42,15 +42,15 @@ test("local env loads credentials from the existing dev vars file", async t => {
 async function fixture(t) {
   const root = await mkdtemp(join(tmpdir(), "raywarden-dev-test-"));
   t.after(() => rm(root, { recursive: true, force: true }));
-  for (const directory of ["scripts", "static/overrides", "bin", "cargo/bin", "release/web-vault"]) {
+  for (const directory of ["scripts", "static/overrides", "bin", "cargo/bin"]) {
     await mkdir(join(root, directory), { recursive: true });
   }
   for (const name of ["Justfile", "package.json", "package-lock.json", "rust-toolchain.toml", "wrangler.jsonc", "scripts/local-config.mjs", "scripts/deploy.mjs", "scripts/patch-ui.mjs", "scripts/prepare-ui.sh", "static/security-headers.json", "static/overrides/vaultwarden.css", "static/overrides/raywarden.js"]) {
     await copyFile(new URL(`../${name}`, import.meta.url), join(root, name));
   }
-  await writeFile(join(root, "release/web-vault/vw-version.json"), JSON.stringify({ version: WEB_VAULT_VERSION }));
-  await writeFile(join(root, "release/web-vault/index.html"), "<html><head></head><body></body></html>");
-  await run("tar", ["-czf", join(root, "release.tar.gz"), "-C", join(root, "release"), "web-vault"]);
+  const release = join(root, "release", "web-vault");
+  await writeVault(release, WEB_VAULT_VERSION, "<html><head></head><body></body></html>");
+  await archiveVault(release, join(root, "release.tar.gz"));
   const stub = async (name, source) => writeFile(join(root, name), `#!${process.execPath}\n${source}`, { mode: 0o755 });
   const imports = 'import fs from "node:fs"; const args = process.argv.slice(2); const log = line => fs.appendFileSync(process.env.DEV_TEST_LOG, line + "\\n");\n';
   await stub("bin/npm", imports + `

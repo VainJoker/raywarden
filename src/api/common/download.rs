@@ -1,28 +1,14 @@
 //! File download HTTP semantics shared by attachments and Send.
 use axum::{
     body::Body,
-    http::{
-        HeaderMap,
-        StatusCode,
-        header,
-    },
+    http::{HeaderMap, StatusCode, header, response::Builder},
     response::Response,
 };
 
+use super::response::set_native_stream;
 use crate::{
-    errors::{
-        AppError,
-        AppResult,
-        protocol::InvalidRange,
-    },
-    infra::{
-        storage::{
-            ObjectBody,
-            ObjectMetadata,
-            Storage,
-        },
-        worker_response::set_native_stream,
-    },
+    errors::{AppError, AppResult},
+    infra::storage::{ObjectBody, ObjectMetadata, Storage},
 };
 
 /// A single inclusive byte interval. Numeric values must remain exact when
@@ -30,7 +16,7 @@ use crate::{
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct ByteRange {
     start: u64,
-    end:   u64,
+    end: u64,
 }
 
 impl ByteRange {
@@ -39,12 +25,23 @@ impl ByteRange {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct InvalidRange(u64);
+
+impl InvalidRange {
+    fn into_response(self, builder: Builder) -> AppResult<Response> {
+        let Self(size) = self;
+        builder
+            .status(StatusCode::RANGE_NOT_SATISFIABLE)
+            .header(header::CONTENT_RANGE, format!("bytes */{size}"))
+            .body(Body::empty())
+            .map_err(AppError::internal_error)
+    }
+}
+
 const MAX_SAFE_JS_INTEGER: u64 = (1 << 53) - 1;
 
-fn parse_byte_range(
-    value: Option<&str>,
-    size: u64,
-) -> Result<Option<ByteRange>, InvalidRange> {
+fn parse_byte_range(value: Option<&str>, size: u64) -> Result<Option<ByteRange>, InvalidRange> {
     let Some(value) = value.filter(|value| !value.is_empty()) else {
         return Ok(None);
     };
@@ -70,7 +67,7 @@ fn parse_byte_range(
         }
         ByteRange {
             start: size.saturating_sub(suffix),
-            end:   size - 1,
+            end: size - 1,
         }
     } else {
         let start = number(start)?;
@@ -131,8 +128,8 @@ fn selected_range(
     headers: &HeaderMap,
     object: &ObjectMetadata,
 ) -> Result<Option<ByteRange>, InvalidRange> {
-    if let Some(condition) = headers.get(header::IF_RANGE) &&
-        object
+    if let Some(condition) = headers.get(header::IF_RANGE)
+        && object
             .http_etag
             .as_ref()
             .is_none_or(|etag| condition.as_bytes() != etag.as_bytes())
@@ -147,10 +144,7 @@ fn selected_range(
     parse_byte_range(value, object.size_bytes)
 }
 
-fn download_response(
-    object: &ObjectMetadata,
-    range: Option<ByteRange>,
-) -> AppResult<Response> {
+fn download_response(object: &ObjectMetadata, range: Option<ByteRange>) -> AppResult<Response> {
     let mut builder = download_builder()
         .status(if range.is_some() {
             StatusCode::PARTIAL_CONTENT
@@ -164,10 +158,7 @@ fn download_response(
     if let Some(range) = range {
         builder = builder.header(
             header::CONTENT_RANGE,
-            format!(
-                "bytes {}-{}/{}",
-                range.start, range.end, object.size_bytes
-            ),
+            format!("bytes {}-{}/{}", range.start, range.end, object.size_bytes),
         );
     }
     if let Some(etag) = &object.http_etag {
@@ -178,7 +169,7 @@ fn download_response(
         .map_err(AppError::internal_error)
 }
 
-fn download_builder() -> axum::http::response::Builder {
+fn download_builder() -> Builder {
     // Stored MIME metadata predates this policy and remains untrusted. Apply
     // the same inert attachment policy to every backend and byte range without
     // changing ciphertext or routing native R2 streams through a body adapter.
@@ -196,11 +187,10 @@ mod tests {
     use super::*;
 
     #[test]
-    fn range_validators_choose_full_or_partial_download_without_touching_storage()
-     {
+    fn range_validators_choose_full_or_partial_download_without_touching_storage() {
         let object = ObjectMetadata {
             size_bytes: 10,
-            http_etag:  Some("\"etag\"".into()),
+            http_etag: Some("\"etag\"".into()),
         };
         let mut headers = HeaderMap::new();
         headers.insert(
@@ -208,8 +198,7 @@ mod tests {
             "bytes=2-5".parse().expect("test fixture should be valid"),
         );
         assert_eq!(
-            selected_range(&headers, &object)
-                .expect("test fixture should be valid"),
+            selected_range(&headers, &object).expect("test fixture should be valid"),
             Some(ByteRange { start: 2, end: 5 })
         );
         headers.insert(
@@ -217,8 +206,7 @@ mod tests {
             "\"other\"".parse().expect("test fixture should be valid"),
         );
         assert_eq!(
-            selected_range(&headers, &object)
-                .expect("test fixture should be valid"),
+            selected_range(&headers, &object).expect("test fixture should be valid"),
             None
         );
         headers.insert(
@@ -226,8 +214,7 @@ mod tests {
             "\"etag\"".parse().expect("test fixture should be valid"),
         );
         assert_eq!(
-            selected_range(&headers, &object)
-                .expect("test fixture should be valid"),
+            selected_range(&headers, &object).expect("test fixture should be valid"),
             Some(ByteRange { start: 2, end: 5 })
         );
         headers.insert(
@@ -243,22 +230,16 @@ mod tests {
     }
 
     #[test]
-    fn response_headers_preserve_range_size_and_etag_with_inert_download_policy()
-     {
+    fn response_headers_preserve_range_size_and_etag_with_inert_download_policy() {
         let object = ObjectMetadata {
             size_bytes: 10,
-            http_etag:  Some("\"etag\"".into()),
+            http_etag: Some("\"etag\"".into()),
         };
-        let response =
-            download_response(&object, Some(ByteRange { start: 2, end: 5 }))
-                .expect("test fixture should be valid");
+        let response = download_response(&object, Some(ByteRange { start: 2, end: 5 }))
+            .expect("test fixture should be valid");
         assert_eq!(response.status(), StatusCode::PARTIAL_CONTENT);
         assert_eq!(response.headers()[header::CONTENT_RANGE], "bytes 2-5/10");
         assert_eq!(response.headers()[header::CONTENT_LENGTH], "4");
-        assert_eq!(
-            response.headers()[header::CONTENT_TYPE],
-            "application/octet-stream"
-        );
         assert_download_policy(&response);
         assert_eq!(response.headers()[header::ETAG], "\"etag\"");
     }
@@ -290,12 +271,12 @@ mod tests {
     fn full_partial_and_invalid_range_downloads_keep_sandbox_after_defaults() {
         let object = ObjectMetadata {
             size_bytes: 10,
-            http_etag:  None,
+            http_etag: None,
         };
         for range in [None, Some(ByteRange { start: 2, end: 5 })] {
-            let mut response = download_response(&object, range)
-                .expect("test fixture should be valid");
-            crate::api::middleware::security_headers::apply_http(
+            let mut response =
+                download_response(&object, range).expect("test fixture should be valid");
+            crate::api::middleware::headers::apply_http(
                 "/api/ciphers/cipher/attachment/file/download",
                 &mut response,
             );
@@ -304,7 +285,7 @@ mod tests {
         let mut response = InvalidRange(10)
             .into_response(download_builder())
             .expect("test fixture should be valid");
-        crate::api::middleware::security_headers::apply_http(
+        crate::api::middleware::headers::apply_http(
             "/api/ciphers/cipher/attachment/file/download",
             &mut response,
         );

@@ -1,113 +1,75 @@
 //! Streaming file writes and publication under the captured account/session.
-use std::fmt::Display;
-
 use bytes::Bytes;
-use futures_util::{
-    Stream,
-    StreamExt as _,
-    stream,
-};
+use futures_util::{Stream, StreamExt as _, stream};
 use serde::Serialize;
-use worker::{
-    D1Database,
-    D1PreparedStatement,
-    Env,
-};
+use worker::{D1Database, D1PreparedStatement, Env};
 
 use super::{
-    content,
-    notify_update,
-    token::{
-        TokenPurpose,
-        UPLOAD_SCOPE,
-        decode_file_token,
-        encode_token,
-    },
+    content, notify_update,
+    token::{SendScope, TokenPurpose, decode_file_token, encode_token},
 };
 use crate::{
-    app::AppContext,
-    config::files::{
-        DEFAULT_SEND_MAX_BYTES,
-        send_file_token_expires_at_seconds,
-        send_max_bytes,
+    errors::{AppError, AppResult},
+    infra::{
+        config::{send_file_token_expires_at_seconds, send_max_bytes, send_quota_bytes},
+        storage::Storage,
     },
-    errors::{
-        AppError,
-        AppResult,
-    },
-    infra::storage::Storage,
     models::{
         identity::device::SessionSnapshot,
-        mutation::{
-            account_snapshot_guard,
-            commit_session,
-        },
-        send::{
-            SendRow,
-            upload_guard,
-        },
+        mutation::{account_snapshot_guard, commit_session},
+        send::{SendRow, upload_guard},
     },
     service::{
-        identity::session::{
-            Claims,
-            validate_session,
-        },
+        identity::session::{Claims, validate_session},
         notifications,
+        storage_cleanup::{self, StagedObject},
     },
 };
 
 /// Identity captured before an upload and rechecked atomically at publication.
 pub(crate) struct UploadSession {
-    user_id:        String,
+    user_id: String,
     security_stamp: String,
-    device_id:      String,
-    session_token:  String,
+    device_id: String,
+    session_token: String,
 }
 
 impl UploadSession {
     pub(crate) fn from_claims(claims: &Claims) -> AppResult<Self> {
         let session = claims.session_snapshot()?;
         Ok(Self {
-            user_id:        session.user_id.to_owned(),
+            user_id: session.user_id.to_owned(),
             security_stamp: session.security_stamp.to_owned(),
-            device_id:      session.device_id.to_owned(),
-            session_token:  session.session_token.to_owned(),
+            device_id: session.device_id.to_owned(),
+            session_token: session.session_token.to_owned(),
         })
     }
 
     pub(crate) async fn authorize_token_upload(
-        state: &AppContext,
+        db: &D1Database,
+        access_secret: &str,
         token: &str,
         send_id: &str,
         file_id: &str,
     ) -> AppResult<(Self, SendRow)> {
-        let claims = decode_file_token(
-            &state.jwt_keys.access_secret,
-            token,
-            UPLOAD_SCOPE,
-            send_id,
-            file_id,
-        )?;
+        let claims = decode_file_token(access_secret, token, SendScope::Upload, send_id, file_id)?;
         let session = Self {
-            user_id:        claims.sub,
+            user_id: claims.sub,
             security_stamp: claims.sstamp.unwrap_or_default(),
-            device_id:      claims.device.unwrap_or_default(),
-            session_token:  claims.session_token.unwrap_or_default(),
+            device_id: claims.device.unwrap_or_default(),
+            session_token: claims.session_token.unwrap_or_default(),
         };
-        if session.security_stamp.is_empty() ||
-            session.device_id.is_empty() ||
-            session.session_token.is_empty()
+        if session.security_stamp.is_empty()
+            || session.device_id.is_empty()
+            || session.session_token.is_empty()
         {
             return Err(AppError::Unauthorized {
                 message: "A user session is required".into(),
             });
         }
-        let db = state.database();
         session.validate(db).await?;
         let send = SendRow::fetch_by_id(db, send_id).await?;
-        if !session.can_upload(&send, file_id) ||
-            send.access_stamp != claims.access_stamp
-        {
+        if !session.can_upload(&send, file_id) || send.access_stamp != claims.access_stamp {
             return Err(AppError::send_unavailable());
         }
         Ok((session, send))
@@ -115,11 +77,11 @@ impl UploadSession {
 
     pub(crate) async fn fetch_uploadable_send(
         &self,
-        state: &AppContext,
+        db: &D1Database,
         send_id: &str,
         file_id: &str,
     ) -> AppResult<SendRow> {
-        let send = SendRow::fetch_by_id(state.database(), send_id).await?;
+        let send = SendRow::fetch_by_id(db, send_id).await?;
         if !self.can_upload(&send, file_id) {
             return Err(AppError::not_found("Pending Send not found"));
         }
@@ -127,9 +89,9 @@ impl UploadSession {
     }
 
     fn can_upload(&self, send: &SendRow, file_id: &str) -> bool {
-        send.user_id == self.user_id &&
-            matches!(send.upload_state, 0 | 1) &&
-            send.file_id.as_deref() == Some(file_id)
+        send.user_id == self.user_id
+            && matches!(send.upload_state, 0 | 1)
+            && send.file_id.as_deref() == Some(file_id)
     }
 
     async fn validate(&self, db: &D1Database) -> AppResult<()> {
@@ -138,22 +100,18 @@ impl UploadSession {
 
     const fn snapshot(&self) -> SessionSnapshot<'_> {
         SessionSnapshot {
-            user_id:        self.user_id.as_str(),
+            user_id: self.user_id.as_str(),
             security_stamp: self.security_stamp.as_str(),
-            device_id:      self.device_id.as_str(),
-            session_token:  self.session_token.as_str(),
+            device_id: self.device_id.as_str(),
+            session_token: self.session_token.as_str(),
         }
     }
 }
 
 /// The final error is yielded before Storage completes its multipart upload.
-fn checked_upload_stream<S, E>(
-    stream: S,
-    exact_bytes: u64,
-) -> impl Stream<Item = AppResult<Bytes>>
+fn checked_upload_stream<S, E>(stream: S, exact_bytes: u64) -> impl Stream<Item = AppResult<Bytes>>
 where
     S: Stream<Item = Result<Bytes, E>>,
-    E: Display,
 {
     stream::try_unfold(
         (Box::pin(stream), 0_u64),
@@ -166,13 +124,10 @@ where
                 }
                 return Ok(None);
             };
-            let chunk = chunk.map_err(|error| {
-                AppError::bad_request(format!("Invalid upload body: {error}"))
-            })?;
-            let total =
-                total.checked_add(chunk.len() as u64).ok_or_else(|| {
-                    AppError::bad_request("Send file is too large")
-                })?;
+            let chunk = chunk.map_err(|_error| AppError::bad_request("Invalid upload body"))?;
+            let total = total
+                .checked_add(chunk.len() as u64)
+                .ok_or_else(|| AppError::bad_request("Send file is too large"))?;
             Ok(Some((chunk, (stream, total))))
         },
     )
@@ -182,50 +137,42 @@ where
 /// Callers explicitly commit or abort: remote cleanup cannot run in Drop.
 #[must_use = "An upload must be committed or explicitly aborted"]
 pub(crate) struct SendUpload<'a> {
-    state:          &'a AppContext,
-    send:           &'a SendRow,
-    session:        SessionSnapshot<'a>,
-    staged_key:     String,
-    key_guard:      D1PreparedStatement,
+    db: &'a D1Database,
+    env: &'a Env,
+    send: &'a SendRow,
+    session: SessionSnapshot<'a>,
+    staged: StagedObject<'a>,
+    key_guard: D1PreparedStatement,
     expected_bytes: u64,
-    written_bytes:  Option<u64>,
 }
 
 impl<'a> SendUpload<'a> {
     pub(crate) async fn prepare(
-        state: &'a AppContext,
+        db: &'a D1Database,
+        env: &'a Env,
         send: &'a SendRow,
         owner: &'a UploadSession,
     ) -> AppResult<Self> {
-        send_file_token_expires_at_seconds(
-            &state.env,
-            crate::utils::time::now_seconds(),
-        )?;
-        let db = state.database();
+        send_file_token_expires_at_seconds(env, crate::utils::time::now_seconds())?;
+        send_quota_bytes(env)?;
         owner.validate(db).await?;
         let session = owner.snapshot();
-        let (_, key_guard) =
-            account_snapshot_guard(db, session.user_id).await?;
-        let expected_bytes =
-            u64::try_from(send.file_size_bytes).map_err(|_error| {
-                AppError::bad_request("Invalid Send file size")
-            })?;
-        let staged_key = format!(
-            "sends/{}/{}/{}",
-            send.id,
-            send.file_id
-                .as_deref()
-                .ok_or_else(AppError::send_unavailable)?,
-            uuid::Uuid::new_v4()
-        );
+        let (_, key_guard) = account_snapshot_guard(db, session.user_id).await?;
+        let expected_bytes = u64::try_from(send.file_size_bytes)
+            .map_err(|_error| AppError::bad_request("Invalid Send file size"))?;
+        let file_id = send
+            .file_id
+            .as_deref()
+            .ok_or_else(AppError::send_unavailable)?;
+        let staged = StagedObject::new(db, env, "sends", &send.id, file_id);
         Ok(Self {
-            state,
+            db,
+            env,
             send,
             session,
-            staged_key,
+            staged,
             key_guard,
             expected_bytes,
-            written_bytes: None,
         })
     }
 
@@ -236,128 +183,115 @@ impl<'a> SendUpload<'a> {
     pub(crate) async fn write<S, E>(&mut self, stream: S) -> AppResult<()>
     where
         S: Stream<Item = Result<Bytes, E>>,
-        E: Display,
     {
-        if self.written_bytes.is_some() {
-            return Err(AppError::Internal);
-        }
+        self.staged.ensure_unwritten()?;
+        let storage = Storage::from_env(self.env)?;
         let maximum = self
             .expected_bytes
-            .min(max_file_size_bytes(&self.state.env) as u64);
-        let size = Storage::from_env(&self.state.env)?
-            .put_stream(
-                &self.staged_key,
+            .min(max_file_size_bytes(self.env, &storage) as u64);
+        self.staged
+            .write(
+                &storage,
                 checked_upload_stream(stream, self.expected_bytes),
                 maximum,
                 Some("application/octet-stream"),
             )
-            .await?;
-        self.written_bytes = Some(size);
-        Ok(())
+            .await
     }
 
     /// Publish once, cleaning the staged key on any failed commit. Referenced
     /// objects survive a lost D1 acknowledgement through the cleanup outbox.
     pub(crate) async fn commit(self) -> AppResult<()> {
         let Self {
-            state,
+            db,
+            env,
             send,
             session,
-            staged_key,
+            staged,
             key_guard,
-            written_bytes,
             ..
         } = self;
         let result = async {
-            let size = written_bytes.ok_or(AppError::Internal)?;
+            let size = staged.size()?;
             if send.user_id != session.user_id {
                 return Err(AppError::send_unavailable());
             }
-            let size = i64::try_from(size).map_err(|_error| {
-                AppError::bad_request("Send file is too large")
-            })?;
+            let size = i64::try_from(size)
+                .map_err(|_error| AppError::bad_request("Send file is too large"))?;
             let now = crate::utils::time::now_rfc3339();
-            let db = state.database();
             let revision = commit_session(
                 db,
                 &session,
-                vec![key_guard, upload_guard(db, send)?],
-                vec![send.finalize_upload_statement(
-                    db,
-                    size,
-                    &staged_key,
-                    &now,
-                )?],
+                vec![
+                    key_guard,
+                    upload_guard(db, send)?,
+                    storage_cleanup::stage_guard(db, staged.key())?,
+                ],
+                vec![
+                    send.finalize_upload_statement(db, size, staged.key(), &now)?,
+                    storage_cleanup::remove_stage(db, staged.key())?,
+                ],
             )
             .await?;
             notify_update(
-                state,
+                env,
                 send,
                 notifications::UpdateType::SyncSendUpdate,
                 Some(session.device_id),
                 &revision,
             )
             .await;
-            if let Err(error) =
-                crate::service::storage_cleanup::process_batch(&state.env, db)
-                    .await
-            {
+            if let Err(error) = storage_cleanup::process_batch(env, db).await {
                 log::warn!("Send replaced-object cleanup deferred: {error}");
             }
             Ok(())
         }
         .await;
         if result.is_err() {
-            discard_staged_file(state, &staged_key).await;
+            staged.discard_written().await;
         }
         result
     }
 
     pub(crate) async fn abort(self) {
-        discard_staged_file(self.state, &self.staged_key).await;
+        self.staged.discard_written().await;
     }
 }
 
-async fn discard_staged_file(state: &AppContext, key: &str) {
-    crate::service::storage_cleanup::discard_staged_object(
-        &state.env,
-        state.database(),
-        key,
-    )
-    .await;
-}
-
-pub(super) fn max_file_size_bytes(env: &Env) -> i64 {
-    let backend_max =
-        Storage::max_bytes(env).map_or(DEFAULT_SEND_MAX_BYTES, |n| n as i64);
-    send_max_bytes(env).min(backend_max)
+pub(super) fn max_file_size_bytes(env: &Env, storage: &Storage) -> i64 {
+    let configured = send_max_bytes(env);
+    storage
+        .max_bytes()
+        .map_or(configured, |backend_max| configured.min(backend_max as i64))
 }
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct SendFileUploadResponse {
-    object:           &'static str,
+    object: &'static str,
     file_upload_type: u8,
-    url:              String,
-    send_response:    content::SendResponse,
+    url: String,
+    send_response: content::SendResponse,
 }
 
 pub(super) fn upload_response(
-    state: &AppContext,
+    env: &Env,
+    domain: &str,
+    access_secret: &str,
     send: SendRow,
     claims: &Claims,
 ) -> AppResult<SendFileUploadResponse> {
-    let token = encode_token(state, &send, TokenPurpose::Upload(claims))?;
+    let token = encode_token(env, access_secret, &send, TokenPurpose::Upload(claims))?;
     let file_id = send.file_id.as_deref().ok_or(AppError::Internal)?;
     Ok(SendFileUploadResponse {
-        object:           "send-fileUpload",
+        object: "send-fileUpload",
         file_upload_type: 1,
-        url:              format!(
+        url: format!(
             "{}/api/sends/{}/file/{file_id}/azure-upload?token={token}",
-            state.domain().trim_end_matches('/'),
+            domain.trim_end_matches('/'),
             send.id
         ),
-        send_response:    content::send_response(send),
+        send_response: content::send_response(send),
     })
 }
 
@@ -385,11 +319,9 @@ mod tests {
     }
 
     #[test]
-    fn checked_upload_stream_rejects_wrong_length_and_input_errors_before_commit()
-     {
+    fn checked_upload_stream_rejects_wrong_length_and_input_errors_before_commit() {
         for exact in [2, 4] {
-            let chunks =
-                stream::iter([Ok::<_, &str>(Bytes::from_static(b"abc"))]);
+            let chunks = stream::iter([Ok::<_, &str>(Bytes::from_static(b"abc"))]);
             let result = checked_upload_stream(chunks, exact)
                 .collect::<Vec<_>>()
                 .now_or_never()

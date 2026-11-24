@@ -1,22 +1,20 @@
 //! Equivalent-domain settings HTTP handlers.
-use axum::{
-    Json,
-    extract::State,
-};
+use std::sync::Arc;
+
+use axum::extract::State;
 
 use crate::{
     api::{
         AppState,
-        common::response::{
-            ApiResponse,
-            EmptyObject,
-            RawJson,
+        common::{
+            json::Json,
+            response::{ApiResponse, EmptyObject},
         },
     },
     errors::AppResult,
     service::{
         identity::session::Claims,
-        vault::domains::UpdateDomainsRequest,
+        vault::domains::{DomainsResponse, UpdateDomainsRequest},
     },
 };
 
@@ -35,10 +33,10 @@ use crate::{
 #[worker::send]
 pub(in crate::api) async fn get_domains(
     claims: Claims,
-    State(state): State<AppState>,
-) -> AppResult<RawJson> {
-    Ok(RawJson(
-        crate::service::vault::domains::settings(&state, &claims).await?,
+    State(state): State<Arc<AppState>>,
+) -> AppResult<ApiResponse<DomainsResponse>> {
+    Ok(ApiResponse(
+        crate::service::vault::domains::settings(state.database(), &claims.sub).await?,
     ))
 }
 
@@ -48,10 +46,10 @@ pub(in crate::api) async fn get_domains(
 #[worker::send]
 pub(in crate::api) async fn update_domains(
     claims: Claims,
-    State(state): State<AppState>,
+    State(state): State<Arc<AppState>>,
     Json(payload): Json<UpdateDomainsRequest>,
 ) -> AppResult<ApiResponse<EmptyObject>> {
-    crate::service::vault::domains::update_settings(&state, &claims, payload)
+    crate::service::vault::domains::update_settings(state.database(), &state.env, &claims, payload)
         .await?;
     Ok(ApiResponse(EmptyObject {}))
 }

@@ -1,3 +1,3 @@
 pub(in crate::api) mod auth;
 pub(crate) mod cors;
-pub(crate) mod security_headers;
+pub(crate) mod headers;

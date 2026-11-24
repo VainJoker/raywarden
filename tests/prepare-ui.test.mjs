@@ -7,9 +7,9 @@ import { promisify } from "node:util";
 import { gzipSync } from "node:zlib";
 import test from "node:test";
 import { renderAssetHeaders, patchUi, readPinnedVaultVersion } from "../scripts/patch-ui.mjs";
+import { archiveVault, WEB_VAULT_VERSION, writeVault } from "./fixtures/web-vault.mjs";
 
 const run = promisify(execFile);
-const WEB_VAULT_VERSION = JSON.parse(await readFile(new URL("../package.json", import.meta.url), "utf8")).config.webVaultVersion;
 const prepare = (root, args = [], options = {}) => run("bash", [join(root, "scripts", "prepare-ui.sh"), ...args], { cwd: tmpdir(), ...options });
 function maliciousArchive(name) {
   const header = Buffer.alloc(512);
@@ -39,16 +39,10 @@ async function fixture(t) {
   return root;
 }
 
-async function vault(directory, version = WEB_VAULT_VERSION, html = "<html><head></head><body><app-root></app-root></body></html>") {
-  await mkdir(directory, { recursive: true });
-  await writeFile(join(directory, "vw-version.json"), JSON.stringify({ version }));
-  await writeFile(join(directory, "index.html"), html);
-}
-
 test("offline preparation copies both source assets, removes maps and is idempotent", async (t) => {
   const root = await fixture(t);
   const directory = join(root, "static", "web-vault");
-  await vault(directory, WEB_VAULT_VERSION, '<html><head><script defer src="js/raywarden.js"></script><script src="/js/raywarden.js"></script></head><body><script>/* turnstile-send-guard-v2 */oldGuard();</script></body></html>');
+  await writeVault(directory, WEB_VAULT_VERSION, '<html><head><script defer src="js/raywarden.js"></script><script src="/js/raywarden.js"></script></head><body><script>/* turnstile-send-guard-v2 */oldGuard();</script></body></html>');
   await mkdir(join(directory, "nested"));
   await writeFile(join(directory, "nested", "bundle.map"), "map");
   await writeFile(join(directory, "demo.html"), "unguarded stale demo");
@@ -72,12 +66,11 @@ test("a local pinned archive replaces stale files after successful preparation",
   const root = await fixture(t);
   const destination = join(root, "static", "web-vault");
   const source = join(root, "release", "web-vault");
-  await vault(destination);
+  await writeVault(destination);
   await writeFile(join(destination, "stale.js"), "old");
-  await vault(source);
+  await writeVault(source);
   await writeFile(join(source, "current.js"), "new");
-  const archive = join(root, "release.tar.gz");
-  await run("tar", ["-czf", archive, "-C", join(root, "release"), "web-vault"]);
+  const archive = await archiveVault(source, join(root, "release.tar.gz"));
   await prepare(root, ["--archive", archive]);
   assert.equal(await readFile(join(destination, "current.js"), "utf8"), "new");
   await assert.rejects(readFile(join(destination, "stale.js")), { code: "ENOENT" });
@@ -85,9 +78,9 @@ test("a local pinned archive replaces stale files after successful preparation",
 
 test("download uses only the pinned GitHub release URL", async (t) => {
   const root = await fixture(t);
-  await vault(join(root, "release", "web-vault"));
-  const archive = join(root, "release.tar.gz");
-  await run("tar", ["-czf", archive, "-C", join(root, "release"), "web-vault"]);
+  const release = join(root, "release", "web-vault");
+  await writeVault(release);
+  const archive = await archiveVault(release, join(root, "release.tar.gz"));
   const bin = join(root, "bin");
   const capture = join(root, "download-url");
   await mkdir(bin);
@@ -109,11 +102,11 @@ cp -- "$UI_TEST_ARCHIVE" "$output"
 test("wrong versions and malformed archives preserve the existing vault", async (t) => {
   const root = await fixture(t);
   const destination = join(root, "static", "web-vault");
-  await vault(destination);
+  await writeVault(destination);
   const before = await readFile(join(destination, "index.html"), "utf8");
-  await vault(join(root, "release", "web-vault"), "2026.6.4");
-  const wrongVersion = join(root, "wrong.tar.gz");
-  await run("tar", ["-czf", wrongVersion, "-C", join(root, "release"), "web-vault"]);
+  const release = join(root, "release", "web-vault");
+  await writeVault(release, "2026.6.4");
+  const wrongVersion = await archiveVault(release, join(root, "wrong.tar.gz"));
   await assert.rejects(prepare(root, ["--archive", wrongVersion]), { code: 1 });
   const malformed = join(root, "malformed.tar.gz");
   await writeFile(malformed, "not a gzip archive");
@@ -124,17 +117,17 @@ test("wrong versions and malformed archives preserve the existing vault", async 
 test("archive paths outside web-vault and symbolic links are rejected before installation", async (t) => {
   const root = await fixture(t);
   const destination = join(root, "static", "web-vault");
-  await vault(destination);
+  await writeVault(destination);
   const before = await readFile(join(destination, "index.html"), "utf8");
   await mkdir(join(root, "outside"));
   await writeFile(join(root, "outside", "file"), "must not install");
   const wrongRoot = join(root, "outside.tar.gz");
   await run("tar", ["-czf", wrongRoot, "-C", root, "outside"]);
   await assert.rejects(prepare(root, ["--archive", wrongRoot]), /only paths inside/);
-  await vault(join(root, "release", "web-vault"));
-  await symlink("../../outside", join(root, "release", "web-vault", "link"));
-  const links = join(root, "links.tar.gz");
-  await run("tar", ["-czf", links, "-C", join(root, "release"), "web-vault"]);
+  const release = join(root, "release", "web-vault");
+  await writeVault(release);
+  await symlink("../../outside", join(release, "link"));
+  const links = await archiveVault(release, join(root, "links.tar.gz"));
   await assert.rejects(prepare(root, ["--archive", links]), /without links/);
   assert.equal(await readFile(join(destination, "index.html"), "utf8"), before);
 });
@@ -142,7 +135,7 @@ test("archive paths outside web-vault and symbolic links are rejected before ins
 test("a real tar entry with parent traversal cannot escape the extraction directory", async (t) => {
   const root = await fixture(t);
   const destination = join(root, "static", "web-vault");
-  await vault(destination);
+  await writeVault(destination);
   const before = await readFile(join(destination, "index.html"), "utf8");
   const archive = join(root, "traversal.tar.gz");
   await writeFile(archive, maliciousArchive("web-vault/../../escaped"));
@@ -155,6 +148,13 @@ test("missing assets, moving version labels and ambiguous input fail clearly", a
   const root = await fixture(t);
   await assert.rejects(prepare(root), /Missing existing Web Vault/);
   await assert.rejects(prepare(root, ["--download", "--archive"]), /Usage/);
+  const release = join(root, "release", "web-vault");
+  await writeVault(release);
+  const archive = await archiveVault(release, join(root, "release.tar.gz"));
+  await assert.rejects(
+    prepare(root, ["--archive", archive], { env: { ...process.env, WEB_VAULT_SHA256: "0".repeat(64) } }),
+    /SHA-256/,
+  );
   await writeFile(join(root, "package.json"), JSON.stringify({ config: { webVaultVersion: "latest" } }));
   assert.throws(() => readPinnedVaultVersion(root), /must pin a release/);
   await assert.rejects(prepare(root), { code: 1 });
@@ -164,7 +164,7 @@ test("HTML patch validates version and document structure before writing", async
   const root = await fixture(t);
   const directory = join(root, "static", "web-vault");
   const html = "<html><body>no head</body></html>";
-  await vault(directory, "2026.6.4", html);
+  await writeVault(directory, "2026.6.4", html);
   assert.throws(() => patchUi(root, directory), /does not match pinned/);
   assert.equal(await readFile(join(directory, "index.html"), "utf8"), html);
   await writeFile(join(directory, "vw-version.json"), JSON.stringify({ version: WEB_VAULT_VERSION }));

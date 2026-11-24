@@ -1,64 +1,13 @@
+import { bearerJsonHeaders, equal, expectStatus } from "./runtime-assertions.mjs";
+import { fromBase64Url as bytes, openFixtureJwtKeys, toBase64Url as base64, wrapFixtureJwtKeys } from "./runtime-auth.mjs";
+
 /** JWT persistence and API-key wrapping against compiled Rust and real SQLite. */
-const jwtEncoder = new TextEncoder();
-const jwtFields = ["access_secret", "refresh_secret"];
-const fixtureBytes = value => Uint8Array.from(atob(value.replaceAll("-", "+").replaceAll("_", "/")), byte => byte.charCodeAt(0));
-const fixtureBase64 = value => btoa(String.fromCharCode(...value)).replaceAll("+", "-").replaceAll("/", "_").replace(/=+$/, "");
-const fixtureContext = field => jwtEncoder.encode(`raywarden/jwt-key-encryption/v1/global/${field}`);
-async function fixtureRootKey(rootSecret) {
-  const raw = fixtureBytes(rootSecret);
-  if (raw.length !== 32 || fixtureBase64(raw) !== rootSecret) throw new Error("Invalid fixture KEY_ENCRYPTION_KEY");
-  return crypto.subtle.importKey("raw", raw, "AES-GCM", false, ["encrypt", "decrypt"]);
-}
-function fixtureIsWrapped(keys) {
-  for (const field of jwtFields) if (typeof keys[field] !== "string" || !keys[field].trim()) throw new Error(`Invalid fixture ${field}`);
-  const wrapped = jwtFields.map(field => keys[field].startsWith("v1."));
-  if (wrapped[0] !== wrapped[1]) throw new Error("Mixed fixture JWT envelope formats");
-  if (!wrapped[0] && jwtFields.some(field => /^v\d+\./.test(keys[field]))) throw new Error("Unsupported fixture JWT envelope version");
-  return wrapped[0];
-}
-
-/** Independently decode production AES-GCM envelopes, or a fresh legacy fixture. */
-export async function openFixtureJwtKeys(keys, rootSecret) {
-  if (!fixtureIsWrapped(keys)) return { access_secret: keys.access_secret, refresh_secret: keys.refresh_secret };
-  const result = {}, key = await fixtureRootKey(rootSecret);
-  for (const field of jwtFields) {
-    const encoded = keys[field].slice(3), packed = fixtureBytes(encoded);
-    if (packed.length < 29 || fixtureBase64(packed) !== encoded) throw new Error(`${field} envelope is malformed`);
-    const plaintext = await crypto.subtle.decrypt({ name: "AES-GCM", iv: packed.subarray(0, 12), additionalData: fixtureContext(field) }, key, packed.subarray(12));
-    result[field] = new TextDecoder("utf-8", { fatal: true }).decode(plaintext);
-    if (!result[field].trim()) throw new Error(`${field} envelope contains an empty key`);
-  }
-  return result;
-}
-
-/** Produce test-controlled envelopes using WebCrypto, independently of Rust. */
-export async function wrapFixtureJwtKeys(keys, rootSecret) {
-  if (fixtureIsWrapped(keys)) throw new Error("Fixture JWT keys are already wrapped");
-  const result = {}, key = await fixtureRootKey(rootSecret);
-  for (const field of jwtFields) {
-    const nonce = crypto.getRandomValues(new Uint8Array(12));
-    const encrypted = new Uint8Array(await crypto.subtle.encrypt({ name: "AES-GCM", iv: nonce, additionalData: fixtureContext(field) }, key, jwtEncoder.encode(keys[field])));
-    const packed = new Uint8Array(12 + encrypted.length); packed.set(nonce); packed.set(encrypted, 12);
-    result[field] = `v1.${fixtureBase64(packed)}`;
-  }
-  return result;
-}
-
 export async function runJwtCompatibility({ fixture, check, accessToken, USER, CIPHER, FILE, sql }) {
   const encoder = new TextEncoder();
   // Public fixture bytes 0..31; never use this key outside isolated tests.
   const rootSecret = "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8";
-  const equal = (actual, expected, label = "value") => {
-    if (actual !== expected) throw new Error(`${label}: expected ${expected}, received ${actual}`);
-  };
-  const expectStatus = async (response, expected) => {
-    if (response.status !== expected) throw new Error(`Expected HTTP ${expected}, received ${response.status}: ${await response.text()}`);
-    return response;
-  };
   const row = () => sql.exec("SELECT access_secret,refresh_secret FROM jwt_keys WHERE id='global'").toArray()[0];
   const empty = () => sql.exec("DELETE FROM users; DELETE FROM jwt_keys;");
-  const bytes = value => Uint8Array.from(atob(value.replaceAll("-", "+").replaceAll("_", "/")), byte => byte.charCodeAt(0));
-  const base64 = value => btoa(String.fromCharCode(...value)).replaceAll("+", "-").replaceAll("/", "_").replace(/=+$/, "");
   const writeRow = keys => sql.exec("UPDATE jwt_keys SET access_secret=?,refresh_secret=? WHERE id='global'", keys.access_secret, keys.refresh_secret);
   async function openRow(keys = row()) {
     for (const field of ["access_secret", "refresh_secret"]) {
@@ -76,7 +25,7 @@ export async function runJwtCompatibility({ fixture, check, accessToken, USER, C
     return crypto.subtle.importKey("raw", raw, "AES-GCM", false, ["encrypt", "decrypt"]);
   }
   const apiKey = async (f, rotate = false) => f.fetch(`/api/accounts/${rotate ? "rotate-api-key" : "api-key"}`, {
-    method: "POST", headers: { Authorization: `Bearer ${await accessToken()}`, "Content-Type": "application/json" },
+    method: "POST", headers: bearerJsonHeaders(await accessToken()),
     body: JSON.stringify({ masterPasswordHash: "hash" }),
   });
 
@@ -114,7 +63,8 @@ export async function runJwtCompatibility({ fixture, check, accessToken, USER, C
 
   await check("a populated database cannot replace missing keys without explicit legacy import", async () => {
     const f = fixture(); sql.exec("DELETE FROM jwt_keys;");
-    await expectStatus(await f.fetch("/api/alive"), 500);
+    const failure = await (await expectStatus(await f.fetch("/api/alive"), 500)).json();
+    equal(failure.code, 13); equal(failure.message, "Internal server error");
     equal(row(), undefined);
     f.env.JWT_SECRET = " original access "; f.env.JWT_REFRESH_SECRET = " original refresh ";
     await expectStatus(await f.fetch("/api/alive"), 200);
@@ -131,9 +81,21 @@ export async function runJwtCompatibility({ fixture, check, accessToken, USER, C
       { JWT_SECRET: null, JWT_REFRESH_SECRET: null },
     ]) {
       const f = fixture(); empty(); Object.assign(f.env, bindings);
-      const response = await f.fetch("/api/alive");
-      if (response.status < 400) throw new Error(`Invalid legacy bindings returned HTTP ${response.status}`);
+      const failure = await (await expectStatus(await f.fetch("/api/alive"), 500)).json();
+      equal(failure.code, 0); equal(failure.message, "Internal server error");
       equal(row(), undefined);
+    }
+  });
+
+  await check("blank JWT keys in stored rows fail without replacement", async () => {
+    for (const stored of [
+      { access_secret: " ", refresh_secret: "fixture stored secret" },
+      { access_secret: "fixture stored secret", refresh_secret: "\t" },
+    ]) {
+      const f = fixture(); writeRow(stored);
+      const failure = await (await expectStatus(await f.fetch("/api/alive"), 500)).json();
+      equal(failure.code, 13); equal(failure.message, "Internal server error");
+      equal(JSON.stringify(row()), JSON.stringify(stored));
     }
   });
 

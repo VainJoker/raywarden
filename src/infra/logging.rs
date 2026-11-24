@@ -2,13 +2,11 @@
 use log::LevelFilter;
 use worker::Env;
 
-use super::env::env_text;
+use super::config::env_text;
 
 pub(crate) fn init(env: &Env) {
     let value = env_text(env, "LOG_LEVEL");
-    if let Some(level) =
-        global_level(value.as_deref().unwrap_or_default()).to_level()
-    {
+    if let Some(level) = global_level(value.as_deref().unwrap_or_default()).to_level() {
         let _ = console_log::init_with_level(level);
     }
 }

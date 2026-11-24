@@ -1,35 +1,14 @@
+import { bearerJsonHeaders, equal, expectStatus, ok } from "./runtime-assertions.mjs";
+import { oauthToken, totp } from "./runtime-auth.mjs";
+
 // Actual authenticator HTTP handlers and native SQLite transactions. The test
 // client computes its TOTP independently with WebCrypto HMAC-SHA1.
-function equal(actual, expected, label = "value") {
-  if (actual !== expected) throw new Error(`${label}: expected ${expected}, received ${actual}`);
-}
-function ok(value, label) { if (!value) throw new Error(label); }
-
-async function totp(secret) {
-  const alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZ234567";
-  let accumulator = 0, bits = 0; const bytes = [];
-  for (const char of secret.toUpperCase().replace(/=+$/, "")) {
-    const value = alphabet.indexOf(char);
-    if (value < 0) throw new Error("Server returned an invalid base32 key");
-    accumulator = (accumulator << 5) | value; bits += 5;
-    if (bits >= 8) { bits -= 8; bytes.push((accumulator >>> bits) & 255); }
-  }
-  const counter = new Uint8Array(8);
-  new DataView(counter.buffer).setBigUint64(0, BigInt(Math.floor(Date.now() / 30000)), false);
-  const key = await crypto.subtle.importKey("raw", new Uint8Array(bytes), { name: "HMAC", hash: "SHA-1" }, false, ["sign"]);
-  const digest = new Uint8Array(await crypto.subtle.sign("HMAC", key, counter));
-  const offset = digest[digest.length - 1] & 15;
-  const value = ((digest[offset] & 127) << 24) | (digest[offset + 1] << 16) | (digest[offset + 2] << 8) | digest[offset + 3];
-  return String(value % 1000000).padStart(6, "0");
-}
-
 export async function runTwoFactorCompatibility({ fixture, check, accessToken, USER, sql }) {
   async function request(f, path, body, bearer, method = "POST") {
-    return f.fetch(path, { method, headers: { Authorization: `Bearer ${bearer ?? await accessToken()}`, "Content-Type": "application/json" }, body: JSON.stringify(body) });
+    return f.fetch(path, { method, headers: bearerJsonHeaders(bearer ?? await accessToken()), body: JSON.stringify(body) });
   }
   async function responseJson(response, status) {
-    const text = await response.text();
-    equal(response.status, status, text);
+    const text = await (await expectStatus(response, status)).text();
     try { return JSON.parse(text); } catch { throw new Error(`Non-JSON HTTP ${status}: ${text}`); }
   }
   const get = (f, bearer) => request(f, "/api/two-factor/get-authenticator", { masterPasswordHash: "hash" }, bearer).then(response => responseJson(response, 200));
@@ -105,6 +84,25 @@ export async function runTwoFactorCompatibility({ fixture, check, accessToken, U
     equal(disabled.enabled, false); equal(disabled.type, 0); equal(count(0), 0);
   });
 
+  await check("invalid Base32 in a submitted TOTP key is a client error and stored corruption is a server error", async () => {
+    const f = fixture();
+    for (const key of ["0" + "A".repeat(31), "ſ" + "A".repeat(31)]) {
+      const error = await responseJson(await request(f, "/api/two-factor/authenticator", {
+        key, token: "123456", masterPasswordHash: "hash",
+      }), 400);
+      equal(error.message, "Invalid request: Invalid Base32 key");
+    }
+    equal(count(0), 0);
+    sql.exec("INSERT INTO two_factors VALUES('invalid-totp',?,0,1,?,0)", USER, "0" + "A".repeat(31));
+    const failure = await responseJson(await oauthToken(f, {
+      grant_type: "password", username: "owner@example.test", password: "hash",
+      deviceIdentifier: "invalid-totp-device", deviceName: "Runtime test", deviceType: "14",
+      twoFactorProvider: "0", twoFactorToken: "123456",
+    }, { "Bitwarden-Client-Version": "2026.10.1", "device-type": "14" }), 500);
+    equal(failure.code, 3); equal(failure.message, "Internal server error");
+    equal(sql.exec("SELECT last_used_step FROM two_factors WHERE id='invalid-totp'").one().last_used_step, 0);
+  });
+
   await check("TOTP POST/PUT aliases preserve setup proof purpose and replay protection", async () => {
     for (const method of ["POST", "PUT"]) {
       const f = fixture(); const setup = await get(f);
@@ -135,6 +133,85 @@ export async function runTwoFactorCompatibility({ fixture, check, accessToken, U
     equal(count(0), 0); equal(count(2), 1); equal(recovery(), code);
     await responseJson(await request(f, "/api/two-factor/disable", { type: 2, masterPasswordHash: "hash" }), 200);
     equal(recovery(), null);
+  });
+
+  await check("MFA activation claims a protected-action OTP only when the factor is enabled", async () => {
+    for (const type of [0, 1]) {
+      const f = fixture(); remember();
+      const isEmail = type === 1;
+      const path = `/api/two-factor/${isEmail ? "email" : "authenticator"}`;
+      const key = isEmail ? undefined : (await get(f)).key;
+      const codes = {};
+      f.env.MAIL_WEBHOOK_URL = "https://mfa-mail.runtime.test/send";
+      const fetch = globalThis.fetch;
+      globalThis.fetch = async input => {
+        const outbound = input instanceof Request ? input : new Request(input);
+        equal(outbound.url, f.env.MAIL_WEBHOOK_URL);
+        const message = await outbound.json();
+        codes[message.purpose] = message.text.split("\n\n")[1];
+        return Response.json({});
+      };
+      try {
+        await responseJson(await request(f, "/api/accounts/request-otp", {}), 200);
+        if (isEmail) {
+          await responseJson(await request(f, "/api/two-factor/send-email", {
+            email: "factor@example.test", masterPasswordHash: "hash",
+          }), 200);
+        }
+      } finally {
+        globalThis.fetch = fetch;
+      }
+
+      const otp = codes["protected-action"];
+      ok(otp, "the protected-action code was not delivered");
+      if (isEmail) ok(codes["email-setup"], "the mailbox code was not delivered");
+      const token = () => isEmail ? codes["email-setup"] : totp(key);
+      const activate = async () => request(f, path, { key, otp, token: await token() });
+      const proof = purpose => sql.exec("SELECT attempts, consumed_at FROM verification_codes WHERE user_id=? AND purpose=?", USER, purpose).one();
+      const expectPending = () => {
+        equal(count(type), 0);
+        equal(count(5), 1);
+        equal(proof("protected-action").attempts, 1);
+        equal(proof("protected-action").consumed_at, null);
+        if (isEmail) {
+          equal(proof("email-setup").attempts, 1);
+          equal(proof("email-setup").consumed_at, null);
+        }
+      };
+
+      await responseJson(await request(f, path, { key, otp: "wrong", token: await token() }), 400);
+      await responseJson(await request(f, path, { key, otp, token: "wrong" }), isEmail ? 400 : 401);
+      expectPending();
+
+      sql.exec("CREATE TRIGGER reject_otp_enrollment BEFORE UPDATE OF two_factor_recovery_code ON users BEGIN SELECT RAISE(ABORT,'injected OTP enrollment failure'); END");
+      await responseJson(await activate(), 500);
+      expectPending();
+      sql.exec("DROP TRIGGER reject_otp_enrollment");
+
+      const batch = f.db.batch.bind(f.db); let raced = false;
+      f.db.batch = async statements => {
+        if (!raced && statements.some(statement => /^INSERT INTO\s+two_factors/.test(statement.sql.trim()))) {
+          raced = true;
+          sql.exec("UPDATE devices SET session_token='replaced' WHERE user_id=? AND device_id='device'", USER);
+        }
+        return batch(statements);
+      };
+      await responseJson(await activate(), 409);
+      equal(raced, true, "activation did not reach its write transaction");
+      expectPending();
+      sql.exec("UPDATE devices SET session_token='session' WHERE user_id=? AND device_id='device'", USER);
+
+      const enabled = await responseJson(await activate(), 200);
+      equal(enabled.enabled, true);
+      equal(count(type), 1);
+      equal(count(5), 0);
+      equal(proof("protected-action").attempts, 2);
+      ok(proof("protected-action").consumed_at, "authorization OTP was left reusable");
+      if (isEmail) {
+        equal(sql.exec("SELECT COUNT(*) AS n FROM verification_codes WHERE user_id=? AND purpose='email-setup'", USER).one().n, 0);
+      }
+      await responseJson(await activate(), 400);
+    }
   });
 
   await check("two concurrent activations of the same TOTP setup publish only one factor", async () => {

@@ -1,44 +1,22 @@
 use aes_gcm::{
-    Aes256Gcm,
-    KeyInit,
-    Nonce,
-    aead::{
-        Aead,
-        Payload,
-    },
+    Aes256Gcm, KeyInit, Nonce,
+    aead::{Aead, Payload},
 };
-use axum::http::HeaderMap;
-use base64::{
-    Engine as _,
-    engine::general_purpose::URL_SAFE_NO_PAD,
-};
-use hmac::{
-    Hmac,
-    Mac,
-};
-use sha2::{
-    Digest,
-    Sha256,
-};
+use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+use hmac::{Hmac, Mac};
+use sha2::{Digest, Sha256};
 use uuid::Uuid;
+use worker::{D1Database, Env};
 
 use crate::{
-    app::AppContext,
-    errors::{
-        AppError,
-        AppResult,
-        AuthError,
-    },
+    errors::{AppError, AppResult, AuthError},
     models::identity::{
-        api_key::ApiKeyRow,
-        device::DeviceRow,
+        api_key::{ApiKeyReplacement, ApiKeyRow},
+        device::NewDeviceSession,
         user::UserRow,
     },
     service::{
-        identity::{
-            session::Claims,
-            user::AccountVerificationRequest,
-        },
+        identity::{session::Claims, user::AccountVerificationRequest},
         rate_limit,
     },
     utils::constant_time_eq,
@@ -53,10 +31,8 @@ fn wrapping_key(secret: &str) -> AppResult<Vec<u8>> {
     }
     // Domain separation matters for long JWT keys: HMAC normalizes keys over
     // SHA-256's block size with SHA-256, which was also our legacy AES key.
-    let mut mac = <Hmac<Sha256> as hmac::digest::KeyInit>::new_from_slice(
-        secret.as_bytes(),
-    )
-    .map_err(AppError::internal_error)?;
+    let mut mac = <Hmac<Sha256> as hmac::digest::KeyInit>::new_from_slice(secret.as_bytes())
+        .map_err(AppError::internal_error)?;
     mac.update(WRAPPING_KEY_CONTEXT);
     Ok(mac.finalize().into_bytes().to_vec())
 }
@@ -67,8 +43,8 @@ fn encrypt_with_nonce(
     value: &str,
     nonce: &[u8; 12],
 ) -> AppResult<String> {
-    let cipher = Aes256Gcm::new_from_slice(&wrapping_key(secret)?)
-        .map_err(AppError::internal_error)?;
+    let cipher =
+        Aes256Gcm::new_from_slice(&wrapping_key(secret)?).map_err(AppError::internal_error)?;
     let cipher_nonce = Nonce::from(*nonce);
     let encrypted = cipher
         .encrypt(&cipher_nonce, Payload {
@@ -103,10 +79,8 @@ fn decrypt(secret: &str, user: &str, value: &str) -> AppResult<String> {
     if bytes.len() < 28 {
         return Err(AppError::Internal);
     }
-    let cipher =
-        Aes256Gcm::new_from_slice(&key).map_err(AppError::internal_error)?;
-    let nonce: [u8; 12] =
-        bytes[..12].try_into().map_err(AppError::internal_error)?;
+    let cipher = Aes256Gcm::new_from_slice(&key).map_err(AppError::internal_error)?;
+    let nonce: [u8; 12] = bytes[..12].try_into().map_err(AppError::internal_error)?;
     let nonce = Nonce::from(nonce);
     let decrypted = cipher
         .decrypt(&nonce, Payload {
@@ -116,94 +90,97 @@ fn decrypt(secret: &str, user: &str, value: &str) -> AppResult<String> {
         .map_err(AppError::internal_error)?;
     String::from_utf8(decrypted).map_err(AppError::internal_error)
 }
-pub async fn get_or_rotate(
-    state: &AppContext,
-    claims: &Claims,
-    proof: &AccountVerificationRequest,
-    rotate: bool,
-) -> AppResult<(String, String)> {
-    let db = state.database();
-    let user = UserRow::fetch_by_id_with(
-        db,
-        &claims.sub,
-        "Failed to fetch API key owner",
-        || AuthError::UserNotFound.into(),
-    )
-    .await?;
-    let session = claims.session_snapshot()?;
-    let previous = ApiKeyRow::find(db, &claims.sub).await?;
-    crate::service::identity::email::verify_password_or_otp(
-        state, claims, proof,
-    )
-    .await?;
-    if !rotate &&
-        let Some(key) = ApiKeyRow::find_current(db, &user, &session).await?
-    {
-        return Ok((
-            decrypt(
-                &state.jwt_keys.access_secret,
-                &claims.sub,
-                &key.encrypted_key,
-            )?,
-            key.updated_at,
-        ));
-    }
-    let value =
-        format!("{}{}", Uuid::new_v4().simple(), Uuid::new_v4().simple());
-    let encrypted =
-        encrypt(&state.jwt_keys.access_secret, &claims.sub, &value)?;
-    let hash = hex::encode(Sha256::digest(value.as_bytes()));
-    if let Some(record) = ApiKeyRow::replace(
-        db,
-        &user,
-        &session,
-        previous.as_ref(),
-        &encrypted,
-        &hash,
-    )
-    .await?
-    {
-        return Ok((value, record.updated_at));
-    }
-    if rotate {
-        return Err(AppError::conflict(
-            "Account, session or API key changed; retry",
-        ));
-    }
-    let record = ApiKeyRow::find_current(db, &user, &session)
-        .await?
-        .ok_or_else(|| {
-            AppError::conflict("Account, session or API key changed; retry")
-        })?;
-    Ok((
-        decrypt(
-            &state.jwt_keys.access_secret,
-            &claims.sub,
-            &record.encrypted_key,
-        )?,
-        record.updated_at,
-    ))
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ApiKeyAction {
+    Get,
+    Rotate,
 }
+
+pub(crate) struct ApiKeyService<'a> {
+    pub(crate) db: &'a D1Database,
+    pub(crate) env: &'a Env,
+    pub(crate) access_secret: &'a str,
+}
+
+impl ApiKeyService<'_> {
+    pub(crate) async fn get_or_rotate(
+        &self,
+        claims: &Claims,
+        proof: &AccountVerificationRequest,
+        action: ApiKeyAction,
+    ) -> AppResult<(String, String)> {
+        let Self {
+            db,
+            env,
+            access_secret,
+        } = *self;
+        let user =
+            UserRow::fetch_by_id_with(db, &claims.sub, "Failed to fetch API key owner", || {
+                AuthError::UserNotFound.into()
+            })
+            .await?;
+        let session = claims.session_snapshot()?;
+        let previous = ApiKeyRow::find(db, &claims.sub).await?;
+        crate::service::identity::email::verify_password_or_otp(
+            db,
+            env,
+            access_secret,
+            claims,
+            proof,
+        )
+        .await?;
+        if action == ApiKeyAction::Get
+            && let Some(key) = ApiKeyRow::find_current(db, &user, &session).await?
+        {
+            return Ok((
+                decrypt(access_secret, &claims.sub, &key.encrypted_key)?,
+                key.updated_at,
+            ));
+        }
+        let value = format!("{}{}", Uuid::new_v4().simple(), Uuid::new_v4().simple());
+        let encrypted = encrypt(access_secret, &claims.sub, &value)?;
+        let hash = hex::encode(Sha256::digest(value.as_bytes()));
+        if let Some(record) = ApiKeyRow::replace(db, &user, &session, ApiKeyReplacement {
+            previous: previous.as_ref(),
+            encrypted: &encrypted,
+            hash: &hash,
+        })
+        .await?
+        {
+            return Ok((value, record.updated_at));
+        }
+        if action == ApiKeyAction::Rotate {
+            return Err(AppError::conflict(
+                "Account, session or API key changed; retry",
+            ));
+        }
+        let record = ApiKeyRow::find_current(db, &user, &session)
+            .await?
+            .ok_or_else(|| AppError::conflict("Account, session or API key changed; retry"))?;
+        Ok((
+            decrypt(access_secret, &claims.sub, &record.encrypted_key)?,
+            record.updated_at,
+        ))
+    }
+}
+
 pub async fn authenticate(
-    state: &AppContext,
-    headers: &HeaderMap,
+    db: &D1Database,
+    env: &Env,
+    request_ip: &str,
     client_id: &str,
     client_secret: &str,
     scope: Option<&str>,
 ) -> AppResult<(UserRow, String)> {
-    rate_limit::check_auth_attempt(
-        state,
-        format!("api-key-ip:{}", rate_limit::client_ip(headers)),
-    )
-    .await?;
+    rate_limit::check_auth_attempt(env, format!("api-key-ip:{request_ip}")).await?;
     let user = client_id
         .strip_prefix("user.")
         .filter(|u| Uuid::parse_str(u).is_ok())
         .ok_or_else(AppError::invalid_api_credentials)?;
-    rate_limit::check_auth_attempt(state, format!("api-key:{user}")).await?;
-    if client_secret.is_empty() ||
-        client_secret.len() > 4096 ||
-        scope.is_some_and(|scope| {
+    rate_limit::check_auth_attempt(env, format!("api-key:{user}")).await?;
+    if client_secret.is_empty()
+        || client_secret.len() > 4096
+        || scope.is_some_and(|scope| {
             scope
                 .split_whitespace()
                 .any(|s| s != "api" && s != "offline_access")
@@ -213,7 +190,7 @@ pub async fn authenticate(
             "Invalid API credentials or scope",
         ));
     }
-    let key = ApiKeyRow::find(state.database(), user)
+    let key = ApiKeyRow::find(db, user)
         .await?
         .ok_or_else(AppError::invalid_api_credentials)?;
     if !constant_time_eq(
@@ -223,7 +200,7 @@ pub async fn authenticate(
         return Err(AppError::invalid_api_credentials());
     }
     let user = UserRow::fetch_by_id_with(
-        state.database(),
+        db,
         user,
         "Failed to fetch API client",
         AppError::invalid_api_credentials,
@@ -232,24 +209,13 @@ pub async fn authenticate(
     Ok((user, key.key_hash))
 }
 
-pub async fn start_session(
-    db: &worker::D1Database,
-    owner: &str,
-    device: &str,
-    name: &str,
-    kind: i32,
+pub(crate) async fn start_session(
+    db: &D1Database,
+    owner: &UserRow,
+    session: &NewDeviceSession<'_>,
     key_hash: &str,
-) -> AppResult<DeviceRow> {
-    ApiKeyRow::start_session(
-        db,
-        owner,
-        device,
-        name,
-        kind,
-        &super::session::new_session_token(),
-        key_hash,
-    )
-    .await
+) -> AppResult<()> {
+    ApiKeyRow::start_session(db, owner, session, key_hash).await
 }
 
 #[cfg(test)]
@@ -257,13 +223,12 @@ mod tests {
     use super::*;
     #[test]
     fn api_secrets_are_encrypted_and_bound_to_owner() {
-        let value = encrypt("signing-secret", "owner", "api-secret")
-            .expect("valid api key fixture");
+        let value =
+            encrypt("signing-secret", "owner", "api-secret").expect("valid api key fixture");
         assert_ne!(value, "api-secret");
         assert!(value.starts_with(CIPHERTEXT_PREFIX));
         assert_eq!(
-            decrypt("signing-secret", "owner", &value)
-                .expect("valid api key fixture"),
+            decrypt("signing-secret", "owner", &value).expect("valid api key fixture"),
             "api-secret"
         );
         assert!(decrypt("signing-secret", "other", &value).is_err());
@@ -280,10 +245,7 @@ mod tests {
             decrypt(
                 "signing-secret",
                 "owner",
-                &format!(
-                    "{CIPHERTEXT_PREFIX}{}",
-                    URL_SAFE_NO_PAD.encode(bytes)
-                )
+                &format!("{CIPHERTEXT_PREFIX}{}", URL_SAFE_NO_PAD.encode(bytes))
             )
             .is_err()
         );
@@ -295,13 +257,11 @@ mod tests {
         let legacy = "AAECAwQFBgcICQoL3AV5TKrds7cBaxOBGWyclAyYWxhMJHzl-pc";
         let current = "v2.AAECAwQFBgcICQoLhKqubgYWX3dW7jacgnij2EoOFve4hEwobqw";
         assert_eq!(
-            decrypt("signing-secret", "owner", legacy)
-                .expect("valid api key fixture"),
+            decrypt("signing-secret", "owner", legacy).expect("valid api key fixture"),
             "api-secret"
         );
         assert_eq!(
-            decrypt("signing-secret", "owner", current)
-                .expect("valid api key fixture"),
+            decrypt("signing-secret", "owner", current).expect("valid api key fixture"),
             "api-secret"
         );
         assert_eq!(
@@ -323,10 +283,7 @@ mod tests {
             )
             .is_err()
         );
-        assert!(
-            decrypt("signing-secret", "owner", &format!("v2.{legacy}"))
-                .is_err()
-        );
+        assert!(decrypt("signing-secret", "owner", &format!("v2.{legacy}")).is_err());
         assert!(decrypt("signing-secret", "owner", "v3.unknown").is_err());
         let long_secret = URL_SAFE_NO_PAD.encode([7; 64]);
         assert_ne!(

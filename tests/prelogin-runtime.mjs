@@ -1,4 +1,5 @@
-import { openFixtureJwtKeys, wrapFixtureJwtKeys } from "./jwt-runtime.mjs";
+import { openFixtureJwtKeys, wrapFixtureJwtKeys } from "./runtime-auth.mjs";
+import { equal, expectJson, expectStatus } from "./runtime-assertions.mjs";
 
 /** Stable unknown-email KDF responses through compiled Rust and real SQLite. */
 export async function runPreloginCompatibility({ fixture, check, sql }) {
@@ -6,18 +7,11 @@ export async function runPreloginCompatibility({ fixture, check, sql }) {
     "/api/accounts/prelogin", "/api/accounts/prelogin/password",
     "/identity/accounts/prelogin", "/identity/accounts/prelogin/password",
   ];
-  const equal = (actual, expected, label = "value") => {
-    if (actual !== expected) throw new Error(`${label}: expected ${expected}, received ${actual}`);
-  };
-  const expectStatus = async (response, expected) => {
-    if (response.status !== expected) throw new Error(`Expected HTTP ${expected}, received ${response.status}: ${await response.text()}`);
-    return response;
-  };
   const request = (f, email, path = aliases[0]) => f.fetch(path, {
     method: "POST", headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ email }),
   });
-  const prelogin = async (f, email, path) => (await expectStatus(await request(f, email, path), 200)).json();
+  const prelogin = async (f, email, path) => expectJson(await request(f, email, path), 200);
   const users = () => JSON.stringify(sql.exec("SELECT * FROM users ORDER BY id").toArray());
   const settings = (body, [type, iterations, memory, parallelism], email) => {
     equal(body.kdf, type, "top-level KDF type");
@@ -34,11 +28,35 @@ export async function runPreloginCompatibility({ fixture, check, sql }) {
   await check("prelogin keeps real account KDF parameters on every alias without credential writes", async () => {
     const f = fixture();
     const email = "owner@example.test";
-    for (const values of [[0, 750000, null, null], [1, 4, 96, 2]]) {
+    const samples = [[0, 750000, null, null], [0, 5000, null, null], [1, 4, 96, 2]];
+    for (const [index, values] of samples.entries()) {
       sql.exec("UPDATE users SET kdf_type=?,kdf_iterations=?,kdf_memory=?,kdf_parallelism=? WHERE email=?", ...values, email);
       const before = users();
-      for (const path of aliases) settings(await prelogin(f, " Owner@Example.TEST ", path), values, email);
+      // All aliases share the same handler. Exercise their wiring with one sample.
+      for (const path of index === 0 ? aliases : [aliases[0]]) {
+        settings(await prelogin(f, " Owner@Example.TEST ", path), values, email);
+      }
       equal(users(), before, "stored account and credential state");
+    }
+  });
+
+  await check("prelogin rejects invalid persisted KDF settings without exposing their values", async () => {
+    const samples = [
+      ["malformed", 600000, null, null], [0, 4294967297, null, null], [1, 4, "malformed", 2],
+      [2, 600000, null, null], [0, -1, null, null], [0, 0, null, null],
+      [1, 0, 64, 4], [1, 4, null, 4], [1, 4, 64, null], [1, 4, 1025, 4], [1, 4, 64, 0],
+    ];
+    for (const [index, values] of samples.entries()) {
+      const f = fixture();
+      const email = "owner@example.test";
+      sql.exec("UPDATE users SET kdf_type=?,kdf_iterations=?,kdf_memory=?,kdf_parallelism=? WHERE email=?", ...values, email);
+      const before = users();
+      for (const path of index === 0 ? aliases : [aliases[0]]) {
+        const body = await expectJson(await request(f, email, path), 500);
+        equal(body.message, "Internal server error");
+        equal(body.code, 13);
+      }
+      equal(users(), before, "stored KDF settings after failed prelogin");
     }
   });
 

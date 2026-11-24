@@ -1,62 +1,35 @@
 //! Account envelope changes commit with the exact vault generation they read.
-use crate::service::{
-    identity::user::{
-        AccountKeyPairRequest,
-        KdfParams,
-    },
-    vault::cipher::CipherPayload,
-};
+use crate::service::identity::user::{AccountKeyPairRequest, KdfParams};
 mod requests;
 use std::collections::HashSet;
 
-pub(crate) use requests::RotateAccountKeysRequest;
-use requests::RotateAccountPayload;
 pub use requests::{
-    AccountKeysRequest,
-    ValidatedAccountKeys,
-    account_keys_response,
-    is_valid_key_id,
+    AccountKeysRequest, PasskeyUnlockItem, SignatureKeyPair, ValidatedAccountKeys,
+    account_keys_response, is_valid_key_id,
 };
+pub(crate) use requests::{RotateAccountKeysRequest, RotateAccountPayload, WrappedRotationKeys};
 use serde_json::Value;
 use uuid::Uuid;
-use worker::{
-    D1Database,
-    D1PreparedStatement,
-};
+use worker::{D1Database, D1PreparedStatement, Env};
 
 use crate::{
-    app::AppContext,
-    errors::{
-        AppError,
-        AppResult,
-    },
+    errors::{AppError, AppResult},
     models::identity::{
-        account_keys::{
-            AccountSnapshot,
-            rotation,
-            rotation::CollectionSnapshot,
-        },
-        user::{
-            StoredPassword,
-            UserRow,
-        },
+        account_keys::{AccountSnapshot, rotation, rotation::CollectionSnapshot},
+        user::{StoredPassword, UserRow},
     },
     service::{
         identity::session::Claims,
         notifications,
-        notifications::{
-            UpdateType,
-            admin as admin_notify,
-            admin::Event,
-        },
+        notifications::{LogoutScope, admin as admin_notify, admin::Event},
         send,
     },
 };
 
 pub struct RotationPassword {
     pub password: StoredPassword,
-    pub kdf:      KdfParams,
-    pub hint:     Option<String>,
+    pub kdf: KdfParams,
+    pub hint: Option<String>,
 }
 
 impl RotationPassword {
@@ -74,48 +47,50 @@ impl RotationPassword {
 
 pub(super) struct CredentialChange<'a> {
     pub password: &'a StoredPassword,
-    pub key:      &'a str,
-    pub kdf:      KdfParams,
-    pub hint:     Option<&'a str>,
-    pub keys:     Option<&'a AccountKeyPairRequest>,
+    pub key: &'a str,
+    pub kdf: KdfParams,
+    pub hint: Option<&'a str>,
+    pub keys: Option<&'a AccountKeyPairRequest>,
 }
 
 pub struct RotationInput {
-    pub keys:             ValidatedAccountKeys,
-    pub data:             RotateAccountPayload,
+    pub keys: ValidatedAccountKeys,
+    pub data: RotateAccountPayload,
     pub wrapped_user_key: String,
-    pub old_user_key_id:  Option<String>,
-    pub new_user_key_id:  Option<String>,
-    pub upgrade:          Option<Value>,
-    pub passkeys:         Vec<Value>,
-    pub password:         Option<RotationPassword>,
+    pub old_user_key_id: Option<String>,
+    pub new_user_key_id: Option<String>,
+    pub upgrade: Option<Value>,
+    pub passkeys: Vec<PasskeyUnlockItem>,
+    pub password: Option<RotationPassword>,
+}
+
+pub(crate) struct AccountRotationContext<'a> {
+    pub db: &'a D1Database,
+    pub env: &'a Env,
+    pub claims: &'a Claims,
+    pub user: &'a UserRow,
 }
 
 impl RotationInput {
-    pub async fn apply(
-        self,
-        state: &AppContext,
-        claims: &Claims,
-        user: &UserRow,
-    ) -> AppResult<()> {
-        let db = state.database();
+    pub(crate) async fn apply(self, context: AccountRotationContext<'_>) -> AppResult<()> {
+        let AccountRotationContext {
+            db,
+            env,
+            claims,
+            user,
+        } = context;
         let changes_password = self.password.is_some();
         self.validate_account(user)?;
-        let is_upgrade = self.password.is_none() &&
-            self.upgrade.is_some() &&
-            !crate::service::identity::user::is_v2(user);
+        let is_upgrade = self.password.is_none()
+            && self.upgrade.is_some()
+            && !crate::service::identity::user::is_v2(user);
         let sources = RotationSources::load(db, &claims.sub).await?;
         sources.validate(&self)?;
 
         let mut batch = RotationBatch::new(db, &claims.sub);
-        let (send_writes, send_guards) = send::rotation_statements(
-            db,
-            &claims.sub,
-            &self.data.sends,
-            &batch.now,
-            &batch.token,
-        )
-        .await?;
+        let (send_writes, send_guards) =
+            send::rotation_statements(db, &claims.sub, &self.data.sends, &batch.now, &batch.token)
+                .await?;
         let final_stamp = if is_upgrade {
             user.security_stamp.clone()
         } else {
@@ -143,7 +118,7 @@ impl RotationInput {
         if let Some(password) = self.password {
             password.apply_to(&mut next);
         }
-        let new_snapshot = AccountSnapshot::from_user(&next).to_json()?;
+        let new_snapshot = AccountSnapshot::json_from_user(&next)?;
         batch.writes.push(rotation::claim_rotation(
             db,
             user,
@@ -155,29 +130,27 @@ impl RotationInput {
         batch.writes.extend(sources.guards()?);
         batch.writes.extend(send_guards);
         batch.writes.extend(send_writes);
-        batch.write_vault_items(&self.data)?;
+        batch.write_vault_items(self.data)?;
         batch.write_passkeys(&self.passkeys, &new_snapshot)?;
-        let now = batch.commit().await?;
+        let (now, revision) = batch.commit().await?;
         if changes_password {
-            notifications::publish_user_update(
-                &state.env,
-                &claims.sub,
-                UpdateType::LogOut,
-                &now,
-                claims.device(),
-            )
-            .await;
+            notifications::publish_account_logout(env, claims, &now).await;
         } else {
-            notifications::publish_key_rotation(
-                &state.env,
-                &claims.sub,
-                &now,
-                claims.device(),
-            )
-            .await;
+            let scope = if is_upgrade {
+                LogoutScope::BeforeRevision {
+                    value: revision,
+                    stamp: claims.sstamp.clone(),
+                }
+            } else {
+                LogoutScope::Stamp {
+                    value: claims.sstamp.clone(),
+                }
+            };
+            notifications::publish_key_rotation(env, &claims.sub, &now, scope, claims.device())
+                .await;
         }
         admin_notify::emit(
-            &state.env,
+            env,
             if changes_password {
                 Event::PasswordChange
             } else {
@@ -191,9 +164,9 @@ impl RotationInput {
 
     fn validate_account(&self, user: &UserRow) -> AppResult<()> {
         self.keys.validate_rotation(user)?;
-        if let Some(id) = &self.new_user_key_id &&
-            (self.keys.is_v2() || self.new_user_key_id != user.user_key_id) &&
-            !is_valid_key_id(id)
+        if let Some(id) = &self.new_user_key_id
+            && (self.keys.is_v2() || self.new_user_key_id != user.user_key_id)
+            && !is_valid_key_id(id)
         {
             return Err(AppError::bad_request(
                 "Key id must be 32 lowercase hex characters",
@@ -207,10 +180,10 @@ impl RotationInput {
         if self.wrapped_user_key.trim().is_empty() {
             return Err(AppError::bad_request("Wrapped user key is required"));
         }
-        if let Some(upgrade) = &self.upgrade &&
-            ["wrappedUserKey1", "wrappedUserKey2"].iter().any(|field| {
-                upgrade[*field].as_str().is_none_or(|s| s.trim().is_empty())
-            })
+        if let Some(upgrade) = &self.upgrade
+            && ["wrappedUserKey1", "wrappedUserKey2"]
+                .iter()
+                .any(|field| upgrade[*field].as_str().is_none_or(|s| s.trim().is_empty()))
         {
             return Err(AppError::bad_request(
                 "Both V2 upgrade wrapped user keys are required",
@@ -223,12 +196,12 @@ impl RotationInput {
 /// The same captured rows define which items must be rewrapped and guard the
 /// transaction against concurrent changes.
 struct RotationSources<'a> {
-    db:          &'a D1Database,
-    owner:       &'a str,
-    ciphers:     CollectionSnapshot,
-    folders:     CollectionSnapshot,
+    db: &'a D1Database,
+    owner: &'a str,
+    ciphers: CollectionSnapshot,
+    folders: CollectionSnapshot,
     attachments: CollectionSnapshot,
-    passkeys:    CollectionSnapshot,
+    passkeys: CollectionSnapshot,
 }
 
 impl<'a> RotationSources<'a> {
@@ -244,28 +217,28 @@ impl<'a> RotationSources<'a> {
     }
 
     fn validate(&self, input: &RotationInput) -> AppResult<()> {
+        self.validate_ciphers_and_folders(input)?;
+        self.validate_attachments(input)?;
+        self.validate_passkeys(input)
+    }
+
+    fn validate_ciphers_and_folders(&self, input: &RotationInput) -> AppResult<()> {
         let cipher_ids = input
             .data
             .ciphers
             .iter()
-            .filter_map(|c| c.id.clone())
+            .filter_map(|c| c.id.as_deref())
             .collect::<HashSet<_>>();
         let folder_ids = input
             .data
             .folders
             .iter()
-            .filter_map(|f| f.id.clone())
+            .filter_map(|f| f.id.as_deref())
             .collect::<HashSet<_>>();
-        if cipher_ids.len() != input.data.ciphers.len() ||
-            cipher_ids != self.ciphers.ids() ||
-            folder_ids.len() !=
-                input
-                    .data
-                    .folders
-                    .iter()
-                    .filter(|f| f.id.is_some())
-                    .count() ||
-            folder_ids != self.folders.ids()
+        if cipher_ids.len() != input.data.ciphers.len()
+            || cipher_ids != self.ciphers.ids()
+            || folder_ids.len() != input.data.folders.iter().filter(|f| f.id.is_some()).count()
+            || folder_ids != self.folders.ids()
         {
             return Err(AppError::conflict(
                 "Every existing cipher and folder must occur exactly once in \
@@ -274,18 +247,19 @@ impl<'a> RotationSources<'a> {
         }
         for cipher in &input.data.ciphers {
             cipher.validate_for_personal_vault(self.owner)?;
-            cipher.validate_encryption_context(
-                self.owner,
-                input.new_user_key_id.as_deref(),
-            )?;
+            cipher.validate_encryption_context(self.owner, input.new_user_key_id.as_deref())?;
         }
+        Ok(())
+    }
+
+    fn validate_attachments(&self, input: &RotationInput) -> AppResult<()> {
         let attachment_rows = self.attachments.rows();
         for cipher in &input.data.ciphers {
             if let Some(files) = &cipher.attachment_key_updates {
                 for id in files.keys() {
                     if !attachment_rows.iter().any(|row| {
-                        row["id"].as_str() == Some(id.as_str()) &&
-                            row["cipher_id"].as_str() == cipher.id.as_deref()
+                        row["id"].as_str() == Some(id.as_str())
+                            && row["cipher_id"].as_str() == cipher.id.as_deref()
                     }) {
                         return Err(AppError::bad_request(
                             "Rotated attachment does not belong to the cipher",
@@ -302,27 +276,30 @@ impl<'a> RotationSources<'a> {
             .flat_map(|c| {
                 c.attachment_key_updates
                     .iter()
-                    .flat_map(|a| a.keys().cloned())
+                    .flat_map(|a| a.keys().map(String::as_str))
             })
             .collect::<Vec<_>>();
-        if provided_attachments.len() != expected_attachments.len() ||
-            provided_attachments.into_iter().collect::<HashSet<_>>() !=
-                expected_attachments
+        if provided_attachments.len() != expected_attachments.len()
+            || provided_attachments.into_iter().collect::<HashSet<_>>() != expected_attachments
         {
             return Err(AppError::conflict(
                 "Every existing attachment must be rewrapped during rotation",
             ));
         }
+        Ok(())
+    }
+
+    fn validate_passkeys(&self, input: &RotationInput) -> AppResult<()> {
         let expected_passkeys = self
             .passkeys
             .rows()
             .iter()
             .filter(|row| {
-                row["credential_use"] == "login" &&
-                    row["encrypted_user_key"]
+                row["credential_use"] == "login"
+                    && row["encrypted_user_key"]
                         .as_str()
-                        .is_some_and(|s| !s.is_empty()) &&
-                    row["encrypted_private_key"]
+                        .is_some_and(|s| !s.is_empty())
+                    && row["encrypted_private_key"]
                         .as_str()
                         .is_some_and(|s| !s.is_empty())
             })
@@ -331,10 +308,13 @@ impl<'a> RotationSources<'a> {
         let provided_passkeys = input
             .passkeys
             .iter()
-            .filter_map(|row| row["id"].as_str().map(str::to_string))
+            .filter_map(|item| item.id.as_deref())
             .collect::<HashSet<_>>();
-        if provided_passkeys.len() != input.passkeys.len() ||
-            provided_passkeys != expected_passkeys
+        if provided_passkeys.len() != input.passkeys.len()
+            || provided_passkeys.len() != expected_passkeys.len()
+            || !expected_passkeys
+                .iter()
+                .all(|slot| provided_passkeys.contains(slot.as_str()))
         {
             return Err(AppError::conflict(
                 "Every enabled passkey must be rewrapped during rotation",
@@ -358,10 +338,10 @@ impl<'a> RotationSources<'a> {
 }
 
 struct RotationBatch<'a> {
-    db:     &'a D1Database,
-    owner:  &'a str,
-    now:    String,
-    token:  String,
+    db: &'a D1Database,
+    owner: &'a str,
+    now: String,
+    token: String,
     writes: Vec<D1PreparedStatement>,
 }
 
@@ -376,41 +356,38 @@ impl<'a> RotationBatch<'a> {
         }
     }
 
-    fn write_vault_items(
-        &mut self,
-        data: &RotateAccountPayload,
-    ) -> AppResult<()> {
-        for cipher in &data.ciphers {
-            let id = cipher.id.as_deref().ok_or(AppError::Internal)?;
+    fn write_vault_items(&mut self, data: RotateAccountPayload) -> AppResult<()> {
+        for mut cipher in data.ciphers {
+            let id = cipher.id.take().ok_or(AppError::Internal)?;
+            let attachments = cipher.attachment_key_updates.take();
             let data =
-                serde_json::to_string(&CipherPayload::from_request(cipher))
-                    .map_err(AppError::internal_error)?;
+                serde_json::to_string(&cipher.into_payload()).map_err(AppError::internal_error)?;
             self.writes.push(rotation::cipher_write(
                 self.db,
                 self.owner,
-                id,
+                &id,
                 &data,
                 &self.now,
                 &self.token,
             )?);
-            if let Some(attachments) = &cipher.attachment_key_updates {
+            if let Some(attachments) = &attachments {
                 for (attachment_id, attachment) in attachments {
-                    if attachment.key.trim().is_empty() ||
-                        attachment.file_name.trim().is_empty()
-                    {
+                    if attachment.key.trim().is_empty() || attachment.file_name.trim().is_empty() {
                         return Err(AppError::bad_request(
                             "Rotated attachment keys and names are required",
                         ));
                     }
                     self.writes.push(rotation::attachment_write(
                         self.db,
-                        self.owner,
-                        id,
-                        attachment_id,
-                        &attachment.file_name,
-                        &attachment.key,
-                        &self.now,
-                        &self.token,
+                        rotation::RotatedAttachmentWrite {
+                            owner: self.owner,
+                            cipher: &id,
+                            attachment_id,
+                            file_name: &attachment.file_name,
+                            key: &attachment.key,
+                            now: &self.now,
+                            write_token: &self.token,
+                        },
                     )?);
                 }
             }
@@ -432,49 +409,45 @@ impl<'a> RotationBatch<'a> {
 
     fn write_passkeys(
         &mut self,
-        passkeys: &[Value],
+        passkeys: &[PasskeyUnlockItem],
         new_snapshot: &str,
     ) -> AppResult<()> {
         for passkey in passkeys {
-            let id = passkey["id"].as_str().ok_or(AppError::Internal)?;
-            let public = passkey["encryptedPublicKey"]
-                .as_str()
+            let id = passkey.id.as_deref().ok_or(AppError::Internal)?;
+            let public = passkey
+                .encrypted_public_key
+                .as_deref()
                 .filter(|v| !v.trim().is_empty())
-                .ok_or_else(|| {
-                    AppError::bad_request(
-                        "Passkey encryptedPublicKey is required",
-                    )
-                })?;
-            let key = passkey["encryptedUserKey"]
-                .as_str()
+                .ok_or_else(|| AppError::bad_request("Passkey encryptedPublicKey is required"))?;
+            let key = passkey
+                .encrypted_user_key
+                .as_deref()
                 .filter(|v| !v.trim().is_empty())
-                .ok_or_else(|| {
-                    AppError::bad_request(
-                        "Passkey encryptedUserKey is required",
-                    )
-                })?;
+                .ok_or_else(|| AppError::bad_request("Passkey encryptedUserKey is required"))?;
             self.writes.push(rotation::passkey_write(
                 self.db,
-                self.owner,
-                id,
-                public,
-                key,
-                new_snapshot,
-                &self.now,
-                &self.token,
+                rotation::RotatedPasskeyWrite {
+                    owner: self.owner,
+                    id,
+                    public,
+                    key,
+                    snapshot: new_snapshot,
+                    now: &self.now,
+                    write_token: &self.token,
+                },
             )?);
         }
         Ok(())
     }
 
-    async fn commit(self) -> AppResult<String> {
-        rotation::commit(self.db, self.owner, &self.token, self.writes).await?;
-        Ok(self.now)
+    async fn commit(self) -> AppResult<(String, String)> {
+        let revision = rotation::commit(self.db, self.owner, &self.token, self.writes).await?;
+        Ok((self.now, revision))
     }
 }
 
 pub(super) async fn change_credentials(
-    state: &AppContext,
+    db: &D1Database,
     claims: &Claims,
     user: &UserRow,
     change: CredentialChange<'_>,
@@ -509,13 +482,12 @@ pub(super) async fn change_credentials(
         master_password_hint: change.hint.map(str::to_string),
         ..user.clone()
     };
-    rotation::change_credentials(
-        state.database(),
+    rotation::change_credentials(db, rotation::CredentialRotation {
         user,
-        &claims.session_snapshot()?,
-        &next,
-        &token,
-        &now,
-    )
+        session: &claims.session_snapshot()?,
+        next: &next,
+        token: &token,
+        now: &now,
+    })
     .await
 }

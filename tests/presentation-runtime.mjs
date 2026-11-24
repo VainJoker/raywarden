@@ -1,12 +1,9 @@
 /** Presentation preferences through the compiled Rust config/CSS handlers. */
+import { equal, expectStatus, ok } from "./runtime-assertions.mjs";
+
 export async function runPresentationCompatibility({ fixture, check }) {
-  const equal = (actual, expected, label = "value") => {
-    if (actual !== expected) throw new Error(`${label}: expected ${expected}, received ${actual}`);
-  };
-  const ok = (value, label) => { if (!value) throw new Error(label); };
   const css = async (f, init) => {
-    const response = await f.fetch("/css/vaultwarden.css", init);
-    equal(response.status, 200, await response.clone().text());
+    const response = await expectStatus(await f.fetch("/css/vaultwarden.css", init), 200);
     return { response, text: await response.text() };
   };
   const config = async (f, headers) => {
@@ -96,7 +93,11 @@ export async function runPresentationCompatibility({ fixture, check }) {
     ok(/^"[a-f0-9]{64}"$/.test(etag), "CSS has no strong content ETag");
     equal(first.response.headers.get("cache-control"), "public, no-cache");
     let response = await f.fetch("/css/vaultwarden.css", { headers: { "If-None-Match": `"another", W/${etag}` } });
-    equal(response.status, 304); equal(await response.text(), ""); equal(response.headers.get("etag"), etag);
+    equal(response.status, 304);
+    equal(await response.text(), "");
+    equal(response.headers.get("etag"), etag);
+    equal(response.headers.get("cache-control"), "public, no-cache");
+    equal(response.headers.get("x-content-type-options"), "nosniff");
     response = await f.fetch("/css/vaultwarden.css", { method: "HEAD" });
     equal(response.status, 200); equal(await response.text(), ""); equal(response.headers.get("etag"), etag);
     f.env.VW_CSS_USER = custom;
