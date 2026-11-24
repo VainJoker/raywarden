@@ -1,156 +1,52 @@
-# Database Backup, Restore, and Time Travel
+# 备份与恢复边界
 
-Centralize your D1 operational playbooks here: backup automation, restore flows, and point-in-time recovery.
+备份与恢复由运营者安排。仓库提供构建和部署工作流，完整恢复需要同期的 D1、文件对象和独立的包装密钥。
 
-## GitHub Actions Backups
+## 需要一起恢复的内容
 
-> [!NOTE] To use this backup feature, you must fork this repository and configure the same three required secrets as described in the [CI/CD deployment](deployment.md#cicd-deployment-with-github-actions) section in advance: `CLOUDFLARE_API_TOKEN`, `CLOUDFLARE_ACCOUNT_ID`, and `D1_DATABASE_ID`.
+- D1：账户验证材料、加密密码项与密钥、设备会话、文件元数据、`jwt_keys`，以及 `d1_migrations` 历史。JWT 签名密钥以 `v1.` 包装格式保存在 D1，同时参与 API Key 包装；恢复时必须保留原行，不能当缓存删除重建。
+- 独立的 `KEY_ENCRYPTION_KEY` Worker Secret：解密 D1 根密钥所必需，应与数据库分开安全备份；仓库中的开发值不能用于生产。
+- R2 或 KV：附件与 File Send 的实际文件字节。对于这些文件，D1 只有元数据；仅恢复 D1 无法找回文件内容。
+- 对应版本的 Worker、配置和前端：恢复的数据结构应与运行代码、迁移链一致。邮件、推送等可选服务的外部 Secrets 不保存在 D1 导出中，需单独保留和配置。全局等价域名和刷新状态可重新获取。
 
-This project includes a GitHub Action workflow that automatically backs up your D1 database to S3-compatible storage daily. The backup runs at 04:00 UTC (1 hour after the cleanup task).
+数据库与文件应有能核对的时间点和对应关系。D1 回退到较早状态后，不能假定当前 R2/KV 恰好与之匹配；Worker 版本回滚也不会自动回滚数据库或文件。
 
-> [!NOTE] **Important Notes:** 
-> - **Manual trigger required for first run:** You must manually trigger the Action once (GitHub Actions → Backup D1 Database to S3 → Run workflow) before scheduled backups will run automatically.
-> - **Ensure your S3 bucket is set to private access** to prevent data leaks and avoid unnecessary public traffic costs.
-> - **⚠️ CRITICAL: Do NOT use R2 from the same Cloudflare account as your Worker** for backups. If your Cloudflare account gets suspended or banned, you will lose access to both your Worker and your backup storage, resulting in complete data loss. Always use a separate Cloudflare account or a different S3-compatible storage provider (AWS S3, Backblaze B2, MinIO, etc.) for backups to ensure redundancy and disaster recovery.
+已有账户的库若缺失 `jwt_keys`，应用会停止初始化，要求恢复原行或成对导入原始 legacy Secrets；不会自动换一套随机密钥。API Key 新密文使用 `v2.` 标记和用途隔离的派生密钥，旧密文仍可读取；两种格式都依赖原 access secret。新格式 D1 不再直接包含原始签名密钥，但历史原文导出、账户验证与 2FA 材料仍属敏感信息，数据库备份仍需加密保管。
 
-### Required Secrets for Backup
+## JWT 包装根密钥与版本回退
 
-Add the following secrets to your GitHub repository (`Settings > Secrets and variables > Actions`):
+加载 JWT 密钥需要正确的 `KEY_ENCRYPTION_KEY`。旧原文行通过条件更新改为 AES-256-GCM 包装，保持原始签名密钥字节，并发请求以已持久化的记录为准。此前导出的原文数据库副本也需要独立加密。
 
-| Secret | Required | Description |
-|--------|----------|-------------|
-| `S3_ACCESS_KEY_ID` | yes | Your S3 access key ID |
-| `S3_SECRET_ACCESS_KEY` | yes | Your S3 secret access key |
-| `S3_BUCKET` | yes | The S3 bucket name for storing backups |
-| `S3_REGION` | yes | The S3 region (e.g., `us-east-1`). If unsure, use `auto` |
-| `S3_ENDPOINT` | no | Custom S3 endpoint URL. Defaults to AWS S3 if not set. Required for S3-compatible services (MinIO, Cloudflare R2, Backblaze B2, etc.) |
-| `BACKUP_ENCRYPTION_KEY` | no | Optional encryption passphrase. If set, backups will be encrypted with AES-256. **Strongly recommended** since the database contains unencrypted user metadata (emails, item counts) |
+已包装的数据库需要同一外部 Secret 才能读取。错误密钥、篡改、字段交换或混合格式均使加载失败。外部 Secret 的轮换需要单独设计与演练。密钥包装减小 D1 只读泄露的影响，恢复时仍需验证备份来源及完整性。
 
-### Backup Features
+旧二进制不识别 `v1.` 保存格式，**不能只回滚 Worker 并继续使用包装后的数据库**。应使用识别包装格式的修复版本；确需旧版时，先独立评审并恢复匹配版本、数据库和 Secret，核对备份之后的数据与 R2/KV 文件。滚动切换期间旧实例若读到新包装行可能短暂认证失败，不能用明文回退掩盖这个版本边界。
 
-* **Automatic Daily Backups:** Production database is backed up daily at 04:00 UTC
-* **Manual Trigger:** You can manually trigger a backup from the GitHub Actions tab
-* **Environment Selection:** When triggering manually, you can choose to backup either `production` or `dev` database
-* **Compression:** Backups are compressed using gzip to save storage space
-* **Optional Encryption:** If `BACKUP_ENCRYPTION_KEY` is set, backups are encrypted with AES-256-CBC (PBKDF2 key derivation, 100k iterations)
-* **Automatic Cleanup:** Old backups older than 30 days are automatically deleted
-* **S3-Compatible:** Works with AWS S3, Cloudflare R2, MinIO, Backblaze B2, and any S3-compatible storage
+## 账户验证成本升级的回滚边界
 
-### Backup File Location
+当前账户基线定义逐账户 `password_iterations`，新写入使用至少 `600000` 次与 64 字节随机盐，已记录的更高成本继续保留。客户端 KDF 和 Send 使用独立参数。旧迁移历史需要单独规划数据转移。
 
-Backups are stored in your S3 bucket with the following structure:
+**只回滚 Worker 到不识别 `password_iterations` 的旧 Raywarden 不安全。** 旧版本固定按 `100000` 次验证，无法验证已经升级的账户；若它再写入凭据，还可能让 hash 与数据库中保留的成本不匹配。删掉这一列、把成本值改回 `100000` 或只恢复旧 Worker 都不能把一个 `600000` 次的 hash 还原成旧 hash。纯成本升级刻意不修改 `updated_at`、安全戳或账户写入标记，因此这些字段也不能代替备份中的 hash、盐和成本来判断是否已升级。
 
-```
-# Unencrypted backups
-s3://your-bucket/warden-worker/production/vault1_prod_YYYY-MM-DD_HH-MM-SS.sql.gz
+日常恢复应选择识别逐账户成本的兼容版本，并一起恢复与它匹配的完整数据库备份，包括 `master_password_hash`、`password_salt`、`password_iterations`、`jwt_keys` 和迁移历史。若确需退回不兼容的旧版本，必须另外评审并恢复升级前的完整数据库及其匹配版本；这会丢失备份时间点之后的数据，仍需核对同期 R2/KV 文件。不能把升级前后的几列手工拼接成一个账户。
 
-# Encrypted backups (when BACKUP_ENCRYPTION_KEY is set)
-s3://your-bucket/warden-worker/production/vault1_prod_YYYY-MM-DD_HH-MM-SS.sql.gz.enc
-```
+## 恢复前的最小演练
 
-### Decrypting Backups
+1. 记录目标环境、代码版本、数据库状态及文件范围，保留原状态；先选择独立数据库和文件存储，不直接覆盖正在使用的库。
+2. 在隔离环境恢复 D1，核对实际表结构、`d1_migrations`、关键记录及外键，并确认 Worker 支持备份中的逐账户验证成本。缺失或不可信的历史先单独核对，不盲目重放完整迁移，不吞重复列错误，也不自动补记录，规则见 [迁移说明](../sql/migrations/README.md)。
+3. 核对附件和 Send 记录所指向的文件是否存在、大小是否匹配；用指定客户端验证恢复的加密材料仍能使用，不能只以 `/api/alive` 成功判断恢复完成。
+4. 记录演练结果、缺失文件和切换条件，再制定实际环境恢复步骤。自动化、备份频率、保留期和恢复耗时均需另行实现与验收。
 
-If you enabled encryption, use the following command to decrypt a backup:
+## 切换文件存储后端
 
-```bash
-openssl enc -aes-256-cbc -d -pbkdf2 -iter 100000 \
-  -in vault1_prod_YYYY-MM-DD_HH-MM-SS.sql.gz.enc \
-  -out backup.sql.gz \
-  -pass pass:"YOUR_ENCRYPTION_KEY"
+文件元数据和清理作业按对象键关联。Worker 优先选择已绑定的 R2，否则使用 KV。切换前按同一时间点验证 D1 与对象存储，并安排维护窗口。
 
-# Then decompress
-gunzip backup.sql.gz
-```
+1. 在原后端仍生效时暂停文件写入、删除和定时清理。核对未完成的上传、暂存记录和清理作业，等待在途请求结束。记录保留的待处理作业及其所属后端。
+2. 用 D1 生成已发布对象清单，覆盖附件和已完成的 File Send。优先使用 `storage_key`。旧附件用 `cipher_id/attachment_id`，旧 Send 用 `sends/send_id/file_id`。按清单复制到新后端并验证对象键、字节数和内容摘要。迁入 KV 前核对单对象大小上限。 [运行配置](runtime-config.md)
+3. 用独立的 D1 副本和目标绑定试运行，验证旧文件下载、两步上传和失败清理。正式切换前确认旧后端的积压作业已经完成或另有处理安排，避免新后端确认删除后留下旧数据。
+4. 发布目标绑定并核对实际产物，通过一组代表性文件验收后恢复写入。保留原后端和同期备份至验收窗口结束。若切换后已有写入，先对齐新增对象和 D1，再决定回退时点。
 
-### Restoring Database to Cloudflare D1
+## 官方参考
 
-1. **Download the backup from S3:**
+[D1 导入与导出说明](https://developers.cloudflare.com/d1/best-practices/import-export-data/)提供数据库导入、导出方式；它不覆盖本项目的 R2/KV 文件与运行配置。
 
-    ```bash
-    # Using AWS CLI
-    aws s3 cp s3://your-bucket/warden-worker/production/vault1_prod_YYYY-MM-DD_HH-MM-SS.sql.gz.enc ./
-    
-    # Or with custom endpoint (e.g., R2, MinIO)
-    aws s3 cp s3://your-bucket/warden-worker/production/vault1_prod_YYYY-MM-DD_HH-MM-SS.sql.gz.enc ./ \
-      --endpoint-url https://your-s3-endpoint.com
-    ```
-
-2. **Decrypt the backup (if encrypted):**
-
-    ```bash
-    openssl enc -aes-256-cbc -d -pbkdf2 -iter 100000 \
-      -in vault1_prod_YYYY-MM-DD_HH-MM-SS.sql.gz.enc \
-      -out backup.sql.gz \
-      -pass pass:"YOUR_ENCRYPTION_KEY"
-    ```
-
-3. **Decompress the backup:**
-
-    ```bash
-    gunzip backup.sql.gz
-    ```
-
-4. **Restore to Cloudflare D1:**
-
-    First, find your database name using wrangler:
-
-    ```bash
-    wrangler d1 list
-    ```
-
-    This will show a table with your databases. Look for the `name` column (e.g., `warden-db` for production or `warden-dev` for dev).
-
-    Then restore the backup:
-
-    ```bash
-    # Replace DATABASE_NAME with your actual database name (e.g., warden-db)
-    
-    # First, you may want to clear the existing database (optional, use with caution!)
-    # wrangler d1 execute DATABASE_NAME --remote --command "DELETE FROM ciphers; DELETE FROM folders; DELETE FROM users;"
-    
-    # Import the backup
-    wrangler d1 execute DATABASE_NAME --remote --file=backup.sql
-    ```
-
-    > [!NOTE] The `--remote` flag is required to execute against your production D1 database. Without it, the command will run against the local development database. 
-
-    > ⚠️ **Troubleshooting: `no such table: main.users` error**
-    > 
-    > If you encounter this error when importing, it's because `wrangler d1 export` may output tables in an order that doesn't respect foreign key dependencies (e.g., `folders` table is created before `users` table, but `folders` has a foreign key referencing `users`).
-    > 
-    > **Solution:** Add `PRAGMA foreign_keys=OFF;` at the beginning of your backup.sql file to disable foreign key checks during import:
-    > 
-    > ```bash
-    > # Prepend the PRAGMA statement to your backup file
-    > echo -e "PRAGMA foreign_keys=OFF;\n$(cat backup.sql)" > backup.sql
-    > 
-    > # Then import as usual
-    > wrangler d1 execute DATABASE_NAME --remote --file=backup.sql
-    > ```
-    > 
-    > Alternatively, you can manually reorder the SQL statements in the backup file to ensure parent tables (`users`) are created before child tables (`folders`, `ciphers`).
-
-## D1 Time Travel (Point-in-Time Recovery)
-
-Cloudflare D1 provides a built-in Time Travel feature that allows you to restore your database to any point within the last 30 days. This is useful for undoing accidental data modifications or deletions without needing a backup.
-
-To use Time Travel:
-
-1. **Check current restore bookmark:**
-
-    ```bash
-    # Replace DATABASE_NAME with your actual database name (e.g., warden-db)
-    wrangler d1 time-travel info DATABASE_NAME
-    ```
-
-2. **Restore to a specific timestamp:**
-
-    ```bash
-    # Restore to a specific point in time (ISO 8601 format)
-    wrangler d1 time-travel restore DATABASE_NAME --timestamp=2024-01-15T12:00:00Z
-    
-    # Or restore to a specific bookmark
-    wrangler d1 time-travel restore DATABASE_NAME --bookmark=<bookmark_id>
-    ```
-
-> [!NOTE] Time Travel retains data for 30 days on the free tier. See [Cloudflare D1 Time Travel documentation](https://developers.cloudflare.com/d1/reference/time-travel/) for more details.
+[D1 Time Travel 与备份说明](https://developers.cloudflare.com/d1/reference/time-travel/)介绍数据库时间点恢复。使用前核对目标数据库的适用条件和当前平台限制；平台提供的能力不等同于本项目已经具备完整的备份恢复方案。

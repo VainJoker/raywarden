@@ -1,0 +1,59 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Raywarden Private Account Setup</title>
+  <style>
+    body{font-family:system-ui,sans-serif;background:#f4f6fa;color:#182433;max-width:34rem;margin:12vh auto;padding:1.5rem}
+    main{background:white;padding:2rem;border-radius:1rem;box-shadow:0 4px 24px #18243315}
+    p{line-height:1.6}label,input,button{display:block;width:100%;box-sizing:border-box}input,button{padding:.8rem;margin:.7rem 0;border:1px solid #b7c3d3;border-radius:.4rem}button{background:#175ddc;color:white;cursor:pointer}button:disabled{opacity:.6}#status{min-height:2rem}
+  </style>
+</head>
+<body>
+<main>
+  <h1>Create a private account</h1>
+  <p>Enter the setup token configured during deployment to authorize this browser to create an account within ten minutes. The official Web Vault will generate and submit the account encryption material in the next step; this site does not generate your master password or client keys.</p>
+  <form id="setup-form">
+    <label for="setup-token">Setup token</label>
+    <input id="setup-token" type="password" autocomplete="off" required minlength="32" maxlength="512" spellcheck="false">
+    <button id="authorize" type="submit">Authorize and create an account</button>
+  </form>
+  <p id="status" role="status" aria-live="polite"></p>
+  <p>Use an email address on the deployment allowlist. You can create separate accounts for multiple addresses. Each account requires this token; the token is not your master password.</p>
+</main>
+<script>
+  (() => {
+    const form = document.getElementById("setup-form");
+    const input = document.getElementById("setup-token");
+    const button = document.getElementById("authorize");
+    const status = document.getElementById("status");
+    form.addEventListener("submit", async event => {
+      event.preventDefault();
+      if (button.disabled) return;
+      const token = input.value;
+      input.value = "";
+      button.disabled = true;
+      status.textContent = "Verifying setup authorization...";
+      try {
+        const response = await fetch("/api/accounts/setup", {
+          method: "POST", credentials: "same-origin", cache: "no-store", redirect: "error",
+          headers: { "Content-Type": "application/json" }, body: JSON.stringify({ token })
+        });
+        if (!response.ok) {
+          status.textContent = response.status === 409
+            ? "All accounts on the allowlist have been created. Return to the Web Vault to log in."
+            : "Authorization failed. Check the deployment token, email configuration, and current setup status.";
+          return;
+        }
+        location.replace("/#/signup");
+      } catch {
+        status.textContent = "The request did not complete. Check your connection to this site and try again.";
+      } finally {
+        button.disabled = false;
+      }
+    });
+  })();
+</script>
+</body>
+</html>

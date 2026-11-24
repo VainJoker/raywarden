@@ -1,9 +1,19 @@
-pub mod cfg;
-pub mod cryptor;
-pub mod dber;
-pub mod jwtor;
+pub(crate) mod config;
+pub mod crypto;
+pub mod db;
+pub mod jwt;
+pub mod logging;
+pub mod storage;
 
-pub use cfg::*;
-pub use cryptor::*;
-pub use dber::*;
-pub use jwtor::*;
+use std::sync::Once;
+
+use ::worker::Env;
+
+/// Initialize panic hook and logging once per Worker instance.
+pub(crate) fn init(env: &Env) {
+    static INIT: Once = Once::new();
+    INIT.call_once(|| {
+        console_error_panic_hook::set_once();
+        logging::init(env);
+    });
+}

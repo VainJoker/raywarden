@@ -1,10 +1,10 @@
-pub mod attachment;
-pub mod cipher;
-pub mod domains;
-pub mod folder;
-pub mod import;
-pub mod meta;
-pub mod serde_helpers;
-pub mod sync;
-pub mod twofactor;
-pub mod user;
+//! Persisted records and atomic writes, grouped by identity, vault and Send.
+//! Cross-feature transactions, usage queries and row helpers remain shared.
+pub(crate) mod health;
+pub mod identity;
+pub mod mutation;
+pub(crate) mod page;
+pub mod send;
+pub mod storage;
+pub mod usage;
+pub mod vault;

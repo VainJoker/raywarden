@@ -1,0 +1,40 @@
+/*
+  Vaultwarden compatibility stylesheet for Bitwarden Web Vault.
+
+  Design goals:
+  - Only perform UI hiding/patching needed for "lightweight self-use" projects to avoid confusion from unsupported features.
+  - Served through the Worker with optional feature rules and ETag caching.
+
+  Usage:
+  - Keep `static/web-vault/` as the static resource root directory.
+  - Run `bash scripts/prepare-ui.sh` to copy this stylesheet and the integration
+    script into the pinned Web Vault release. The Worker also serves these sources.
+*/
+
+/* Hide unsupported UI elements */
+.vw-hide,
+bit-nav-item[route="settings/subscription"],
+a[href$="/settings/sponsored-families"],
+
+/* Org-related / enterprise UI */
+app-organization-plans > form > bit-section:nth-child(2),
+app-org-account form.ng-untouched:nth-child(5),
+app-org-reports-home > app-report-list > div.tw-inline-grid > div:nth-child(6),
+bit-dialog div.tw-ml-4:has(bit-form-control input),
+bit-dialog div.tw-col-span-4:has(input[formcontrolname*="access"], input[formcontrolname*="manage"]) {
+  display: none !important;
+}
+
+/* Change collapsed menu icon to Vaultwarden */
+bit-nav-logo bit-nav-item a:before {
+  content: "";
+  background-image: url("../images/icon-white.svg");
+  background-repeat: no-repeat;
+  background-position: center center;
+  height: 32px;
+  display: block;
+}
+
+bit-nav-logo bit-nav-item .bwi-shield {
+  display: none !important;
+}

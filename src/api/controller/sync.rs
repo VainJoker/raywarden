@@ -1,73 +1,136 @@
+use std::sync::Arc;
+
 use axum::{
-    Json,
-    extract::{
-        Query,
-        State,
-    },
+    extract::{Query, State},
+    response::Response,
 };
 use serde::Deserialize;
-use serde_json::{
-    Value,
-    json,
-};
+use serde_json::{Value, json};
 
 use crate::{
     api::{
         AppState,
-        service::claims::Claims,
-    },
-    errors::{
-        AppError,
-        AuthError,
-    },
-    models::{
-        attachment::AttachmentDB,
-        cipher::CipherDB,
-        domains::EquivDomainData,
-        folder::{
-            FolderDB,
-            FolderResponse,
+        common::{
+            extract::ClientVersionHeader,
+            snapshot::{ReadSnapshot, SnapshotJson},
         },
-        sync::Profile,
-        twofactor::TwoFactorDB,
-        user::UserDB,
+    },
+    errors::AppResult,
+    models::identity::user::UserRow,
+    service::{
+        identity::{session::Claims, user::ProfileResponse},
+        notifications::{admin as admin_notify, admin::Event},
+        send,
+        vault::{attachment, cipher, domains, folder},
     },
 };
 
 #[derive(Debug, Deserialize)]
-pub struct SyncQuery {
+pub(in crate::api) struct SyncQuery {
     /// If true, omit domains data from sync (vaultwarden sets domains to
     /// null).
     #[serde(rename = "excludeDomains", default)]
-    pub exclude_domains: bool,
+    exclude_domains: bool,
 }
 
 #[worker::send]
-pub async fn get_sync_data(
+pub(in crate::api) async fn sync_vault(
     claims: Claims,
-    State(state): State<AppState>,
+    State(state): State<Arc<AppState>>,
+    ClientVersionHeader(version): ClientVersionHeader,
     Query(query): Query<SyncQuery>,
-) -> Result<Json<Value>, AppError> {
-    let user_id = claims.sub;
-    let db = state.get_db();
+) -> AppResult<Response> {
+    let show_ssh_keys = version
+        .is_some_and(|version| !version.is_prerelease && version.satisfies_minimum(2024, 12, 0));
 
-    // Fetch profile
-    let user = UserDB::fetch_by_id_with(
-        &db,
-        &user_id,
-        "Failed to fetch user for sync",
-        || AppError::Auth(AuthError::UserNotFound),
-    )
-    .await?;
+    VaultSync {
+        state: &state,
+        claims: &claims,
+    }
+    .respond(show_ssh_keys, query.exclude_domains)
+    .await
+}
 
-    let two_factor_enabled =
-        TwoFactorDB::two_factor_enabled(&db, &user_id).await?;
+/// Validate the source account and session again before releasing a response
+/// assembled from multiple reads.
+struct VaultSync<'a> {
+    state: &'a AppState,
+    claims: &'a Claims,
+}
 
-    let has_master_password = !user.master_password_hash.is_empty();
-    let equivalent_domains = user.equivalent_domains.clone();
-    let excluded_globals = user.excluded_globals.clone();
+impl VaultSync<'_> {
+    async fn respond(self, show_ssh_keys: bool, exclude_domains: bool) -> AppResult<Response> {
+        let db = self.state.database();
+        let user = ReadSnapshot::user(db, self.claims, "Failed to fetch user for sync").await?;
+        let snapshot = ReadSnapshot::from_user(&user);
+        let response = self.render(user, show_ssh_keys, exclude_domains).await?;
+        snapshot.verify(db, self.claims).await?;
+        admin_notify::emit(&self.state.env, Event::Sync, &self.claims.sub).await;
+        Ok(response)
+    }
+
+    async fn render(
+        &self,
+        mut user: UserRow,
+        show_ssh_keys: bool,
+        exclude_domains: bool,
+    ) -> AppResult<Response> {
+        let db = self.state.database();
+        let user_id = &self.claims.sub;
+        let is_two_factor_enabled =
+            crate::service::identity::two_factor::is_two_factor_enabled(db, user_id).await?;
+        let has_master_password = !user.master_password_hash.is_empty();
+        let decryption = user_decryption(&user, has_master_password);
+
+        let equivalent_domains = std::mem::take(&mut user.equivalent_domains);
+        let excluded_globals = std::mem::take(&mut user.excluded_globals);
+        let mut profile = ProfileResponse::from_user(user, is_two_factor_enabled);
+        profile.status = i32::from(!has_master_password);
+
+        let mut response = SnapshotJson::new();
+        response.field("profile", &profile)?;
+        let mut folders = response.array("folders")?;
+        folder::visit_folder_responses(db, user_id, |folder| folders.push(&folder)).await?;
+        folders.finish()?;
+        response.field("collections", &[] as &[()])?;
+        response.field("policies", &[] as &[()])?;
+        response.field("policiesNew", &[] as &[()])?;
+
+        let mut ciphers = response.array("ciphers")?;
+        cipher::visit_cipher_responses(
+            db,
+            user_id,
+            attachment::include_metadata(&self.state.env),
+            show_ssh_keys,
+            false,
+            self.state.domain(),
+            |cipher| ciphers.push(&cipher),
+        )
+        .await?;
+        ciphers.finish()?;
+
+        let domains = if exclude_domains {
+            None
+        } else {
+            Some(domains::render_settings(db, &equivalent_domains, &excluded_globals, false).await)
+        };
+        response.field("domains", &domains)?;
+        let mut sends = response.array("sends")?;
+        send::visit_send_responses(db, user_id, |send| sends.push(&send)).await?;
+        sends.finish()?;
+        response.field("userDecryption", &decryption)?;
+        response.field("object", &"sync")?;
+        response.finish()
+    }
+}
+
+fn user_decryption(user: &UserRow, has_master_password: bool) -> Value {
+    let v2_upgrade_token = user
+        .v2_upgrade_token
+        .as_deref()
+        .and_then(|raw| serde_json::from_str::<Value>(raw).ok());
     let master_password_unlock = if has_master_password {
-        // Mirrors vaultwarden's `ciphers::sync` casing (lower camelCase).
+        // Mirrors vaultwarden's `cipher::sync` casing (lower camelCase).
         // We don't support SSO, so this is always derived from the current user
         // record.
         json!({
@@ -81,81 +144,16 @@ pub async fn get_sync_data(
             // https://github.com/bitwarden/android/blob/release/2025.12-rc41/network/src/main/kotlin/com/bitwarden/network/model/MasterPasswordUnlockDataJson.kt#L22-L26
             "masterKeyEncryptedUserKey": user.key,
             "masterKeyWrappedUserKey": user.key,
-            "salt": user.email
+            "salt": user.email,
+            "containedKeyId": user.user_key_id
         })
     } else {
         Value::Null
     };
 
-    // Fetch folders
-    let folders_db = FolderDB::list_for_user(&db, &user_id).await?;
-    let folders: Vec<FolderResponse> = folders_db
-        .into_iter()
-        .map(std::convert::Into::into)
-        .collect();
-
-    // Fetch ciphers as raw JSON array string (no parsing in Rust!)
-    let include_attachments = AttachmentDB::attachments_enabled(&state.env);
-    let ciphers_json = CipherDB::fetch_cipher_json_array_raw(
-        &db,
-        include_attachments,
-        "WHERE c.user_id = ?1",
-        &[user_id.clone().into()],
-        "",
-    )
-    .await?;
-
-    // Serialize profile and folders (small data, acceptable CPU cost)
-    let mut profile = Profile::from_user(user, two_factor_enabled);
-    // Match vaultwarden semantics: `_status` is `Invited` when no master
-    // password is set. We don't implement org invitations, but this helps
-    // clients interpret the account state.
-    profile.status = i32::from(!has_master_password);
-    let profile_json = serde_json::to_string(&profile).map_err(|err| {
-        log::error!("Failed to serialize profile for sync: {err}");
-        AppError::Internal
-    })?;
-    let folders_json = serde_json::to_string(&folders).map_err(|err| {
-        log::error!("Failed to serialize folders for sync: {err}");
-        AppError::Internal
-    })?;
-
-    // Build response JSON via string concatenation (ciphers already raw JSON)
-    let user_decryption_json = serde_json::to_string(&json!({
-        "masterPasswordUnlock": master_password_unlock
-    }))
-    .map_err(|err| {
-        log::error!("Failed to serialize user decryption data: {err}");
-        AppError::Internal
-    })?;
-
-    let response = if query.exclude_domains {
-        format!(
-            r#"{{"profile":{profile_json},"folders":{folders_json},"collections":[],"policies":[],"ciphers":{ciphers_json},"sends":[],"userDecryption":{user_decryption_json},"object":"sync"}}"#
-        )
-    } else {
-        // Match vaultwarden sync semantics:
-        // - mark excluded in /api/settings/domains
-        // - filter excluded out of sync payload
-        let global_equivalent_domains =
-            EquivDomainData::global_equivalent_domains_json(
-                &db,
-                &excluded_globals,
-                false,
-            )
-            .await;
-        let domains_json = format!(
-            r#"{{"equivalentDomains":{equivalent_domains},"globalEquivalentDomains":{global_equivalent_domains},"object":"domains"}}"#
-        );
-        format!(
-            r#"{{"profile":{profile_json},"folders":{folders_json},"collections":[],"policies":[],"ciphers":{ciphers_json},"domains":{domains_json},"sends":[],"userDecryption":{user_decryption_json},"object":"sync"}}"#
-        )
-    };
-
-    Ok(Json(json!(
-        serde_json::from_str::<Value>(&response).map_err(|err| {
-            log::error!("Failed to parse sync response JSON: {err}");
-            AppError::Internal
-        })?
-    )))
+    json!({
+        "masterPasswordUnlock": master_password_unlock,
+        "userKeyId": user.user_key_id,
+        "v2UpgradeToken": v2_upgrade_token
+    })
 }

@@ -2,7 +2,7 @@
 
 # General Settings
 style_edition = "2024"
-max_width = 80
+max_width = 100
 tab_spaces = 4
 
 # Newline and Whitespace
@@ -20,13 +20,9 @@ normalize_doc_attributes = true
 imports_granularity = "Crate"
 group_imports = "StdExternalCrate"
 reorder_imports = true
-imports_layout = "Vertical"
 
 # Structural Formatting
-binop_separator = "Back"
-format_strings = true
 overflow_delimited_expr = true
-struct_field_align_threshold = 20
 
 # Miscellaneous
 ignore = []
