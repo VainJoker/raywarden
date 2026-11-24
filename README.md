@@ -30,7 +30,7 @@ The files in [sql/migrations](sql/migrations/README.md) define the database stru
 
 ## Deployment and maintenance
 
-Follow the [deployment guide](docs/deployment.md) for Cloudflare resources, GitHub Secrets, and first account creation. CI verifies and builds the Worker, then the Cloudflare job deploys the verified artifact from the same release-tag run. For a local production preflight, use `just dry-run`. Use `just db-migrate production` for a standalone production migration.
+Follow the [deployment guide](docs/deployment.md) for Cloudflare resources, GitHub Secrets, and first account creation. The Cloudflare workflow starts on `v*` tag pushes, reuses Integration to verify and build the Worker, then deploys the verified artifact from the same run. For a local production preflight, use `just dry-run`. Use `just db-migrate production` for a standalone production migration.
 
 Production requires `ALLOWED_EMAILS`, `KEY_ENCRYPTION_KEY`, and `DOMAIN`. The deploy script derives `DOMAIN` from the configured public endpoint. Configure `OWNER_SETUP_TOKEN` to authorize registration and store the wrapping key separately from the D1 backup.
 

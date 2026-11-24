@@ -259,7 +259,7 @@ function collectArtifactFiles(target, bundleFiles) {
 }
 function validateArtifactInputs(target, bundleDirectory) {
   const assets = resolveArtifactPath(target.projectDir, "static/web-vault/index.html");
-  if (!existsSync(assets)) throw new Error("Missing prepared Web Vault; obtain a successful Integration artifact");
+  if (!existsSync(assets)) throw new Error("Missing prepared Web Vault; obtain a validated release artifact");
   const bundleFiles = filesBelow(target.projectDir, bundleDirectory);
   const wasm = bundleFiles.filter((file) => file.endsWith(".wasm"));
   if (!wasm.length) throw new Error("Prebundled Worker artifact contains no WASM module");

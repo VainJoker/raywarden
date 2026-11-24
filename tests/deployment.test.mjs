@@ -318,19 +318,24 @@ test("workers.dev discovery reports missing subdomains, disabled endpoints and A
   await assert.rejects(checkHealth({ configPath: disabled.configPath }, () => { throw new Error("Unexpected fetch"); }, undefined, env), /enable workers_dev/);
 });
 
-test("Integration gates same-run deployment on both checks and coverage, and only stores release artifacts", () => {
+test("Cloudflare owns tag deployment and waits for reusable Integration checks and coverage", () => {
   const integration = readFileSync(resolve(PROJECT_ROOT, ".github/workflows/integration.yml"), "utf8");
   const deploy = readFileSync(resolve(PROJECT_ROOT, ".github/workflows/cloudflare.yml"), "utf8");
   const [check, rest] = integration.split("\n  coverage:\n");
-  const [coverage, deployCall] = rest.split("\n  deploy:\n");
-  assert.ok(coverage && deployCall);
-  assert.match(deployCall, /needs: \[check, coverage\]/);
-  assert.match(deployCall, /uses: \.\/\.github\/workflows\/cloudflare\.yml/);
+  const coverage = rest;
+  assert.ok(coverage);
+  assert.doesNotMatch(integration, /^  deploy:|tags:|cloudflare\.yml/m);
+  assert.match(integration, /push:\n    branches: \[main\]/);
+  assert.match(integration, /pull_request:/);
+  assert.match(integration, /workflow_call:/);
+  assert.match(deploy, /integration:\n    name: Integration\n    uses: \.\/\.github\/workflows\/integration\.yml/);
+  assert.match(deploy, /deploy:\n    needs: integration/);
   assert.match(coverage, /just coverage$/m);
   assert.match(check, /run: just ci[\s\S]*run: just dry-run[\s\S]*run: just test-worker[\s\S]*run: just test-d1[\s\S]*run: just artifact/);
   assert.match(check, /if: startsWith\(github.ref, 'refs\/tags\/v'\)\s+run: just artifact/);
   assert.match(check, /if: startsWith\(github.ref, 'refs\/tags\/v'\)\s+uses: actions\/upload-artifact@/);
-  assert.match(deploy, /on:\n  workflow_call:/);
+  assert.match(deploy, /on:\n  push:\n    tags: \['v\*'\]/);
+  assert.doesNotMatch(deploy, /workflow_call:|branches:|pull_request:|secrets: inherit/);
   assert.doesNotMatch(deploy, /workflow_dispatch:|inputs[.:]|run_id|run-id:|getWorkflowRun|listJobsForWorkflowRun/);
   assert.match(deploy, /queue: max/);
   assert.match(deploy, /cancel-in-progress: false/);
@@ -342,9 +347,6 @@ test("Integration gates same-run deployment on both checks and coverage, and onl
   for (const workflow of [integration, deploy]) {
     assert.match(workflow, /name: raywarden-release-production-\$\{\{ github\.sha \}\}/);
     assert.doesNotMatch(workflow, /\bfeat\b|\[deploy\]|head_commit\.message/);
-  }
-  for (const job of [deployCall, deploy]) {
-    assert.match(job, /^    if: startsWith\(github\.ref, 'refs\/tags\/v'\) && \(github\.event_name == 'push' \|\| github\.event_name == 'workflow_dispatch'\)$/m);
   }
 });
 
