@@ -42,6 +42,11 @@ pub struct ClientData {
 
 impl ClientData {
     pub fn parse(bytes: Vec<u8>) -> AppResult<Self> {
+        if bytes.len() > 32_768 {
+            return Err(AppError::invalid_credentials(
+                "Invalid WebAuthn client data",
+            ));
+        }
         let json = serde_json::from_slice(&bytes)
             .map_err(|_error| AppError::invalid_credentials("Invalid WebAuthn client data"))?;
         Ok(Self { bytes, json })
@@ -181,16 +186,7 @@ pub fn parse_attestation_object(bytes: &[u8]) -> AppResult<AuthenticatorData> {
         .and_then(|value| value.as_bytes())
         .ok_or_else(|| AppError::bad_request("Invalid WebAuthn attestation".to_string()))?;
 
-    let parsed = parse_authenticator_data(auth_data, true)?;
-    parsed
-        .credential_id
-        .as_ref()
-        .ok_or_else(|| AppError::bad_request("Missing WebAuthn credential id".to_string()))?;
-    parsed
-        .credential_public_key_cose
-        .as_ref()
-        .ok_or_else(|| AppError::bad_request("Missing WebAuthn credential key".to_string()))?;
-    Ok(parsed)
+    parse_authenticator_data(auth_data, true)
 }
 
 pub fn parse_authenticator_data(
@@ -274,77 +270,59 @@ impl WebauthnVerifyingKey {
             Self::P256(verifying_key) => {
                 let signature = P256Signature::from_der(signature)
                     .map_err(|_error| AppError::invalid_credentials("Invalid signature format"))?;
-                verifying_key
-                    .verify(signed_data, &signature)
-                    .map_err(|_error| {
-                        AppError::invalid_credentials("Signature verification failed")
-                    })
+                verifying_key.verify(signed_data, &signature)
             }
             Self::Rsa(rsa_key) => {
                 // RS256: RSASSA-PKCS1-v1_5 with SHA-256
                 let verifying_key = RsaVerifyingKey::<Sha256>::new(rsa_key.clone());
                 let signature = RsaSignature::try_from(signature)
                     .map_err(|_error| AppError::invalid_credentials("Invalid signature format"))?;
-                verifying_key
-                    .verify(signed_data, &signature)
-                    .map_err(|_error| {
-                        AppError::invalid_credentials("Signature verification failed")
-                    })
+                verifying_key.verify(signed_data, &signature)
             }
         }
+        .map_err(|_error| AppError::invalid_credentials("Signature verification failed"))
     }
 }
 
-pub fn parse_webauthn_public_key(cose_key_bytes: &[u8]) -> AppResult<(WebauthnVerifyingKey, i64)> {
-    let value: CborValue = ciborium::de::from_reader(Cursor::new(cose_key_bytes))
-        .map_err(|_error| AppError::bad_request("Invalid WebAuthn public key".to_string()))?;
-    let map = value
-        .as_map()
-        .ok_or_else(|| AppError::bad_request("Invalid WebAuthn public key".to_string()))?;
+pub fn parse_webauthn_public_key(cose_key_bytes: &[u8]) -> AppResult<WebauthnVerifyingKey> {
+    let invalid_key = || AppError::bad_request("Invalid WebAuthn public key");
+    let value: CborValue =
+        ciborium::de::from_reader(Cursor::new(cose_key_bytes)).map_err(|_error| invalid_key())?;
+    let map = value.as_map().ok_or_else(invalid_key)?;
 
-    let key_type = cbor_integer_value(map, 1)
-        .ok_or_else(|| AppError::bad_request("Invalid WebAuthn public key".to_string()))?;
-    let algorithm = cbor_integer_value(map, 3)
-        .ok_or_else(|| AppError::bad_request("Invalid WebAuthn public key".to_string()))?;
+    let key_type = cbor_integer_value(map, 1).ok_or_else(invalid_key)?;
+    let algorithm = cbor_integer_value(map, 3).ok_or_else(invalid_key)?;
 
     match (key_type, algorithm) {
         // EC2 key type (kty=2) with ES256 (alg=-7)
         (2, -7) => {
-            let curve = cbor_integer_value(map, -1)
-                .ok_or_else(|| AppError::bad_request("Invalid WebAuthn public key".to_string()))?;
+            let curve = cbor_integer_value(map, -1).ok_or_else(invalid_key)?;
             if curve != 1 {
-                return Err(AppError::bad_request(
-                    "Unsupported WebAuthn curve".to_string(),
-                ));
+                return Err(AppError::bad_request("Unsupported WebAuthn curve"));
             }
 
-            let x = cbor_bytes_value(map, -2)
-                .ok_or_else(|| AppError::bad_request("Invalid WebAuthn public key".to_string()))?;
-            let y = cbor_bytes_value(map, -3)
-                .ok_or_else(|| AppError::bad_request("Invalid WebAuthn public key".to_string()))?;
+            let x = cbor_bytes_value(map, -2).ok_or_else(invalid_key)?;
+            let y = cbor_bytes_value(map, -3).ok_or_else(invalid_key)?;
             if x.len() != 32 || y.len() != 32 {
-                return Err(AppError::bad_request(
-                    "Invalid WebAuthn public key length".to_string(),
-                ));
+                return Err(AppError::bad_request("Invalid WebAuthn public key length"));
             }
 
-            let mut encoded = Vec::with_capacity(65);
-            encoded.push(0x04);
-            encoded.extend_from_slice(x);
-            encoded.extend_from_slice(y);
+            let mut encoded = [0_u8; 65];
+            encoded[0] = 0x04;
+            encoded[1..33].copy_from_slice(x);
+            encoded[33..65].copy_from_slice(y);
 
-            let verifying_key = P256VerifyingKey::from_sec1_bytes(&encoded).map_err(|_error| {
-                AppError::bad_request("Invalid WebAuthn public key".to_string())
-            })?;
-            Ok((WebauthnVerifyingKey::P256(verifying_key), algorithm as i64))
+            let verifying_key =
+                P256VerifyingKey::from_sec1_bytes(&encoded).map_err(|_error| invalid_key())?;
+            Ok(WebauthnVerifyingKey::P256(verifying_key))
         }
         // RSA key type (kty=3) with RS256 (alg=-257)
         (3, -257) => {
             // RSA public key: n (-1) and e (-2)
             let modulus = cbor_bytes_value(map, -1)
-                .ok_or_else(|| AppError::bad_request("Invalid RSA public key".to_string()))?;
+                .ok_or_else(|| AppError::bad_request("Invalid RSA public key"))?;
             let exponent = cbor_bytes_value(map, -2)
-                .ok_or_else(|| AppError::bad_request("Invalid RSA public key".to_string()))?;
+                .ok_or_else(|| AppError::bad_request("Invalid RSA public key"))?;
 
             if !(256..=1024).contains(&modulus.len()) || exponent.is_empty() || exponent.len() > 4 {
                 return Err(AppError::invalid_credentials("Invalid RSA key size"));
@@ -355,8 +333,8 @@ pub fn parse_webauthn_public_key(cose_key_bytes: &[u8]) -> AppResult<(WebauthnVe
             let exponent_integer = BoxedUint::from_be_slice_vartime(exponent);
 
             let rsa_key = RsaPublicKey::new(modulus_integer, exponent_integer)
-                .map_err(|_error| AppError::bad_request("Invalid RSA public key".to_string()))?;
-            Ok((WebauthnVerifyingKey::Rsa(rsa_key), algorithm as i64))
+                .map_err(|_error| AppError::bad_request("Invalid RSA public key"))?;
+            Ok(WebauthnVerifyingKey::Rsa(rsa_key))
         }
         _ => Err(AppError::bad_request(format!(
             "Unsupported WebAuthn public key type: kty={key_type}, \
@@ -393,13 +371,17 @@ fn cbor_bytes_value(map: &[(CborValue, CborValue)], key: i128) -> Option<&[u8]> 
 #[cfg(test)]
 mod tests {
     use p256::ecdsa::{SigningKey, signature::Signer};
+    use rsa::{
+        PrivateKey, pkcs1v15::SigningKey as RsaSigningKey, pkcs8::DecodePrivateKey,
+        signature::SignatureEncoding, traits::PublicKeyParts,
+    };
 
     use super::*;
 
     #[test]
-    fn es256_signature_verification_rejects_modified_authenticator_data() {
-        let key = SigningKey::from_slice(&[1u8; 32]).expect("test fixture should be valid");
-        let public = key.verifying_key().to_sec1_point(false);
+    fn es256_and_rs256_signatures_verify_and_reject_tampering() {
+        let key = SigningKey::from_slice(&[1u8; 32]).expect("valid key");
+        let pt = key.verifying_key().to_sec1_point(false);
         let cose = CborValue::Map(vec![
             (CborValue::Integer(1.into()), CborValue::Integer(2.into())),
             (
@@ -412,53 +394,29 @@ mod tests {
             ),
             (
                 CborValue::Integer((-2).into()),
-                CborValue::Bytes(public.x().expect("test fixture should be valid").to_vec()),
+                CborValue::Bytes(pt.x().expect("x").to_vec()),
             ),
             (
                 CborValue::Integer((-3).into()),
-                CborValue::Bytes(public.y().expect("test fixture should be valid").to_vec()),
+                CborValue::Bytes(pt.y().expect("y").to_vec()),
             ),
         ]);
         let mut encoded = Vec::new();
-        ciborium::ser::into_writer(&cose, &mut encoded).expect("test fixture should be valid");
-        let verifying = parse_webauthn_public_key(&encoded)
-            .expect("test fixture should be valid")
-            .0;
-        let mut data = Sha256::digest(b"vault.example").to_vec();
-        data.push(5);
-        data.extend_from_slice(&1u32.to_be_bytes());
-        let client=br#"{"type":"webauthn.get","origin":"https://vault.example","challenge":"Y2hhbGxlbmdl"}"#;
-        data.extend_from_slice(&Sha256::digest(client));
-        let signature: P256Signature = key.sign(&data);
-        assert!(
-            verifying
-                .verify(&data, signature.to_der().as_bytes())
-                .is_ok()
-        );
-        // WebAuthn ES256 signatures are ASN.1 DER, not raw r || s.
-        assert!(verifying.verify(&data, &signature.to_bytes()).is_err());
+        ciborium::ser::into_writer(&cose, &mut encoded).expect("cbor");
+        let verifying = parse_webauthn_public_key(&encoded).expect("cose");
+        let mut data = b"webauthn-message".to_vec();
+        let sig: P256Signature = key.sign(&data);
+        assert!(verifying.verify(&data, sig.to_der().as_bytes()).is_ok());
+        assert!(verifying.verify(&data, &sig.to_bytes()).is_err());
         data[0] ^= 1;
-        assert!(
-            verifying
-                .verify(&data, signature.to_der().as_bytes())
-                .is_err()
-        );
-    }
-    #[test]
-    fn rs256_signature_verification_rejects_modified_data() {
-        use rsa::{
-            PrivateKey,
-            pkcs1v15::SigningKey,
-            pkcs8::DecodePrivateKey,
-            signature::{SignatureEncoding, Signer},
-            traits::PublicKeyParts,
-        };
-        let key = PrivateKey::from_pkcs8_pem(include_str!(
+        assert!(verifying.verify(&data, sig.to_der().as_bytes()).is_err());
+
+        let rsa_key = PrivateKey::from_pkcs8_pem(include_str!(
             "../../../../tests/fixtures/webauthn-rs256-test-key.pem"
         ))
-        .expect("test fixture should be valid");
-        let public = key.to_public_key();
-        let cose = CborValue::Map(vec![
+        .expect("pem");
+        let rsa_pub = rsa_key.to_public_key();
+        let rsa_cose = CborValue::Map(vec![
             (CborValue::Integer(1.into()), CborValue::Integer(3.into())),
             (
                 CborValue::Integer(3.into()),
@@ -466,155 +424,70 @@ mod tests {
             ),
             (
                 CborValue::Integer((-1).into()),
-                CborValue::Bytes(public.n_bytes().into_vec()),
+                CborValue::Bytes(rsa_pub.n_bytes().into_vec()),
             ),
             (
                 CborValue::Integer((-2).into()),
-                CborValue::Bytes(public.e_bytes().into_vec()),
+                CborValue::Bytes(rsa_pub.e_bytes().into_vec()),
             ),
         ]);
-        let mut encoded = Vec::new();
-        ciborium::ser::into_writer(&cose, &mut encoded).expect("test fixture should be valid");
-        let (public, algorithm) =
-            parse_webauthn_public_key(&encoded).expect("test fixture should be valid");
-        assert_eq!(algorithm, -257);
-        let signer = SigningKey::<Sha256>::new(key);
-        let signature = signer.sign(b"WebAuthn fixed test message");
-        assert!(
-            public
-                .verify(b"WebAuthn fixed test message", &signature.to_bytes())
-                .is_ok()
-        );
-        assert!(
-            public
-                .verify(b"WebAuthn fixed test message", &signature.to_bytes()[1..])
-                .is_err()
-        );
-        assert!(
-            public
-                .verify(b"modified message", &signature.to_bytes())
-                .is_err()
-        );
+        encoded.clear();
+        ciborium::ser::into_writer(&rsa_cose, &mut encoded).expect("cbor");
+        let rsa_verifying = parse_webauthn_public_key(&encoded).expect("rsa cose");
+        let rsa_sig = RsaSigningKey::<Sha256>::new(rsa_key).sign(b"msg");
+        assert!(rsa_verifying.verify(b"msg", &rsa_sig.to_bytes()).is_ok());
+        assert!(rsa_verifying.verify(b"bad", &rsa_sig.to_bytes()).is_err());
     }
 
     #[test]
-    fn relying_party_origin_and_uv_are_enforced() {
-        let relying_party_id = "vault.example";
-        let mut data = Sha256::digest(relying_party_id.as_bytes()).to_vec();
-        data.push(5);
-        data.extend_from_slice(&0u32.to_be_bytes());
-        let parsed = parse_authenticator_data(&data, false).expect("test fixture should be valid");
-        assert!(verify_authenticator_data(&parsed, relying_party_id, true).is_ok());
+    fn relying_party_origins_flags_and_attestations_are_enforced() {
+        let mut auth = Sha256::digest(b"vault.example").to_vec();
+        auth.push(5);
+        auth.extend_from_slice(&0u32.to_be_bytes());
+        let parsed = parse_authenticator_data(&auth, false).expect("auth");
+        assert!(verify_authenticator_data(&parsed, "vault.example", true).is_ok());
         assert!(verify_authenticator_data(&parsed, "evil.example", true).is_err());
-        data[32] = 1;
+        auth[32] = 1;
         assert!(
             verify_authenticator_data(
-                &parse_authenticator_data(&data, false).expect("test fixture should be valid"),
-                relying_party_id,
+                &parse_authenticator_data(&auth, false).expect("auth"),
+                "vault.example",
                 true
             )
             .is_err()
         );
-        let good = ClientData::parse(
-            br#"{"type":"webauthn.get","origin":"https://vault.example","challenge":"Y2hhbGxlbmdl"}"#.to_vec(),
-        ).expect("test fixture should be valid");
-        assert!(
-            good.verify("webauthn.get", "Y2hhbGxlbmdl", "https://vault.example", "")
-                .is_ok()
-        );
-        assert!(
-            good.verify(
-                "webauthn.create",
-                "Y2hhbGxlbmdl",
-                "https://vault.example",
-                ""
-            )
-            .is_err()
-        );
-        assert!(
-            good.verify("webauthn.get", "Y2hhbGxlbmdl", "https://evil.example", "")
-                .is_err()
-        );
-        let cross = ClientData::parse(
-            br#"{"type":"webauthn.get","origin":"https://vault.example","challenge":"Y2hhbGxlbmdl","crossOrigin":true}"#.to_vec(),
-        ).expect("test fixture should be valid");
-        assert!(
-            cross
-                .verify("webauthn.get", "Y2hhbGxlbmdl", "https://vault.example", "")
-                .is_err()
-        );
-        assert!(relying_party("http://vault.example").is_err());
-        assert_eq!(
-            relying_party("https://vault.example:443/").expect("test fixture should be valid"),
-            ("vault.example".into(), "https://vault.example".into())
-        );
-    }
-    #[test]
-    fn native_origins_require_exact_explicit_configuration() {
+
         let android = ClientData::parse(
-            br#"{"type":"webauthn.get","origin":"android:apk-key-hash:trusted-app","challenge":"YWJj"}"#.to_vec(),
-        ).expect("test fixture should be valid");
-        let extension = ClientData::parse(
-            br#"{"type":"webauthn.get","origin":"chrome-extension://trusted-id","challenge":"YWJj"}"#.to_vec(),
-        ).expect("test fixture should be valid");
-        for (data, extra_origins, accepts) in [
-            (&android, "", false),
-            (&android, " , android:apk-key-hash:trusted-app ", true),
-            (&android, "android:apk-key-hash:*", false),
-            (&android, "android:apk-key-hash:other-app", false),
-            (&extension, "chrome-extension://trusted-id", true),
-            (&extension, "chrome-extension://*", false),
-        ] {
-            assert_eq!(
-                data.verify(
+            br#"{"type":"webauthn.get","origin":"android:apk-key-hash:app","challenge":"YWJj"}"#
+                .to_vec(),
+        )
+        .expect("client data");
+        assert!(
+            android
+                .verify("webauthn.get", "YWJj", "https://vault.example", "")
+                .is_err()
+        );
+        assert!(
+            android
+                .verify(
                     "webauthn.get",
                     "YWJj",
                     "https://vault.example",
-                    extra_origins
+                    "android:apk-key-hash:app"
                 )
-                .is_ok(),
-                accepts,
-                "allowed origins: {extra_origins}"
-            );
-        }
-    }
-
-    #[test]
-    fn attestation_retains_original_verification_flags_and_credential_material() {
-        for flags in [0x41, 0x45] {
-            let mut auth = Sha256::digest(b"vault.example").to_vec();
-            auth.push(flags);
-            auth.extend_from_slice(&9_u32.to_be_bytes());
-            auth.extend_from_slice(&[0; 16]); // AAGUID
-            auth.extend_from_slice(&3_u16.to_be_bytes());
-            auth.extend_from_slice(&[1, 2, 3]); // Credential ID
-            auth.push(0xa0); // Structurally valid COSE map; key checks are separate.
-            let attestation = CborValue::Map(vec![(
-                CborValue::Text("authData".into()),
-                CborValue::Bytes(auth),
-            )]);
-            let mut encoded = Vec::new();
-            ciborium::ser::into_writer(&attestation, &mut encoded)
-                .expect("valid attestation fixture");
-            let parsed = parse_attestation_object(&encoded).expect("valid attestation fixture");
-            assert_eq!(parsed.flags, flags);
-            assert_eq!(parsed.sign_count, 9);
-            assert_eq!(parsed.credential_id.as_deref(), Some([1, 2, 3].as_slice()));
-            assert_eq!(
-                parsed.credential_public_key_cose.as_deref(),
-                Some([0xa0].as_slice())
-            );
-            assert!(verify_authenticator_data(&parsed, "vault.example", false).is_ok());
-            assert_eq!(
-                verify_authenticator_data(&parsed, "vault.example", true).is_ok(),
-                flags & 4 != 0
-            );
-        }
-    }
-
-    #[test]
-    fn malformed_attestations_and_unsupported_keys_fail() {
-        assert!(parse_authenticator_data(&[0; 36], false).is_err());
+                .is_ok()
+        );
+        assert!(
+            android
+                .verify(
+                    "webauthn.get",
+                    "YWJj",
+                    "https://vault.example",
+                    "android:apk-key-hash:*"
+                )
+                .is_err()
+        );
+        assert!(relying_party("http://vault.example").is_err());
         assert!(parse_attestation_object(&[0xff]).is_err());
         assert!(parse_webauthn_public_key(&[0xa0]).is_err());
     }

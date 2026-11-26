@@ -2,7 +2,8 @@
 use std::sync::Arc;
 
 use axum::{
-    extract::{FromRequest, Path, RawQuery, Request, State},
+    Extension,
+    extract::{FromRequest, RawQuery, Request, State},
     response::{IntoResponse, Response},
 };
 use serde::{Deserialize, Serialize};
@@ -11,9 +12,10 @@ use crate::{
     api::{
         AppState,
         common::{
+            extract::Path,
             json::Json,
             response::ApiResponse,
-            snapshot::{ReadSnapshot, SnapshotJson},
+            snapshot::{ListOrder, SnapshotJson},
         },
     },
     errors::{AppError, AppResult},
@@ -33,7 +35,7 @@ use crate::{
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
-pub(in crate::api) struct CipherListResponse {
+struct CipherListResponse {
     data: Vec<CipherResponse>,
     object: &'static str,
     continuation_token: Option<String>,
@@ -76,23 +78,6 @@ impl BulkCipherSelection {
     }
 }
 
-async fn mutate_bulk(
-    state: &AppState,
-    claims: &Claims,
-    ids: Vec<String>,
-    kind: CipherMutation,
-) -> AppResult<Vec<CipherResponse>> {
-    mutate_selected(
-        state.database(),
-        &state.env,
-        state.domain(),
-        claims,
-        CipherSelection::Bulk(ids),
-        kind,
-    )
-    .await
-}
-
 #[worker::send]
 pub(in crate::api) async fn create_cipher_with_collections(
     claims: Claims,
@@ -102,17 +87,7 @@ pub(in crate::api) async fn create_cipher_with_collections(
     if !payload.collection_ids.is_empty() {
         return Err(AppError::bad_request("Collections are not supported"));
     }
-    Ok(ApiResponse(
-        cipher::save_cipher(
-            state.database(),
-            &state.env,
-            state.domain(),
-            &claims,
-            None,
-            payload.cipher,
-        )
-        .await?,
-    ))
+    create_cipher(claims, State(state), Json(payload.cipher)).await
 }
 #[worker::send]
 pub(in crate::api) async fn create_cipher(
@@ -158,25 +133,19 @@ pub(in crate::api) async fn list_ciphers(
     State(state): State<Arc<AppState>>,
 ) -> AppResult<Response> {
     let db = state.database();
-    let snapshot = ReadSnapshot::capture(db, &claims).await?;
-    let mut response = SnapshotJson::new();
-    let mut data = response.array("data")?;
-    cipher::visit_cipher_responses(
-        db,
-        &claims.sub,
-        attachment::include_metadata(&state.env),
-        true,
-        true,
-        state.domain(),
-        |cipher| data.push(&cipher),
-    )
-    .await?;
-    data.finish()?;
-    response.field("object", &"list")?;
-    response.field("continuationToken", &None::<String>)?;
-    let response = response.finish()?;
-    snapshot.verify(db, &claims).await?;
-    Ok(response)
+    SnapshotJson::list(db, &claims, ListOrder::ObjectFirst, async |data| {
+        cipher::visit_cipher_responses(
+            db,
+            &claims.sub,
+            attachment::include_metadata(&state.env),
+            true,
+            true,
+            state.domain(),
+            |cipher| data.push(&cipher),
+        )
+        .await
+    })
+    .await
 }
 #[worker::send]
 pub(in crate::api) async fn get_cipher(
@@ -210,7 +179,7 @@ pub(in crate::api) async fn update_cipher_partial(
             &state.env,
             state.domain(),
             &claims,
-            id,
+            &id,
             payload,
         )
         .await?,
@@ -218,85 +187,85 @@ pub(in crate::api) async fn update_cipher_partial(
 }
 
 #[worker::send]
-pub(in crate::api) async fn soft_delete_cipher(
+pub(in crate::api) async fn mutate_cipher(
     claims: Claims,
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
-) -> AppResult<ApiResponse<()>> {
-    mutate_selected(
+    Extension(kind): Extension<CipherMutation>,
+) -> AppResult<Response> {
+    let returns_rows = kind.returns_rows();
+    let rows = mutate_selected(
         state.database(),
         &state.env,
         state.domain(),
         &claims,
         CipherSelection::Single(id),
-        CipherMutation::SoftDelete,
+        kind,
     )
     .await?;
-    Ok(ApiResponse(()))
+    if returns_rows {
+        let cipher = rows
+            .into_iter()
+            .next()
+            .ok_or_else(|| AppError::internal("Mutated cipher response is missing"))?;
+        Ok(ApiResponse(cipher).into_response())
+    } else {
+        Ok(ApiResponse(()).into_response())
+    }
 }
+
 #[worker::send]
-pub(in crate::api) async fn soft_delete_ciphers_bulk(
+pub(in crate::api) async fn mutate_cipher_selection(
     claims: Claims,
     State(state): State<Arc<AppState>>,
+    Extension(kind): Extension<CipherMutation>,
     selection: BulkCipherSelection,
-) -> AppResult<ApiResponse<()>> {
-    mutate_bulk(&state, &claims, selection.ids, CipherMutation::SoftDelete).await?;
-    Ok(ApiResponse(()))
+) -> AppResult<Response> {
+    let kind = match kind {
+        CipherMutation::Move { .. } => CipherMutation::Move {
+            folder_id: selection.folder_id,
+        },
+        kind => kind,
+    };
+    mutate_bulk(&state, &claims, selection.ids, kind).await
 }
+
+#[derive(Deserialize)]
+pub(in crate::api) struct ArchiveRequest {
+    ids: Vec<String>,
+}
+
 #[worker::send]
-pub(in crate::api) async fn hard_delete_cipher(
+pub(in crate::api) async fn mutate_cipher_archive(
     claims: Claims,
     State(state): State<Arc<AppState>>,
-    Path(id): Path<String>,
-) -> AppResult<ApiResponse<()>> {
-    mutate_selected(
+    Extension(kind): Extension<CipherMutation>,
+    Json(payload): Json<ArchiveRequest>,
+) -> AppResult<Response> {
+    mutate_bulk(&state, &claims, payload.ids, kind).await
+}
+
+async fn mutate_bulk(
+    state: &AppState,
+    claims: &Claims,
+    ids: Vec<String>,
+    kind: CipherMutation,
+) -> AppResult<Response> {
+    let returns_rows = kind.returns_rows();
+    let rows = mutate_selected(
         state.database(),
         &state.env,
         state.domain(),
-        &claims,
-        CipherSelection::Single(id),
-        CipherMutation::HardDelete,
+        claims,
+        CipherSelection::Bulk(ids),
+        kind,
     )
     .await?;
-    Ok(ApiResponse(()))
-}
-#[worker::send]
-pub(in crate::api) async fn hard_delete_ciphers_bulk(
-    claims: Claims,
-    State(state): State<Arc<AppState>>,
-    selection: BulkCipherSelection,
-) -> AppResult<ApiResponse<()>> {
-    mutate_bulk(&state, &claims, selection.ids, CipherMutation::HardDelete).await?;
-    Ok(ApiResponse(()))
-}
-#[worker::send]
-pub(in crate::api) async fn restore_cipher(
-    claims: Claims,
-    State(state): State<Arc<AppState>>,
-    Path(id): Path<String>,
-) -> AppResult<ApiResponse<CipherResponse>> {
-    mutate_one(claims, state, id, CipherMutation::Restore).await
-}
-#[worker::send]
-pub(in crate::api) async fn restore_ciphers_bulk(
-    claims: Claims,
-    State(state): State<Arc<AppState>>,
-    selection: BulkCipherSelection,
-) -> AppResult<ApiResponse<CipherListResponse>> {
-    let rows = mutate_bulk(&state, &claims, selection.ids, CipherMutation::Restore).await?;
-    Ok(ApiResponse(CipherListResponse::new(rows)))
-}
-#[worker::send]
-pub(in crate::api) async fn move_ciphers(
-    claims: Claims,
-    State(state): State<Arc<AppState>>,
-    selection: BulkCipherSelection,
-) -> AppResult<ApiResponse<()>> {
-    mutate_bulk(&state, &claims, selection.ids, CipherMutation::Move {
-        folder_id: selection.folder_id,
-    })
-    .await?;
-    Ok(ApiResponse(()))
+    if returns_rows {
+        Ok(ApiResponse(CipherListResponse::new(rows)).into_response())
+    } else {
+        Ok(ApiResponse(()).into_response())
+    }
 }
 
 #[worker::send]
@@ -316,66 +285,6 @@ pub(in crate::api) async fn purge_vault(
     )
     .await?;
     Ok(ApiResponse(()))
-}
-
-#[derive(Deserialize)]
-pub(in crate::api) struct ArchiveRequest {
-    ids: Vec<String>,
-}
-async fn mutate_one(
-    claims: Claims,
-    state: Arc<AppState>,
-    id: String,
-    kind: CipherMutation,
-) -> AppResult<ApiResponse<CipherResponse>> {
-    Ok(ApiResponse(
-        mutate_selected(
-            state.database(),
-            &state.env,
-            state.domain(),
-            &claims,
-            CipherSelection::Single(id),
-            kind,
-        )
-        .await?
-        .into_iter()
-        .next()
-        .ok_or(AppError::Internal)?,
-    ))
-}
-#[worker::send]
-pub(in crate::api) async fn archive_cipher(
-    claims: Claims,
-    State(state): State<Arc<AppState>>,
-    Path(id): Path<String>,
-) -> AppResult<ApiResponse<CipherResponse>> {
-    mutate_one(claims, state, id, CipherMutation::Archive).await
-}
-#[worker::send]
-pub(in crate::api) async fn unarchive_cipher(
-    claims: Claims,
-    State(state): State<Arc<AppState>>,
-    Path(id): Path<String>,
-) -> AppResult<ApiResponse<CipherResponse>> {
-    mutate_one(claims, state, id, CipherMutation::Unarchive).await
-}
-#[worker::send]
-pub(in crate::api) async fn archive_ciphers_bulk(
-    claims: Claims,
-    State(state): State<Arc<AppState>>,
-    Json(payload): Json<ArchiveRequest>,
-) -> AppResult<ApiResponse<CipherListResponse>> {
-    let rows = mutate_bulk(&state, &claims, payload.ids, CipherMutation::Archive).await?;
-    Ok(ApiResponse(CipherListResponse::new(rows)))
-}
-#[worker::send]
-pub(in crate::api) async fn unarchive_ciphers_bulk(
-    claims: Claims,
-    State(state): State<Arc<AppState>>,
-    Json(payload): Json<ArchiveRequest>,
-) -> AppResult<ApiResponse<CipherListResponse>> {
-    let rows = mutate_bulk(&state, &claims, payload.ids, CipherMutation::Unarchive).await?;
-    Ok(ApiResponse(CipherListResponse::new(rows)))
 }
 
 #[worker::send]

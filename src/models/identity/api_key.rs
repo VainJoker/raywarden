@@ -27,17 +27,14 @@ pub struct ApiKeyReplacement<'a> {
 
 impl ApiKeyRow {
     pub async fn find(db: &D1Database, user: &str) -> AppResult<Option<Self>> {
-        db::run_query(
-            async {
-                query!(
-                    db,
-                    "SELECT encrypted_key,key_hash,updated_at FROM \
-                     user_api_keys WHERE user_id=?1",
-                    user
-                )?
-                .first(None)
-                .await
-            },
+        db::query_first(
+            query!(
+                db,
+                "SELECT encrypted_key,key_hash,updated_at FROM \
+                 user_api_keys WHERE user_id=?1",
+                user
+            ),
+            None,
             "Failed to fetch API key",
         )
         .await
@@ -103,55 +100,53 @@ impl ApiKeyRow {
             previous.map(|key| key.updated_at.as_str()),
         ]);
         let claim = db.prepare(sql).bind(&values)?;
-        let results = db::run_query(
-            async {
-                db.batch(vec![
-                    claim,
-                    query!(
-                        db,
-                        "DELETE FROM devices WHERE user_id=?1 AND \
-                         EXISTS(SELECT 1 FROM user_api_key_sessions s WHERE \
-                         s.user_id=devices.user_id AND \
-                         s.device_id=devices.device_id AND \
-                         s.session_token=devices.session_token) AND EXISTS \
-                         (SELECT 1 FROM users WHERE id=?1 AND \
-                         account_write_token=?2)",
-                        user.id,
-                        marker
-                    )?,
-                    query!(
-                        db,
-                        "DELETE FROM user_api_key_sessions WHERE user_id=?1 \
-                         AND EXISTS(SELECT 1 FROM users WHERE id=?1 AND \
-                         account_write_token=?2)",
-                        user.id,
-                        marker
-                    )?,
-                    query!(
-                        db,
-                        "INSERT INTO \
-                         user_api_keys(user_id,encrypted_key,key_hash,\
-                         updated_at) SELECT ?1,?2,?3,updated_at FROM users \
-                         WHERE id=?1 AND account_write_token=?4 ON \
-                         CONFLICT(user_id) DO UPDATE SET \
-                         encrypted_key=excluded.encrypted_key,\
-                         key_hash=excluded.key_hash,updated_at=excluded.\
-                         updated_at RETURNING \
-                         encrypted_key,key_hash,updated_at",
-                        user.id,
-                        encrypted,
-                        hash,
-                        marker
-                    )?,
-                ])
-                .await
-            },
+        let results = db::run_batch(
+            db,
+            vec![
+                claim,
+                query!(
+                    db,
+                    "DELETE FROM devices WHERE user_id=?1 AND \
+                     EXISTS(SELECT 1 FROM user_api_key_sessions s WHERE \
+                     s.user_id=devices.user_id AND \
+                     s.device_id=devices.device_id AND \
+                     s.session_token=devices.session_token) AND EXISTS \
+                     (SELECT 1 FROM users WHERE id=?1 AND \
+                     account_write_token=?2)",
+                    user.id,
+                    marker
+                )?,
+                query!(
+                    db,
+                    "DELETE FROM user_api_key_sessions WHERE user_id=?1 \
+                     AND EXISTS(SELECT 1 FROM users WHERE id=?1 AND \
+                     account_write_token=?2)",
+                    user.id,
+                    marker
+                )?,
+                query!(
+                    db,
+                    "INSERT INTO \
+                     user_api_keys(user_id,encrypted_key,key_hash,\
+                     updated_at) SELECT ?1,?2,?3,updated_at FROM users \
+                     WHERE id=?1 AND account_write_token=?4 ON \
+                     CONFLICT(user_id) DO UPDATE SET \
+                     encrypted_key=excluded.encrypted_key,\
+                     key_hash=excluded.key_hash,updated_at=excluded.\
+                     updated_at RETURNING \
+                     encrypted_key,key_hash,updated_at",
+                    user.id,
+                    encrypted,
+                    hash,
+                    marker
+                )?,
+            ],
             "Failed to rotate API key",
         )
         .await?;
         Ok(results
             .last()
-            .ok_or(AppError::Internal)?
+            .ok_or_else(|| AppError::internal("Missing API key rotation batch result"))?
             .results::<Self>()?
             .into_iter()
             .next())

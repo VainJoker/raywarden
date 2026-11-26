@@ -1,43 +1,23 @@
 //! Thin Cloudflare Durable Object adapter over `service::notifications::hub`.
 use std::future::ready;
 
-use futures_util::StreamExt;
 use serde::Deserialize;
 use worker::{
-    DurableObject, Env, Method, Request, Response, Result, State, WebSocket,
+    DurableObject, Env, Method, Request, Response, ResponseBuilder, Result, State, WebSocket,
     WebSocketIncomingMessage, WebSocketPair, durable_object,
 };
 
-use super::{NotificationError, PublicNotificationEndpoint};
+use super::PublicNotificationEndpoint;
 use crate::{
     service::notifications::{
         self, FanoutSelector, PING,
-        hub::{
-            self, FilterOutcome, FrameDecision, HubError, HubIdentity, HubResult, HubSession,
-            IncomingFrame,
-        },
+        hub::{self, FilterOutcome, FrameDecision, HubError, HubIdentity, HubResult, HubSession},
     },
-    utils::time,
+    utils::{bounded_content_length, collect_bounded, time},
 };
 
 const KEEPALIVE_INTERVAL_MS: i64 = 25_000;
 const FANOUT_MAX_BYTES: usize = 65_536;
-
-enum NotifyRoute {
-    Public(PublicNotificationEndpoint),
-    Fanout,
-}
-
-impl NotifyRoute {
-    fn classify(method: &Method, path: &str) -> Option<Self> {
-        let trimmed = path.trim_end_matches('/');
-        if let Some(endpoint) = PublicNotificationEndpoint::parse(trimmed) {
-            let (expected, _) = endpoint.expected_method();
-            return (*method == expected).then_some(Self::Public(endpoint));
-        }
-        (*method == Method::Post && trimmed == notifications::FANOUT_PATH).then_some(Self::Fanout)
-    }
-}
 
 #[derive(Deserialize, Default)]
 struct HubQuery {
@@ -61,16 +41,18 @@ impl DurableObject for notifydo {
     }
 
     async fn fetch(&self, mut req: Request) -> Result<Response> {
-        match NotifyRoute::classify(&req.method(), &req.path()) {
-            Some(NotifyRoute::Public(PublicNotificationEndpoint::Upgrade { anonymous })) => {
-                self.accept_websocket(&req, anonymous).await
-            }
-            Some(NotifyRoute::Public(PublicNotificationEndpoint::Negotiate { anonymous })) => {
-                self.negotiate(&req, anonymous).await
-            }
-            Some(NotifyRoute::Fanout) => self.fanout(&mut req).await,
-            None => NotificationError::NotFound.into_worker_response(),
+        let path = req.path();
+        let path = path.trim_end_matches('/');
+        let method = req.method();
+        if method == Method::Post && path == notifications::FANOUT_PATH {
+            return self.fanout(&mut req).await;
         }
+        if let Some(endpoint) = PublicNotificationEndpoint::parse(path)
+            && method == endpoint.expected_method().0
+        {
+            return self.handle_public(&req, endpoint).await;
+        }
+        Response::error("Not found", 404)
     }
 
     async fn websocket_message(
@@ -81,11 +63,7 @@ impl DurableObject for notifydo {
         let Some(mut session) = restore_session(&ws) else {
             return Ok(());
         };
-        let frame = match &message {
-            WebSocketIncomingMessage::String(text) => IncomingFrame::Text(text),
-            WebSocketIncomingMessage::Binary(bytes) => IncomingFrame::Binary(bytes),
-        };
-        match session.handle_frame(&self.env, frame).await {
+        match session.handle_frame(&self.env, &message).await {
             FrameDecision::Reply(bytes) => {
                 ws.send_with_bytes(bytes)?;
                 ws.serialize_attachment(&session)
@@ -185,59 +163,72 @@ impl notifydo {
     }
 
     fn connection_tags(&self, identity: &HubIdentity) -> Option<Vec<String>> {
-        let (mut tags, limit_tag, limit) = identity.tag_policy();
-        if self.state.get_websockets_with_tag(&limit_tag).len() >= limit {
+        let mut policy = identity.tag_policy();
+        if self
+            .state
+            .get_websockets_with_tag(&policy.capacity_tag)
+            .len()
+            >= policy.max_connections
+        {
             return None;
         }
-        tags.push(limit_tag);
-        Some(tags)
+        policy.routing_tags.push(policy.capacity_tag);
+        Some(policy.routing_tags)
     }
 
-    async fn negotiate(&self, req: &Request, anonymous: bool) -> Result<Response> {
-        let Ok(ip) = req.headers().get("cf-connecting-ip") else {
-            return NotificationError::from(hub::unavailable("read client IP header"))
-                .into_worker_response();
+    async fn handle_public(
+        &self,
+        req: &Request,
+        endpoint: PublicNotificationEndpoint,
+    ) -> Result<Response> {
+        let (anonymous, upgrade) = match endpoint {
+            PublicNotificationEndpoint::Upgrade { anonymous } => (anonymous, true),
+            PublicNotificationEndpoint::Negotiate { anonymous } => (anonymous, false),
         };
-        if let Err(error) = self.authenticate(req, anonymous, ip.as_deref()).await {
-            return NotificationError::from(error).into_worker_response();
-        }
-        let id = uuid::Uuid::new_v4().to_string();
-        Response::from_json(&serde_json::json!({
-            "negotiateVersion":1,"connectionId":id,"connectionToken":id,
-            "availableTransports":[{"transport":"WebSockets","transferFormats":["Binary"]}]
-        }))
-    }
-
-    async fn accept_websocket(&self, req: &Request, anonymous: bool) -> Result<Response> {
-        if !req
-            .headers()
-            .get("upgrade")?
-            .is_some_and(|value| value.eq_ignore_ascii_case("websocket"))
+        if upgrade
+            && !req
+                .headers()
+                .get("upgrade")?
+                .is_some_and(|value| value.eq_ignore_ascii_case("websocket"))
         {
-            return NotificationError::UpgradeRequired.into_worker_response();
+            return ResponseBuilder::new()
+                .with_header("Upgrade", "websocket")?
+                .with_header("Connection", "upgrade")?
+                .error("WebSocket upgrade required", 426);
         }
         let Ok(ip) = req.headers().get("cf-connecting-ip") else {
-            return NotificationError::from(hub::unavailable("read client IP header"))
-                .into_worker_response();
+            return hub::unavailable("read client IP header").response();
         };
         let identity = match self.authenticate(req, anonymous, ip.as_deref()).await {
             Ok(identity) => identity,
-            Err(error) => return NotificationError::from(error).into_worker_response(),
+            Err(error) => return error.response(),
         };
-        if let Err(error) = hub::check_connect_rate_limit(&self.env, ip.as_deref()).await {
-            return NotificationError::from(error).into_worker_response();
+        if upgrade {
+            self.accept_websocket(identity, ip.as_deref()).await
+        } else {
+            let id = uuid::Uuid::new_v4().to_string();
+            Response::from_json(&serde_json::json!({
+                "negotiateVersion":1,"connectionId":id,"connectionToken":id,
+                "availableTransports":[{"transport":"WebSockets","transferFormats":["Binary"]}]
+            }))
+        }
+    }
+
+    async fn accept_websocket(&self, identity: HubIdentity, ip: Option<&str>) -> Result<Response> {
+        if let Err(error) = hub::check_connect_rate_limit(&self.env, ip).await {
+            return error.response();
         }
         if self.connection_tags(&identity).is_none() {
-            return NotificationError::from(HubError::TooManyConnections).into_worker_response();
+            return HubError::TooManyConnections.response();
         }
         if self.ensure_keepalive_alarm().await.is_err() {
             log::warn!("Notification upgrade could not schedule keepalive");
-            return NotificationError::from(HubError::Unavailable).into_worker_response();
+            return HubError::Unavailable.response();
         }
         // Recheck capacity after the await. Checking and accepting the socket
         // must stay synchronous so another upgrade cannot race the limit.
         let Some(tags) = self.connection_tags(&identity) else {
-            return NotificationError::from(HubError::TooManyConnections).into_worker_response();
+            return HubError::TooManyConnections.response();
         };
         let pair = WebSocketPair::new()?;
         pair.server
@@ -253,14 +244,14 @@ impl notifydo {
             .get(notifications::FANOUT_TOKEN_HEADER)?
             .unwrap_or_default();
         if token.is_empty() {
-            return NotificationError::from(HubError::Forbidden).into_worker_response();
+            return HubError::Forbidden.response();
         }
         let Some(body) = read_bounded_fanout_body(req).await? else {
-            return NotificationError::from(HubError::Forbidden).into_worker_response();
+            return HubError::Forbidden.response();
         };
         let fanout = match hub::verify_and_decode_fanout(&self.env, &body, &token).await {
             Ok(fanout) => fanout,
-            Err(error) => return NotificationError::from(error).into_worker_response(),
+            Err(error) => return error.response(),
         };
         let sent = self
             .deliver(&fanout.selector, &fanout.payload, fanout.logout)
@@ -355,28 +346,16 @@ fn close_socket(ws: &WebSocket, code: u16, reason: &str) {
 }
 
 async fn read_bounded_fanout_body(req: &mut Request) -> Result<Option<String>> {
-    if let Some(length) = req
-        .headers()
-        .get("content-length")?
-        .filter(|value| !value.is_empty())
-        && (!length.bytes().all(|byte| byte.is_ascii_digit())
-            || !length
-                .parse::<usize>()
-                .is_ok_and(|size| size <= FANOUT_MAX_BYTES))
-    {
+    if !bounded_content_length(
+        req.headers().get("content-length")?.as_deref(),
+        FANOUT_MAX_BYTES,
+    ) {
         return Ok(None);
     }
     if req.inner().body().is_none() {
         return Ok(Some(String::new()));
     }
-    let mut stream = req.stream()?;
-    let mut bytes = Vec::new();
-    while let Some(chunk) = stream.next().await {
-        let chunk = chunk?;
-        if chunk.len() > FANOUT_MAX_BYTES - bytes.len() {
-            return Ok(None);
-        }
-        bytes.extend_from_slice(&chunk);
-    }
-    Ok(String::from_utf8(bytes).ok())
+    Ok(collect_bounded(req.stream()?, FANOUT_MAX_BYTES)
+        .await?
+        .and_then(|bytes| String::from_utf8(bytes).ok()))
 }

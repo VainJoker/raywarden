@@ -4,3 +4,4 @@ pub mod cipher;
 pub mod domains;
 pub mod folder;
 pub mod import;
+mod json_batch;

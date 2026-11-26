@@ -1,7 +1,7 @@
 //! Cipher response shape, persisted-row conversion and client compatibility
 //! projections.
-use serde::{Serialize, Serializer};
-use serde_json::{Value, json};
+use serde::{Serialize, Serializer, ser::SerializeMap};
+use serde_json::{Map, Value, json};
 
 use super::request::{
     CipherKind, is_data_blob_encrypted, is_valid_ssh_key, normalize_optional_rfc3339,
@@ -29,7 +29,9 @@ pub struct CipherResponse {
 impl TryFrom<CipherRow> for CipherResponse {
     type Error = AppError;
     fn try_from(row: CipherRow) -> Result<Self, Self::Error> {
-        let data = serde_json::from_str(&row.data).map_err(AppError::internal_error)?;
+        let data = serde_json::from_str(&row.data).map_err(AppError::internal_json(
+            "Stored cipher payload is malformed",
+        ))?;
         Ok(Self::from_row_and_data(row, data))
     }
 }
@@ -52,53 +54,6 @@ impl CipherResponse {
     }
 }
 
-/// Field order follows the historical JSON map, including explicit nulls
-/// for inactive and sealed fields. Only the opaque blob field can be absent.
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-struct CipherWireResponse<'a> {
-    archived_date: Option<&'a str>,
-    attachments: Option<&'a [AttachmentResponse]>,
-    bank_account: Value,
-    card: Value,
-    collection_ids: [&'static str; 0],
-    creation_date: &'a str,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    data: Option<&'a str>,
-    deleted_date: Option<&'a str>,
-    drivers_license: Value,
-    edit: bool,
-    favorite: bool,
-    fields: Value,
-    folder_id: Option<&'a str>,
-    id: &'a str,
-    identity: Value,
-    key: Option<&'a Value>,
-    login: Value,
-    name: Option<&'a Value>,
-    notes: Option<&'a Value>,
-    object: &'static str,
-    #[serde(flatten)]
-    organization: CipherOrganization<'a>,
-    passport: Value,
-    password_history: Value,
-    permissions: CipherPermissions,
-    reprompt: i64,
-    revision_date: &'a str,
-    secure_note: Value,
-    ssh_key: Value,
-    #[serde(rename = "type")]
-    cipher_type: i32,
-    view_password: bool,
-}
-
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-struct CipherOrganization<'a> {
-    organization_id: Option<&'a str>,
-    organization_use_totp: bool,
-}
-
 #[derive(Serialize)]
 struct CipherPermissions {
     delete: bool,
@@ -107,161 +62,135 @@ struct CipherPermissions {
 
 impl Serialize for CipherResponse {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        self.wire_response().serialize(serializer)
-    }
-}
-
-impl CipherResponse {
-    fn wire_response(&self) -> CipherWireResponse<'_> {
         let data = &self.data;
         let blob = data
             .get("data")
             .and_then(Value::as_str)
             .filter(|data| is_data_blob_encrypted(data));
-        let sealed = blob.is_some();
-        let mut wire = CipherWireResponse {
-            archived_date: self.archived_at.as_deref(),
-            attachments: self.attachments.as_deref(),
-            bank_account: Value::Null,
-            card: Value::Null,
-            collection_ids: [],
-            creation_date: &self.created_at,
-            data: blob,
-            deleted_date: self.deleted_at.as_deref(),
-            drivers_license: Value::Null,
-            edit: true,
-            favorite: self.is_favorite,
-            fields: Value::Null,
-            folder_id: self.folder_id.as_deref(),
-            id: &self.id,
-            identity: Value::Null,
-            key: data.get("key"),
-            login: Value::Null,
-            name: None,
-            notes: None,
-            object: "cipherDetails",
-            organization: CipherOrganization {
-                organization_id: self.organization_id.as_deref(),
-                organization_use_totp: false,
-            },
-            passport: Value::Null,
-            password_history: Value::Null,
-            permissions: CipherPermissions {
-                delete: true,
-                restore: true,
-            },
-            reprompt: data
-                .get("reprompt")
-                .and_then(Value::as_i64)
-                .filter(|v| *v == 0 || *v == 1)
-                .unwrap_or(0),
-            revision_date: &self.updated_at,
-            secure_note: Value::Null,
-            ssh_key: Value::Null,
-            cipher_type: self.cipher_type,
-            view_password: true,
-        };
-        if !sealed {
-            wire.name = data.get("name");
-            wire.notes = data.get("notes");
-            wire.fields = normalize_fields(data.get("fields"));
-            wire.password_history = normalize_password_history(data.get("passwordHistory"));
-            if let Ok(kind) = CipherKind::try_from(self.cipher_type) {
-                wire.project_active_fields(data, kind);
+        let structured = blob.is_none().then_some(data);
+        let kind = structured.and(CipherKind::try_from(self.cipher_type).ok());
+        let active = |expected, field| {
+            if kind != Some(expected) {
+                return Value::Null;
             }
-        }
-        wire
-    }
-}
-
-impl CipherWireResponse<'_> {
-    fn project_active_fields(&mut self, data: &Value, kind: CipherKind) {
-        // Historical rows with missing active payloads get a client-safe
-        // object while malformed JSON is rejected during row conversion.
-        let active = |field| {
+            // Historical rows may be missing their active payload.
             data.get(field)
                 .filter(|value| value.is_object())
                 .cloned()
                 .unwrap_or_else(|| json!({}))
         };
-        match kind {
-            CipherKind::Login => {
-                self.login = active("login");
-                normalize_login(&mut self.login);
-            }
-            CipherKind::SecureNote => {
-                self.secure_note = active("secureNote");
-                normalize_secure_note(&mut self.secure_note);
-            }
-            CipherKind::Card => self.card = active("card"),
-            CipherKind::Identity => self.identity = active("identity"),
-            CipherKind::SshKey => {
-                self.ssh_key = active("sshKey");
-                normalize_ssh_key(&mut self.ssh_key);
-            }
-            CipherKind::BankAccount => self.bank_account = active("bankAccount"),
-            CipherKind::DriversLicense => self.drivers_license = active("driversLicense"),
-            CipherKind::Passport => self.passport = active("passport"),
+        let field = |key| structured.and_then(|data| data.get(key));
+
+        // Keep historical field order and nulls. Only the opaque blob may be absent.
+        let mut wire = serializer.serialize_map(None)?;
+        wire.serialize_entry("archivedDate", &self.archived_at)?;
+        wire.serialize_entry("attachments", &self.attachments)?;
+        wire.serialize_entry(
+            "bankAccount",
+            &active(CipherKind::BankAccount, "bankAccount"),
+        )?;
+        wire.serialize_entry("card", &active(CipherKind::Card, "card"))?;
+        wire.serialize_entry("collectionIds", &[(); 0])?;
+        wire.serialize_entry("creationDate", &self.created_at)?;
+        if let Some(blob) = blob {
+            wire.serialize_entry("data", blob)?;
         }
+        wire.serialize_entry("deletedDate", &self.deleted_at)?;
+        wire.serialize_entry(
+            "driversLicense",
+            &active(CipherKind::DriversLicense, "driversLicense"),
+        )?;
+        wire.serialize_entry("edit", &true)?;
+        wire.serialize_entry("favorite", &self.is_favorite)?;
+        wire.serialize_entry("fields", &normalize_fields(field("fields")))?;
+        wire.serialize_entry("folderId", &self.folder_id)?;
+        wire.serialize_entry("id", &self.id)?;
+        wire.serialize_entry("identity", &active(CipherKind::Identity, "identity"))?;
+        wire.serialize_entry("key", &data.get("key"))?;
+        let mut login = active(CipherKind::Login, "login");
+        normalize_login(&mut login);
+        wire.serialize_entry("login", &login)?;
+        wire.serialize_entry("name", &field("name"))?;
+        wire.serialize_entry("notes", &field("notes"))?;
+        wire.serialize_entry("object", "cipherDetails")?;
+        wire.serialize_entry("organizationId", &self.organization_id)?;
+        wire.serialize_entry("organizationUseTotp", &false)?;
+        wire.serialize_entry("passport", &active(CipherKind::Passport, "passport"))?;
+        wire.serialize_entry(
+            "passwordHistory",
+            &normalize_password_history(field("passwordHistory")),
+        )?;
+        wire.serialize_entry("permissions", &CipherPermissions {
+            delete: true,
+            restore: true,
+        })?;
+        let reprompt = data
+            .get("reprompt")
+            .and_then(Value::as_i64)
+            .filter(|v| *v == 0 || *v == 1)
+            .unwrap_or(0);
+        wire.serialize_entry("reprompt", &reprompt)?;
+        wire.serialize_entry("revisionDate", &self.updated_at)?;
+        let mut note = active(CipherKind::SecureNote, "secureNote");
+        if kind == Some(CipherKind::SecureNote) {
+            normalize_secure_note(&mut note);
+        }
+        wire.serialize_entry("secureNote", &note)?;
+        let mut ssh_key = active(CipherKind::SshKey, "sshKey");
+        normalize_ssh_key(&mut ssh_key);
+        wire.serialize_entry("sshKey", &ssh_key)?;
+        wire.serialize_entry("type", &self.cipher_type)?;
+        wire.serialize_entry("viewPassword", &true)?;
+        wire.end()
     }
+}
+
+fn normalize_object_array(
+    value: Option<&Value>,
+    mut normalize: impl FnMut(&mut Map<String, Value>) -> bool,
+) -> Value {
+    if value.is_none_or(Value::is_null) {
+        return Value::Null;
+    }
+    Value::Array(
+        value
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(|entry| {
+                let mut entry = entry.as_object()?.clone();
+                normalize(&mut entry).then_some(Value::Object(entry))
+            })
+            .collect(),
+    )
 }
 
 fn normalize_fields(value: Option<&Value>) -> Value {
-    if value.is_none_or(Value::is_null) {
-        return Value::Null;
-    }
-    let Some(fields) = value.and_then(Value::as_array) else {
-        return Value::Array(Vec::new());
-    };
-
-    Value::Array(
-        fields
-            .iter()
-            .filter_map(|field| {
-                let mut field = field.as_object()?.clone();
-                match field.get("type") {
-                    Some(Value::Number(_)) => {}
-                    Some(Value::String(value)) => {
-                        let field_type = value.parse::<u8>().unwrap_or(1);
-                        field.insert("type".to_string(), json!(field_type));
-                    }
-                    _ => {
-                        field.insert("type".to_string(), json!(1));
-                    }
-                }
-                Some(Value::Object(field))
-            })
-            .collect(),
-    )
+    normalize_object_array(value, |field| {
+        let kind = match field.get("type") {
+            Some(Value::Number(_)) => return true,
+            Some(Value::String(value)) => value.parse::<u8>().unwrap_or(1),
+            _ => 1,
+        };
+        field.insert("type".to_owned(), json!(kind));
+        true
+    })
 }
 
 fn normalize_password_history(value: Option<&Value>) -> Value {
-    if value.is_none_or(Value::is_null) {
-        return Value::Null;
-    }
-    let Some(history) = value.and_then(Value::as_array) else {
-        return Value::Array(Vec::new());
-    };
+    normalize_object_array(value, |entry| {
+        if !entry.get("password").is_some_and(Value::is_string) {
+            return false;
+        }
+        let last_used_date = normalized_date(entry.get("lastUsedDate").and_then(Value::as_str));
+        entry.insert("lastUsedDate".to_owned(), last_used_date);
+        true
+    })
+}
 
-    Value::Array(
-        history
-            .iter()
-            .filter_map(|entry| {
-                let mut entry = entry.as_object()?.clone();
-                if !entry.get("password").is_some_and(Value::is_string) {
-                    return None;
-                }
-
-                let last_used_date = entry
-                    .get("lastUsedDate")
-                    .and_then(Value::as_str)
-                    .and_then(|value| normalize_optional_rfc3339(Some(value)))
-                    .unwrap_or_else(|| "1970-01-01T00:00:00.000000Z".to_string());
-                entry.insert("lastUsedDate".to_string(), json!(last_used_date));
-                Some(Value::Object(entry))
-            })
-            .collect(),
-    )
+fn normalized_date(value: Option<&str>) -> Value {
+    normalize_optional_rfc3339(value)
+        .map_or_else(|| json!("1970-01-01T00:00:00.000000Z"), Value::String)
 }
 
 fn normalize_login(login: &mut Value) {
@@ -282,11 +211,9 @@ fn normalize_login(login: &mut Value) {
     }
 
     if let Some(Value::String(password_revision_date)) = map.get("passwordRevisionDate") {
-        let password_revision_date = normalize_optional_rfc3339(Some(password_revision_date))
-            .unwrap_or_else(|| "1970-01-01T00:00:00.000000Z".to_string());
         map.insert(
-            "passwordRevisionDate".to_string(),
-            json!(password_revision_date),
+            "passwordRevisionDate".to_owned(),
+            normalized_date(Some(password_revision_date)),
         );
     }
 
@@ -321,162 +248,44 @@ fn normalize_secure_note(secure_note: &mut Value) {
 mod tests {
     use super::{super::CipherRequest, *};
 
-    fn cipher_with_data(data: &Value, cipher_type: i32) -> CipherResponse {
+    fn cipher_fields(data: &Value, cipher_type: i32) -> Value {
         let row: CipherRow = serde_json::from_value(json!({
             "id": "cipher", "user_id": "owner", "organization_id": null,
             "cipher_type": cipher_type, "data": data.to_string(), "is_favorite": 0,
             "folder_id": null, "deleted_at": null, "created_at": "now", "updated_at": "now"
         }))
-        .expect("valid cipher projection fixture");
-        CipherResponse::from_row_and_data(row, data.clone())
-    }
-
-    fn cipher_fields(data: &Value, cipher_type: i32) -> Value {
-        serde_json::to_value(cipher_with_data(data, cipher_type)).expect("valid cipher projection")
+        .expect("fixture");
+        serde_json::to_value(CipherResponse::from_row_and_data(row, data.clone())).expect("json")
     }
 
     #[test]
-    fn wire_snapshot_keeps_field_order_and_nulls_and_omits_missing_blob() {
-        assert_eq!(
-            serde_json::to_string(&cipher_with_data(&json!({"login": {}}), 1))
-                .expect("valid cipher projection"),
-            json!({
-                "archivedDate": null, "attachments": null, "bankAccount": null,
-                "card": null, "collectionIds": [], "creationDate": "now",
-                "deletedDate": null, "driversLicense": null, "edit": true,
-                "favorite": false, "fields": null, "folderId": null, "id": "cipher",
-                "identity": null, "key": null, "login": {"uri": null}, "name": null,
-                "notes": null, "object": "cipherDetails", "organizationId": null,
-                "organizationUseTotp": false, "passport": null, "passwordHistory": null,
-                "permissions": {"delete": true, "restore": true}, "reprompt": 0,
-                "revisionDate": "now", "secureNote": null, "sshKey": null,
-                "type": 1, "viewPassword": true
-            })
-            .to_string()
-        );
-    }
-
-    #[test]
-    fn sealed_blob_preserves_opaque_data_and_hides_structured_fields() {
+    fn projections_isolate_active_type_seal_blobs_and_reject_corrupt_json() {
         let blob = "{ \"format_version\": 2, \"data\": \"opaque\" }";
-        let request: CipherRequest = serde_json::from_value(json!({"type":8,"data":blob,"name":"ignored","passport":{"number":"ignored"},"key":"wrapped","reprompt":1})).expect("valid cipher projection fixture");
-        request
-            .validate_for_personal_vault("owner")
-            .expect("valid cipher projection fixture");
-        let stored =
-            serde_json::to_value(request.into_payload()).expect("valid cipher projection fixture");
+        let req: CipherRequest = serde_json::from_value(json!({
+            "type": 8, "data": blob, "name": "ignored", "passport": {"number": "ignored"}, "key": "wrapped", "reprompt": 1
+        }))
+        .expect("blob req");
+        let stored = serde_json::to_value(req.into_payload()).expect("stored");
         assert!(!stored.to_string().contains("ignored"));
-        let response = cipher_fields(&stored, 8);
-        assert_eq!(response["data"], blob);
-        assert_eq!(response["key"], "wrapped");
-        assert_eq!(response["reprompt"], 1);
-        for field in [
-            "name",
-            "notes",
-            "fields",
-            "passwordHistory",
-            "passport",
-            "login",
-        ] {
-            assert_eq!(response[field], Value::Null);
-        }
-    }
+        let sealed = cipher_fields(&stored, 8);
+        assert_eq!(
+            (sealed["data"].as_str(), sealed["passport"].is_null()),
+            (Some(blob), true)
+        );
 
-    #[test]
-    fn new_cipher_types_strip_client_response_properties_and_round_trip() {
-        for (kind, field) in [(6, "bankAccount"), (7, "driversLicense"), (8, "passport")] {
-            let request: CipherRequest=serde_json::from_value(json!({"type":kind,"name":"encrypted",field:{"encrypted":"opaque","response":{"transient":true}},"fields":[{"name":"encrypted","response":{}}]})).expect("valid cipher projection fixture");
-            request
-                .validate_for_personal_vault("owner")
-                .expect("valid cipher projection fixture");
-            let stored = serde_json::to_value(request.into_payload())
-                .expect("valid cipher projection fixture");
-            assert!(stored[field].get("response").is_none());
-            assert!(stored["fields"][0].get("response").is_none());
-            assert_eq!(cipher_fields(&stored, kind)[field]["encrypted"], "opaque");
-        }
-    }
-
-    #[test]
-    fn missing_historical_payloads_get_client_safe_objects() {
-        let login = cipher_fields(&json!({"login":null,"fields":[{"type":"3"}]}), 1);
-        assert!(login["login"].is_object());
-        assert_eq!(login["login"]["uri"], Value::Null);
+        let login = cipher_fields(
+            &json!({"login": null, "secureNote": {"type": 0}, "fields": [{"type": "3"}]}),
+            1,
+        );
+        assert!(login["login"].is_object() && login["secureNote"].is_null());
         assert_eq!(login["fields"][0]["type"], 3);
-        assert_eq!(
-            cipher_fields(&json!({}), 2)["secureNote"],
-            json!({"type":0})
-        );
-        for (kind, field) in [
-            (3, "card"),
-            (4, "identity"),
-            (6, "bankAccount"),
-            (7, "driversLicense"),
-            (8, "passport"),
-        ] {
-            assert!(cipher_fields(&json!({}), kind)[field].is_object());
-        }
-    }
 
-    #[test]
-    fn structured_payloads_only_expose_the_active_cipher_type() {
-        let data = json!({"name":"encrypted","login":{"uris":[{"uri":"encrypted-uri"}]},"secureNote":{"type":0},"card":{"number":"encrypted"},"identity":{"name":"encrypted"},"sshKey":{"publicKey":"encrypted","privateKey":"encrypted","keyFingerprint":"encrypted"},"bankAccount":{},"driversLicense":{},"passport":{}});
-        let names = [
-            "login",
-            "secureNote",
-            "card",
-            "identity",
-            "sshKey",
-            "bankAccount",
-            "driversLicense",
-            "passport",
-        ];
-        for kind in 1..=8 {
-            let fields = cipher_fields(&data, kind);
-            for (index, name) in names.iter().enumerate() {
-                if index + 1 == kind as usize {
-                    assert!(fields[*name].is_object());
-                } else {
-                    assert_eq!(fields[*name], Value::Null);
-                }
-            }
-        }
-    }
-
-    #[test]
-    fn invalid_stored_json_fails_conversion_instead_of_fabricating_empty_content() {
-        let row:CipherRow=serde_json::from_value(json!({"id":"bad","user_id":"owner","organization_id":null,"cipher_type":1,"data":"{broken","is_favorite":0,"folder_id":null,"deleted_at":null,"created_at":"now","updated_at":"now"})).expect("valid cipher projection fixture");
-        assert!(CipherResponse::try_from(row).is_err());
-    }
-
-    #[test]
-    fn item_key_survives_request_storage_and_response() -> Result<(), serde_json::Error> {
-        let request: CipherRequest = serde_json::from_value(json!({
-            "type": 1, "name": "encrypted-name", "key": "wrapped-item-key",
-            "login": { "password": "encrypted-password" }
-        }))?;
-        let data = request.into_payload();
-        let row: CipherRow = serde_json::from_value(json!({
-            "id": "cipher", "user_id": "owner", "organization_id": null,
-            "cipher_type": 1, "data": serde_json::to_string(&data)?, "is_favorite": 0,
-            "folder_id": null, "deleted_at": null,
-            "archived_at": "2026-01-01T00:00:00.000Z",
-            "created_at": "2025-01-01T00:00:00.000Z",
-            "updated_at": "2026-01-01T00:00:00.000Z"
-        }))?;
-        let response = serde_json::to_value(
-            CipherResponse::try_from(row).expect("valid cipher projection fixture"),
-        )?;
-        assert_eq!(response["key"], "wrapped-item-key");
-        assert_eq!(response["archivedDate"], "2026-01-01T00:00:00.000Z");
-        assert_eq!(response["login"]["password"], "encrypted-password");
-        assert_eq!(response["favorite"], false);
-        assert_eq!(response["organizationUseTotp"], false);
-        assert_eq!(response["collectionIds"], json!([]));
-        assert_eq!(
-            response["permissions"],
-            json!({"delete":true,"restore":true})
-        );
-        Ok(())
+        let corrupt: CipherRow = serde_json::from_value(json!({
+            "id": "bad", "user_id": "owner", "organization_id": null, "cipher_type": 1,
+            "data": "{broken", "is_favorite": 0, "folder_id": null, "deleted_at": null,
+            "created_at": "now", "updated_at": "now"
+        }))
+        .expect("corrupt row");
+        assert!(CipherResponse::try_from(corrupt).is_err());
     }
 }

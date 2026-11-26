@@ -55,6 +55,5 @@ public_routes! {
     "/api/version" => server::server_version,
     "/css/vaultwarden.css" => client_assets::stylesheet,
     "/js/raywarden.js" => client_assets::client_script,
-    "/demo.html" => client_assets::demo_page,
     "/.well-known/apple-app-site-association" => client_assets::apple_app_site_association,
 }

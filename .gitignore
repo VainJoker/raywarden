@@ -22,6 +22,9 @@ node_modules/
 /public/
 /static/web-vault/
 
+# Local schema reference generated from migrations
+/sql/schema.sql
+
 # Test output and Python caches
 /coverage/
 __pycache__/

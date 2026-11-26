@@ -5,6 +5,7 @@ pub mod auth_request;
 pub mod email;
 pub mod jwt_keys;
 pub mod kdf;
+mod key_envelope;
 pub mod oauth;
 pub mod session;
 pub mod setup;

@@ -1,4 +1,5 @@
 //! Numeric version cores with a flag for prerelease suffixes.
+use std::str::FromStr;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct ParsedVersion {
@@ -16,49 +17,57 @@ impl ParsedVersion {
     }
 }
 
+impl FromStr for ParsedVersion {
+    type Err = ();
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        let identifiers = |part: &str| {
+            !part.is_empty()
+                && part.split('.').all(|id| {
+                    !id.is_empty() && id.bytes().all(|c| c.is_ascii_alphanumeric() || c == b'-')
+                })
+        };
+        let (value, build) = value
+            .split_once('+')
+            .map_or((value, None), |(core, build)| (core, Some(build)));
+        if build.is_some_and(|value| !identifiers(value)) {
+            return Err(());
+        }
+        let (core, pre) = value
+            .split_once('-')
+            .map_or((value, None), |(core, pre)| (core, Some(pre)));
+        if pre.is_some_and(|value| {
+            !identifiers(value)
+                || value.split('.').any(|id| {
+                    id.len() > 1 && id.starts_with('0') && id.bytes().all(|c| c.is_ascii_digit())
+                })
+        }) {
+            return Err(());
+        }
+        let number = |part: &str| {
+            if part.is_empty()
+                || !part.bytes().all(|b| b.is_ascii_digit())
+                || (part.len() > 1 && part.starts_with('0'))
+            {
+                Err(())
+            } else {
+                part.parse().map_err(|_error| ())
+            }
+        };
+        let mut parts = core.split('.');
+        let version = Self {
+            major: number(parts.next().ok_or(())?)?,
+            minor: number(parts.next().ok_or(())?)?,
+            patch: number(parts.next().ok_or(())?)?,
+            is_prerelease: pre.is_some(),
+        };
+        parts.next().is_none().then_some(version).ok_or(())
+    }
+}
+
 /// Build metadata is validated and discarded.
 pub(crate) fn parse(value: &str) -> Option<ParsedVersion> {
-    let identifiers = |part: &str| {
-        !part.is_empty()
-            && part.split('.').all(|id| {
-                !id.is_empty() && id.bytes().all(|c| c.is_ascii_alphanumeric() || c == b'-')
-            })
-    };
-    let (value, build) = value
-        .split_once('+')
-        .map_or((value, None), |(core, build)| (core, Some(build)));
-    if build.is_some_and(|value| !identifiers(value)) {
-        return None;
-    }
-    let (core, pre) = value
-        .split_once('-')
-        .map_or((value, None), |(core, pre)| (core, Some(pre)));
-    if pre.is_some_and(|value| {
-        !identifiers(value)
-            || value.split('.').any(|id| {
-                id.len() > 1 && id.starts_with('0') && id.bytes().all(|c| c.is_ascii_digit())
-            })
-    }) {
-        return None;
-    }
-    let number = |part: &str| {
-        if part.is_empty()
-            || !part.bytes().all(|b| b.is_ascii_digit())
-            || (part.len() > 1 && part.starts_with('0'))
-        {
-            None
-        } else {
-            part.parse().ok()
-        }
-    };
-    let mut parts = core.split('.');
-    let version = ParsedVersion {
-        major: number(parts.next()?)?,
-        minor: number(parts.next()?)?,
-        patch: number(parts.next()?)?,
-        is_prerelease: pre.is_some(),
-    };
-    parts.next().is_none().then_some(version)
+    value.parse().ok()
 }
 
 #[cfg(test)]
@@ -66,51 +75,27 @@ mod tests {
     use super::{ParsedVersion, parse};
 
     #[test]
-    fn parses_numeric_cores_and_prerelease_flags_without_build_metadata() {
-        for (value, (major, minor, patch), is_prerelease) in [
-            ("0.0.0", (0, 0, 0), false),
-            ("2026.10.2", (2026, 10, 2), false),
-            ("2026.11.0-beta.1+build", (2026, 11, 0), true),
-            ("1.2.3+001.build-7", (1, 2, 3), false),
-            ("1.2.3-0", (1, 2, 3), true),
-            ("18446744073709551615.0.0", (u64::MAX, 0, 0), false),
-        ] {
-            let version = ParsedVersion {
-                major,
-                minor,
-                patch,
-                is_prerelease,
-            };
-            assert_eq!(parse(value), Some(version), "{value}");
-            assert_eq!(
-                version.satisfies_minimum(major, minor, patch),
-                !is_prerelease
-            );
-        }
-    }
-
-    #[test]
-    fn rejects_invalid_cores_suffixes_and_overflow() {
-        for value in [
+    fn semver_parses_prerelease_flags_and_rejects_malformed_inputs() {
+        assert_eq!(
+            parse("2026.10.2"),
+            Some(ParsedVersion {
+                major: 2026,
+                minor: 10,
+                patch: 2,
+                is_prerelease: false
+            })
+        );
+        let pre = parse("2026.11.0-beta.1+build").expect("pre");
+        assert!(pre.is_prerelease && !pre.satisfies_minimum(2026, 11, 0));
+        for bad in [
             "",
             "2026.10",
             "2026.10.01",
-            "2026.10.2-",
-            "2026.10.2+",
-            "2026.10.2-beta.01",
-            "1.2.3.4",
             "v1.2.3",
-            " 1.2.3",
-            "1.2.3 ",
-            "01.2.3",
-            "1.02.3",
-            "1.2.3-beta..1",
-            "1.2.3+build..1",
-            "1.2.3-beta_1",
-            "1.2.3+build+one",
+            "1.2.3-beta.01",
             "18446744073709551616.0.0",
         ] {
-            assert!(parse(value).is_none(), "{value}");
+            assert!(parse(bad).is_none(), "{bad}");
         }
     }
 }

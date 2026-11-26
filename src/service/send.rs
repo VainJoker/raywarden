@@ -7,15 +7,15 @@ pub(crate) mod upload;
 use axum::http::HeaderMap;
 pub use content::RotateSendRequest;
 use serde::Serialize;
-pub(crate) use token::{SendAccessTokenResponse, SendTokenIssuer};
+pub(crate) use token::{SendAccessTokenResponse, issue_access_token};
 use worker::{D1Database, D1PreparedStatement, Env};
 
 use self::{
     content::{
-        SendAccessResponse, SendKind, SendPassword, SendRequest, SendResponse, max_text_size_bytes,
-        validate_send_dates,
+        AccessCountPolicy, SendAccessResponse, SendKind, SendPassword, SendRequest, SendResponse,
+        SendUploadState, max_text_size_bytes, validate_send_dates,
     },
-    token::{SendScope, TokenPurpose, decode_file_token, decode_token, encode_token},
+    token::{FileTokenScope, TokenPurpose, decode_file_token, decode_token, encode_token},
 };
 use crate::{
     errors::{AppError, AppResult},
@@ -23,7 +23,10 @@ use crate::{
         config::{send_file_token_expires_at_seconds, send_quota_bytes},
         storage::Storage,
     },
-    models::send::{SendRow, collection_guard, snapshot_guard},
+    models::{
+        page::Page,
+        send::{SendRow, collection_guard},
+    },
     service::{
         identity::session::Claims,
         notifications,
@@ -48,7 +51,7 @@ impl<'a> SendOwner<'a> {
         SendRow::fetch_for_user(self.db, id, &self.claims.sub).await
     }
 
-    pub(crate) async fn create_text(&self, mut payload: SendRequest) -> AppResult<SendRow> {
+    pub(crate) async fn create_text(&self, payload: SendRequest) -> AppResult<SendRow> {
         if payload.send_type != SendKind::Text as i32 {
             return Err(AppError::bad_request(
                 "Use the file upload endpoint for file Sends",
@@ -56,15 +59,7 @@ impl<'a> SendOwner<'a> {
         }
         let db = self.db;
         let (_, key_guard) = vault_write::account_key_guard(db, self.claims).await?;
-        let password = payload.password.take();
-        let mut send = content::new_send(
-            self.claims.sub.clone(),
-            payload,
-            max_text_size_bytes(self.env),
-        )?;
-        SendPassword::derive(password.as_deref())
-            .await?
-            .apply(&mut send);
+        let send = self.new_draft(payload).await?;
         let revision = self.insert(&send, None, key_guard).await?;
         self.notify(&send, notifications::UpdateType::SyncSendCreate, &revision)
             .await;
@@ -73,7 +68,7 @@ impl<'a> SendOwner<'a> {
 
     pub(crate) async fn reserve_file_upload(
         &self,
-        mut payload: SendRequest,
+        payload: SendRequest,
         domain: &str,
         access_secret: &str,
     ) -> AppResult<upload::SendFileUploadResponse> {
@@ -82,7 +77,7 @@ impl<'a> SendOwner<'a> {
         let quota = send_quota_bytes(env)?;
         let db = self.db;
         let (_, key_guard) = vault_write::account_key_guard(db, self.claims).await?;
-        let storage = Storage::from_env(env)?;
+        Storage::from_env(env)?;
         if payload.send_type != SendKind::File as i32 {
             return Err(AppError::bad_request("Send must contain a file"));
         }
@@ -91,20 +86,15 @@ impl<'a> SendOwner<'a> {
             .as_ref()
             .ok_or_else(|| AppError::bad_request("fileLength is required"))?
             .parse_i64()?;
-        if size < 0 || size > upload::max_file_size_bytes(env, &storage) {
+        if size < 0 || size > crate::infra::config::send_max_bytes(env) {
             return Err(AppError::bad_request(
                 "Send file size exceeds the configured limit",
             ));
         }
-        let password = payload.password.take();
-        let mut send =
-            content::new_send(self.claims.sub.clone(), payload, max_text_size_bytes(env))?;
+        let mut send = self.new_draft(payload).await?;
         send.file_id = Some(uuid::Uuid::new_v4().to_string());
         send.file_size_bytes = size;
-        send.upload_state = 1;
-        SendPassword::derive(password.as_deref())
-            .await?
-            .apply(&mut send);
+        send.upload_state = i32::from(SendUploadState::Pending);
         self.insert(&send, quota, key_guard).await?;
         upload::upload_response(env, domain, access_secret, send, self.claims)
     }
@@ -116,7 +106,7 @@ impl<'a> SendOwner<'a> {
         let db = self.db;
         let (_, key_guard) = vault_write::account_key_guard(db, self.claims).await?;
         let existing = SendRow::fetch_for_user(db, id, &self.claims.sub).await?;
-        if kind as i32 != existing.send_type {
+        if i32::from(kind) != existing.send_type {
             return Err(AppError::bad_request("Send type cannot change"));
         }
         let data = if kind == SendKind::Text {
@@ -131,7 +121,7 @@ impl<'a> SendOwner<'a> {
         } else {
             None
         };
-        let guard = snapshot_guard(db, &existing)?;
+        let guard = existing.snapshot_guard(db)?;
         let mut send = existing;
         if let Some(data) = data {
             send.data = data;
@@ -155,8 +145,8 @@ impl<'a> SendOwner<'a> {
 
     pub(crate) async fn remove_password(&self, id: &str) -> AppResult<SendRow> {
         let mut send = SendRow::fetch_for_user(self.db, id, &self.claims.sub).await?;
-        let guard = snapshot_guard(self.db, &send)?;
-        SendPassword::derive(None).await?.apply(&mut send);
+        let guard = send.snapshot_guard(self.db)?;
+        SendPassword::default().apply(&mut send);
         send.access_stamp = uuid::Uuid::new_v4().to_string();
         send.updated_at = crate::utils::time::now_rfc3339();
         self.save_update(&send, vec![guard]).await?;
@@ -170,17 +160,29 @@ impl<'a> SendOwner<'a> {
         if send.user_id != self.claims.sub {
             return Err(AppError::send_unavailable());
         }
-        let revision =
-            vault_write::commit(db, self.claims, vec![snapshot_guard(db, &send)?], vec![
-                send.delete_statement(db)?,
-            ])
-            .await?;
+        let revision = vault_write::commit(db, self.claims, vec![send.snapshot_guard(db)?], vec![
+            send.delete_statement(db)?,
+        ])
+        .await?;
         self.notify(&send, notifications::UpdateType::SyncSendDelete, &revision)
             .await;
         if let Err(error) = crate::service::storage_cleanup::process_batch(self.env, db).await {
-            log::warn!("Send deletion cleanup deferred: {error}");
+            log::warn!("Send deletion cleanup deferred: {error:?}");
         }
         Ok(())
+    }
+
+    async fn new_draft(&self, mut payload: SendRequest) -> AppResult<SendRow> {
+        let password = payload.password.take();
+        let mut send = content::new_send(
+            self.claims.sub.clone(),
+            payload,
+            max_text_size_bytes(self.env),
+        )?;
+        SendPassword::derive(password.as_deref())
+            .await?
+            .apply(&mut send);
+        Ok(send)
     }
 
     async fn insert(
@@ -253,7 +255,7 @@ impl<'a> SendAccess<'a> {
     ) -> AppResult<Self> {
         let claims = decode_token(access_secret, token)?;
         let row = SendRow::fetch_by_id(db, &claims.send_id).await?;
-        content::validate_access(&row, false)?;
+        content::validate_access(&row, AccessCountPolicy::Ignore)?;
         if claims.access_stamp != row.access_stamp {
             return Err(AppError::send_unavailable());
         }
@@ -266,20 +268,18 @@ impl<'a> SendAccess<'a> {
     }
 
     pub(crate) async fn read(mut self) -> AppResult<SendAccessResponse> {
+        let kind = SendKind::try_from(self.row.send_type);
         // Reject exhausted text Sends before the lookup. The write still
         // checks the access limit atomically.
-        if self.row.send_type == SendKind::Text as i32 {
-            content::validate_access(&self.row, true)?;
+        if kind == Ok(SendKind::Text) {
+            content::validate_access(&self.row, AccessCountPolicy::Enforce)?;
         }
         let email = if self.row.is_email_hidden == 0 {
             self.row.creator_email(self.db).await?
         } else {
             None
         };
-        match (
-            SendKind::try_from(self.row.send_type),
-            self.is_token_authenticated,
-        ) {
+        match (kind, self.is_token_authenticated) {
             (Ok(SendKind::Text), _) => self.record_access(None).await?,
             (_, true) => {
                 let revision = self.row.advance_revision(self.db).await?;
@@ -296,13 +296,13 @@ impl<'a> SendAccess<'a> {
         domain: &str,
         access_secret: &str,
     ) -> AppResult<SendFileDownloadResponse> {
-        if self.row.send_type != SendKind::File as i32 {
+        if self.row.send_type != i32::from(SendKind::File) {
             return Err(AppError::bad_request("Send is not a file type send"));
         }
         if self.row.file_id.as_deref() != Some(file_id) {
             return Err(AppError::send_unavailable());
         }
-        content::validate_access(&self.row, true)?;
+        content::validate_access(&self.row, AccessCountPolicy::Enforce)?;
         let key = content::storage_key(&self.row).ok_or_else(AppError::send_unavailable)?;
         if Storage::from_env(self.env)?.open(&key).await?.is_none() {
             return Err(AppError::send_unavailable());
@@ -337,13 +337,21 @@ pub(crate) async fn authorize_file_download(
     send_id: &str,
     file_id: &str,
 ) -> AppResult<String> {
-    let claims = decode_file_token(access_secret, token, SendScope::Download, send_id, file_id)?;
+    let claims = decode_file_token(
+        access_secret,
+        token,
+        FileTokenScope::Download,
+        send_id,
+        file_id,
+    )?;
     let send = SendRow::fetch_by_id(db, send_id).await?;
-    content::validate_access(&send, false)?;
+    content::validate_access(&send, AccessCountPolicy::Ignore)?;
     if send.file_id.as_deref() != Some(file_id) || send.access_stamp != claims.access_stamp {
         return Err(AppError::send_unavailable());
     }
-    content::storage_key(&send).ok_or_else(AppError::send_unavailable)
+    content::storage_key(&send)
+        .map(std::borrow::Cow::into_owned)
+        .ok_or_else(AppError::send_unavailable)
 }
 
 async fn authorize_anonymous(
@@ -354,7 +362,7 @@ async fn authorize_anonymous(
     password: Option<&str>,
 ) -> AppResult<()> {
     turnstile::verify_send_access(env, access_secret, headers, &send.id)?;
-    content::validate_access(send, true)?;
+    content::validate_access(send, AccessCountPolicy::Enforce)?;
     rate_limit::check_send_access(
         env,
         format!("send:{}:{}", send.id, rate_limit::client_ip(headers)),
@@ -368,15 +376,15 @@ pub(crate) async fn visit_send_responses(
     user_id: &str,
     mut visit: impl FnMut(SendResponse) -> AppResult<()>,
 ) -> AppResult<()> {
-    let mut after = None;
-    loop {
-        let page = SendRow::list_page(db, user_id, after.as_ref()).await?;
-        for row in page.rows {
-            visit(content::send_response(row))?;
-        }
-        let Some(next) = page.next else { return Ok(()) };
-        after = Some(next);
-    }
+    Page::visit(
+        async |after| SendRow::list_page(db, user_id, after).await,
+        async |rows| {
+            rows.into_iter()
+                .map(content::send_response)
+                .try_for_each(&mut visit)
+        },
+    )
+    .await
 }
 
 #[derive(Serialize)]
@@ -393,7 +401,7 @@ fn download_response(
     send: &SendRow,
     file_id: &str,
 ) -> AppResult<SendFileDownloadResponse> {
-    if send.send_type != SendKind::File as i32 || send.file_id.as_deref() != Some(file_id) {
+    if send.send_type != i32::from(SendKind::File) || send.file_id.as_deref() != Some(file_id) {
         return Err(AppError::send_unavailable());
     }
     let token = encode_token(env, access_secret, send, TokenPurpose::Download)?;
@@ -438,15 +446,22 @@ pub(crate) async fn rotation_statements(
     write_token: &str,
 ) -> AppResult<(Vec<D1PreparedStatement>, Vec<D1PreparedStatement>)> {
     let existing = SendRow::all_for_user(db, user_id).await?;
-    if existing.iter().any(|send| send.upload_state != 0) {
+    if existing
+        .iter()
+        .any(|send| send.upload_state != i32::from(SendUploadState::Ready))
+    {
         return Err(AppError::bad_request(
             "Complete or cancel pending Send uploads before rotating keys",
         ));
     }
-    let existing_ids: std::collections::HashSet<&str> =
-        existing.iter().map(|s| s.id.as_str()).collect();
-    let ids: std::collections::HashSet<&str> = sends.iter().map(|s| s.id.as_str()).collect();
-    if sends.len() != ids.len() || ids != existing_ids {
+    let existing_by_id: std::collections::HashMap<&str, &SendRow> =
+        existing.iter().map(|s| (s.id.as_str(), s)).collect();
+    let mut seen_ids = std::collections::HashSet::with_capacity(sends.len());
+    if sends.len() != existing_by_id.len()
+        || !sends
+            .iter()
+            .all(|s| existing_by_id.contains_key(s.id.as_str()) && seen_ids.insert(s.id.as_str()))
+    {
         return Err(AppError::bad_request(
             "All existing Sends must be included exactly once in key rotation",
         ));
@@ -454,16 +469,16 @@ pub(crate) async fn rotation_statements(
     let mut guards = Vec::with_capacity(existing.len() + 1);
     guards.push(collection_guard(db, user_id, existing.len())?);
     for send in &existing {
-        guards.push(snapshot_guard(db, send)?);
+        guards.push(send.snapshot_guard(db)?);
     }
     let mut statements = Vec::with_capacity(sends.len());
     for payload in sends {
         if payload.encrypted_key.is_empty() {
             return Err(AppError::bad_request("Rotated Send key is required"));
         }
-        let send = existing
-            .iter()
-            .find(|send| send.id == payload.id)
+        let send = existing_by_id
+            .get(payload.id.as_str())
+            .copied()
             .ok_or_else(AppError::send_unavailable)?;
         statements.push(send.rotation_statement(db, &payload.encrypted_key, now, write_token)?);
     }
@@ -475,7 +490,9 @@ pub(crate) async fn purge_expired_sends(env: &Env, db: &D1Database) -> AppResult
         crate::utils::time::now()
             .checked_sub(jiff::SignedDuration::from_secs(86_400))
             .map(crate::utils::time::format_millis)
-            .map_err(AppError::internal_error)
+            .map_err(|error| {
+                AppError::internal_debug("Send abandonment cutoff timestamp overflowed", error)
+            })
     };
     let candidates =
         SendRow::cleanup_candidates(db, &crate::utils::time::now_rfc3339(), &abandoned_before()?)
@@ -487,12 +504,12 @@ pub(crate) async fn purge_expired_sends(env: &Env, db: &D1Database) -> AppResult
         match send.delete_expired(db, &now, &cutoff).await {
             Ok(()) => count += 1,
             Err(error) => {
-                log::warn!("Expired Send metadata retained for retry: {error}");
+                log::warn!("Expired Send metadata retained for retry: {error:?}");
             }
         }
     }
     if let Err(error) = crate::service::storage_cleanup::process_batch(env, db).await {
-        log::warn!("Expired Send object cleanup deferred: {error}");
+        log::warn!("Expired Send object cleanup deferred: {error:?}");
     }
     Ok(count)
 }

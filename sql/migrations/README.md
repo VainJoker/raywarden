@@ -117,23 +117,22 @@ in any backup. Global-domain caches are rebuildable.
 ## Commands and future changes
 
 ```bash
-just schema               # Regenerate sql/schema.sql in memory.
+just schema               # Generate a local sql/schema.sql reference.
 just test-sql             # Exercise model queries and verify snapshot parity.
 just test-d1              # Verify fresh migrations and file lifecycle with native D1/R2.
 just db-migrate local     # Apply with Wrangler to the selected local database.
 just dev                  # Apply pending local migrations before serving.
 ```
 
-`sql/schema.sql` is a generated structural reference, not an initialization or
-restore path. Do not hand-edit it, import it into an application database or
-prefill migration history. Wrangler owns execution tracking; CREATE statements
-deliberately omit IF NOT EXISTS so mistakes fail.
+`just schema` generates `sql/schema.sql` from the migrations for local review.
+Use Wrangler migrations for application databases and leave migration history
+to Wrangler. The CREATE statements omit IF NOT EXISTS so mistakes fail.
 Local commands select `env.local` in `wrangler.jsonc` and persist to
 `.wrangler/local`. Remote migration requires the explicit
 `just db-migrate production` target.
 
 After this consolidation, preserve applied filenames and contents, then append `0009_*.sql`
-and later for future changes. Regenerate the snapshot and check fresh databases
+and later for future changes. Check fresh databases
 and any supported upgrade from the preceding schema. Existing instances with
 older schemas need a separately planned transfer; this change does not clear,
 upgrade or deploy them.

@@ -31,53 +31,6 @@ pub struct PublicKeyRow {
     pub public_key: String,
 }
 
-pub async fn set_initial_material(
-    db: &D1Database,
-    session: &SessionSnapshot<'_>,
-    keys: &AccountKeyMaterial,
-    key_id: Option<&str>,
-) -> AppResult<()> {
-    let revision_sql = next_user_revision_sql(8);
-    let statement = query!(
-        db,
-        format!(
-            "UPDATE users SET \
-                 private_key=?1,public_key=?2,signed_public_key=?3,\
-                 security_state=?4,security_version=?5,\
-                 signature_key_pair=?6,user_key_id=?7,\
-                 updated_at={revision_sql} WHERE id=?9 AND \
-                 security_stamp=?10 AND private_key='' AND \
-                 public_key='' RETURNING id"
-        ),
-        keys.private_key,
-        keys.public_key,
-        keys.signed_public_key,
-        keys.security_state,
-        keys.security_version,
-        keys.signature_key_pair,
-        key_id,
-        crate::utils::time::now_rfc3339(),
-        session.user_id,
-        session.security_stamp
-    )?;
-    let results = db
-        .batch(vec![session_guard(db, session)?, statement])
-        .await
-        .map_err(|error| map_session_write_error("Failed to initialize account keys", &error))?;
-    let row: Option<serde_json::Value> = results
-        .last()
-        .ok_or(AppError::Internal)?
-        .results()?
-        .into_iter()
-        .next();
-    if row.is_none() {
-        return Err(AppError::bad_request(
-            "Account key pair is already initialized or session changed",
-        ));
-    }
-    Ok(())
-}
-
 pub async fn set_key_id(db: &D1Database, session: &SessionSnapshot<'_>, id: &str) -> AppResult<()> {
     let now = crate::utils::time::now_rfc3339();
     let revision_sql = next_user_revision_sql(2);
@@ -98,7 +51,7 @@ pub async fn set_key_id(db: &D1Database, session: &SessionSnapshot<'_>, id: &str
         .map_err(|error| map_session_write_error("Failed to initialize user key ID", &error))?;
     let row: Option<serde_json::Value> = results
         .last()
-        .ok_or(AppError::Internal)?
+        .ok_or_else(|| AppError::internal("Missing user key ID initialization batch result"))?
         .results()?
         .into_iter()
         .next();
@@ -109,17 +62,14 @@ pub async fn set_key_id(db: &D1Database, session: &SessionSnapshot<'_>, id: &str
 }
 
 pub async fn public_key(db: &D1Database, user: &str) -> AppResult<PublicKeyRow> {
-    db::run_query(
-        async {
-            query!(
-                db,
-                "SELECT id, public_key FROM users WHERE id=?1 AND \
-                     public_key<>''",
-                user
-            )?
-            .first(None)
-            .await
-        },
+    db::query_first(
+        query!(
+            db,
+            "SELECT id, public_key FROM users WHERE id=?1 AND \
+                 public_key<>''",
+            user
+        ),
+        None,
         "Failed to fetch public key",
     )
     .await?
@@ -151,6 +101,27 @@ impl AccountSnapshot {
         }
     }
 
+    pub fn as_borrowed(&self) -> AccountSnapshot<&str> {
+        AccountSnapshot {
+            key: self.key.as_str(),
+            user_key_id: self.user_key_id.as_deref(),
+            private_key: self.private_key.as_str(),
+            public_key: self.public_key.as_str(),
+            signed_public_key: self.signed_public_key.as_deref(),
+            security_state: self.security_state.as_deref(),
+            security_version: self.security_version,
+            signature_key_pair: self.signature_key_pair.as_deref(),
+        }
+    }
+
+    pub fn matches_user(&self, user: &UserRow) -> bool {
+        self.as_borrowed() == Self::borrowed(user)
+    }
+
+    pub fn users_match(left: &UserRow, right: &UserRow) -> bool {
+        Self::borrowed(left) == Self::borrowed(right)
+    }
+
     pub fn from_user(user: &UserRow) -> Self {
         Self {
             key: user.key.clone(),
@@ -165,17 +136,14 @@ impl AccountSnapshot {
     }
 
     pub async fn load(db: &D1Database, user_id: &str) -> AppResult<Self> {
-        db::run_query(
-            async {
-                db.prepare(
-                    "SELECT key,user_key_id,private_key,public_key,\
-                     signed_public_key,security_state,security_version,\
-                     signature_key_pair FROM users WHERE id=?1",
-                )
-                .bind(&db::d1_params![user_id])?
-                .first(None)
-                .await
-            },
+        db::query_first(
+            db.prepare(
+                "SELECT key,user_key_id,private_key,public_key,\
+                 signed_public_key,security_state,security_version,\
+                 signature_key_pair FROM users WHERE id=?1",
+            )
+            .bind(&db::d1_params![user_id]),
+            None,
             "Failed to load account encryption state",
         )
         .await?
@@ -183,11 +151,15 @@ impl AccountSnapshot {
     }
 
     pub fn to_json(&self) -> AppResult<String> {
-        serde_json::to_string(self).map_err(AppError::internal_error)
+        serde_json::to_string(self).map_err(AppError::internal_json(
+            "Failed to serialize account key snapshot",
+        ))
     }
 
     pub fn json_from_user(user: &UserRow) -> AppResult<String> {
-        serde_json::to_string(&Self::borrowed(user)).map_err(AppError::internal_error)
+        serde_json::to_string(&Self::borrowed(user)).map_err(AppError::internal_json(
+            "Failed to serialize account key snapshot",
+        ))
     }
 
     pub fn matches_sql(parameter: usize) -> String {

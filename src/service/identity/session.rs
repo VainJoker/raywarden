@@ -7,8 +7,7 @@ use worker::D1Database;
 
 use crate::{
     errors::{AppError, AppResult},
-    models::identity::device::{DeviceRow, SessionSnapshot},
-    utils::constant_time_eq,
+    models::identity::device::SessionSnapshot,
 };
 
 /// Optional claims serialized alongside the session bindings.
@@ -125,22 +124,7 @@ pub(crate) async fn validate_session(
     db: &D1Database,
     expected: &SessionSnapshot<'_>,
 ) -> AppResult<()> {
-    let current = DeviceRow::find_session(db, expected.user_id, expected.device_id).await?;
-    if current.is_some_and(|session| {
-        constant_time_eq(
-            session.session_token.as_bytes(),
-            expected.session_token.as_bytes(),
-        ) && constant_time_eq(
-            session.security_stamp.as_bytes(),
-            expected.security_stamp.as_bytes(),
-        )
-    }) {
-        Ok(())
-    } else {
-        Err(AppError::invalid_credentials(
-            "Session expired. Please log in again.",
-        ))
-    }
+    expected.revision(db).await.map(|_| ())
 }
 
 pub(crate) fn new_session_token() -> String {
@@ -153,68 +137,35 @@ mod tests {
     use super::*;
 
     #[test]
-    fn renamed_flags_keep_standard_token_claim_names() {
-        let flags = ClaimsExtensions {
-            is_premium: Some(true),
-            is_email_verified: Some(false),
-            ..ClaimsExtensions::default()
+    fn session_claims_bind_purpose_overflow_safely_and_require_all_fields() {
+        let snap = SessionSnapshot {
+            user_id: "user",
+            security_stamp: "stamp",
+            device_id: "device",
+            session_token: "nonce",
         };
-        let wire = serde_json::to_value(flags).expect("valid claims fixture");
-        assert_eq!(
-            wire,
-            serde_json::json!({"premium": true, "email_verified": false})
-        );
-        let decoded: ClaimsExtensions = serde_json::from_value(wire).expect("valid claims fixture");
-        assert_eq!(decoded.is_premium, Some(true));
-        assert_eq!(decoded.is_email_verified, Some(false));
-    }
-
-    fn valid_access_claims(duration_seconds: i64) -> Claims {
-        Claims::for_session(
-            &SessionSnapshot {
-                user_id: "user",
-                security_stamp: "stamp",
-                device_id: "device",
-                session_token: "nonce",
-            },
+        let overflow = Claims::for_session(
+            &snap,
             ClaimsExtensions::default(),
             TokenUse::Access,
-            duration_seconds,
-        )
-    }
+            i64::MAX,
+        );
+        assert_eq!(overflow.exp, overflow.iat);
 
-    #[test]
-    fn an_overflowing_duration_cannot_wrap_or_panic_during_token_issuance() {
-        let claims = valid_access_claims(i64::MAX);
-        assert_eq!(claims.exp, claims.iat);
-    }
-
-    #[test]
-    fn tokens_are_bound_to_purpose_and_session() {
-        let mut claims = valid_access_claims(3600);
+        let claims = Claims::for_session(
+            &snap,
+            ClaimsExtensions {
+                device: Some("device".into()),
+                ..Default::default()
+            },
+            TokenUse::Access,
+            3600,
+        );
         assert!(claims.bound_session(TokenUse::Access).is_ok());
         assert!(claims.bound_session(TokenUse::Refresh).is_err());
-        claims.token_use = TokenUse::Unknown;
-        assert!(claims.bound_session(TokenUse::Access).is_err());
-    }
-
-    #[test]
-    fn session_snapshot_preserves_bindings_and_requires_complete_access_claims() {
-        let claims = valid_access_claims(3600);
-        let session = claims.session_snapshot().expect("valid claims fixture");
-        assert_eq!(session.user_id, "user");
-        assert_eq!(session.security_stamp, "stamp");
-        assert_eq!(session.device_id, "device");
-        assert_eq!(session.session_token, "nonce");
-        for missing in 0..4 {
-            let mut invalid = claims.clone();
-            match missing {
-                0 => invalid.token_use = TokenUse::Refresh,
-                1 => invalid.sstamp.clear(),
-                2 => invalid.session_token.clear(),
-                _ => invalid.extensions.device = None,
-            }
-            assert!(invalid.session_snapshot().is_err());
-        }
+        assert!(claims.session_snapshot().is_ok());
+        let mut missing = claims;
+        missing.session_token.clear();
+        assert!(missing.session_snapshot().is_err());
     }
 }

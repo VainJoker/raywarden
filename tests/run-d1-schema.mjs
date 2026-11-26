@@ -1,6 +1,5 @@
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
-import { createHmac } from "node:crypto";
 import {
   copyFileSync,
   existsSync,
@@ -16,7 +15,7 @@ import { join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 import { parseJsonc } from "../scripts/deploy.mjs";
-import { expectStatus } from "./runtime-tools.mjs";
+import { expectJson, expectStatus, signJwt, wrapFixtureJwtKeys } from "./runtime-tools.mjs";
 
 const root = fileURLToPath(new URL("../", import.meta.url));
 const entry = resolve(root, "build/index.js");
@@ -66,6 +65,10 @@ async function history(db) {
 
 async function seedFixture({ DB, ATTACHMENTS_BUCKET }) {
   assert.deepEqual(await history(DB), migrations);
+  const keys = await wrapFixtureJwtKeys({
+    access_secret: accessSecret,
+    refresh_secret: "fixture-schema-refresh-secret",
+  }, local.vars.KEY_ENCRYPTION_KEY);
   await DB.batch([
     DB.prepare(`INSERT INTO users (id,email,master_password_hash,key,private_key,public_key,security_stamp,created_at,updated_at)
       VALUES('fixture-user','owner@example.test','hash','2.key','2.private','public','stamp','2026-01-01','2026-01-01')`),
@@ -75,18 +78,11 @@ async function seedFixture({ DB, ATTACHMENTS_BUCKET }) {
       VALUES('fixture-cipher','fixture-user',1,'{}','2026-01-01','2026-01-01')`),
     DB.prepare(`INSERT INTO attachments (id,cipher_id,file_name,file_size_bytes,encrypted_key,storage_key,created_at,updated_at)
       VALUES('fixture-attachment','fixture-cipher','opaque-name',?1,'opaque-key',?2,'2026-01-01','2026-01-01')`).bind(oldBytes.length, oldKey),
-    DB.prepare("INSERT INTO jwt_keys(id,access_secret,refresh_secret) VALUES('global',?1,'fixture-schema-refresh-secret')").bind(accessSecret),
+    DB.prepare("INSERT INTO jwt_keys(id,access_secret,refresh_secret) VALUES('global',?1,?2)").bind(
+      keys.access_secret, keys.refresh_secret,
+    ),
   ]);
   await ATTACHMENTS_BUCKET.put(oldKey, oldBytes);
-}
-
-function bearer() {
-  const now = Math.floor(Date.now() / 1000);
-  const json = value => Buffer.from(JSON.stringify(value)).toString("base64url");
-  const header = json({ alg: "HS256", typ: "JWT" });
-  const claims = json({ sub: "fixture-user", iat: now, nbf: now, exp: now + 300, sstamp: "stamp", session_token: "session", token_use: "access", device: "fixture-device" });
-  const signature = createHmac("sha256", accessSecret).update(`${header}.${claims}`).digest("base64url");
-  return `Bearer ${header}.${claims}.${signature}`;
 }
 
 async function verifyWorker(worker) {
@@ -96,32 +92,26 @@ async function verifyWorker(worker) {
   assert.equal(alive.headers.get("X-Raywarden-Release-Id"), releaseId);
 
   const path = "/api/ciphers/fixture-cipher/attachment/fixture-attachment";
-  const headers = { Authorization: bearer() };
+  const proof = await signJwt({
+    sub: "fixture-user", sstamp: "stamp", session_token: "session", token_use: "access", device: "fixture-device",
+  }, accessSecret);
+  const headers = { Authorization: `Bearer ${proof}` };
   const download = async expected => {
-    const metadata = await worker.fetch(path, { headers });
-    await expectStatus(metadata, 200, "attachment metadata");
-    const target = new URL((await metadata.json()).url);
+    const metadata = await expectJson(await worker.fetch(path, { headers }), 200, "attachment metadata");
+    const target = new URL(metadata.url);
     const response = await worker.fetch(target.pathname + target.search);
     await expectStatus(response, 200, "attachment download");
     assert.equal(await response.text(), expected);
   };
   await download(oldBytes);
-  const boundary = "raywarden-schema-attachment";
-  const body = [
-    `--${boundary}`,
-    'Content-Disposition: form-data; name="key"',
-    "",
-    "replacement-opaque-key",
-    `--${boundary}`,
-    'Content-Disposition: form-data; name="data"; filename="encrypted.bin"',
-    "Content-Type: application/octet-stream",
-    "",
-    newBytes,
-    `--${boundary}--`,
-    "",
-  ].join("\r\n");
+  const body = new FormData();
+  body.append("key", "replacement-opaque-key");
+  body.append("data", new Blob([newBytes]), "encrypted.bin");
+  // Wrangler uses a separate Request implementation for its test client.
+  const multipart = new Response(body);
   const updated = await worker.fetch(path, {
-    method: "POST", headers: { ...headers, "Content-Type": `multipart/form-data; boundary=${boundary}` }, body,
+    method: "POST", headers: { ...headers, "Content-Type": multipart.headers.get("Content-Type") },
+    body: await multipart.arrayBuffer(),
   });
   await expectStatus(updated, 200, "attachment replacement");
   await updated.text();

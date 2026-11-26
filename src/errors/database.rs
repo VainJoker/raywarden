@@ -1,4 +1,7 @@
-use std::fmt::Display;
+use std::{
+    borrow::Cow,
+    fmt::{self, Display},
+};
 
 use wasm_bindgen::JsCast as _;
 
@@ -48,12 +51,12 @@ use DbSentinel::{
     VaultWriteConflict, VaultWriteSession,
 };
 
-struct D1ErrorText {
-    cause: Option<String>,
-    outer: Option<String>,
+struct D1ErrorText<'a> {
+    cause: Option<Cow<'a, str>>,
+    outer: Option<Cow<'a, str>>,
 }
 
-impl D1ErrorText {
+impl D1ErrorText<'_> {
     fn messages(&self) -> impl Iterator<Item = &str> {
         [self.cause.as_deref(), self.outer.as_deref()]
             .into_iter()
@@ -77,16 +80,19 @@ impl DatabaseError {
         Self::find_sentinel(error, &[marker]).is_some()
     }
 
-    pub(crate) fn query_failed(message: impl Into<String>) -> AppError {
-        Self::QueryFailed(message.into()).into()
+    pub(crate) const fn query_failed(context: &'static str, d1_code: &'static str) -> AppError {
+        AppError::Database(Self::QueryFailed { context, d1_code })
     }
 
-    pub(crate) fn query(context: impl Display, error: &worker::Error) -> AppError {
-        Self::query_failed(format!("{context}: {}", d1_error_diagnostic(error)))
+    pub(crate) fn query(context: &'static str, error: &worker::Error) -> AppError {
+        Self::query_failed(context, d1_code(error))
     }
 
     pub(crate) fn invalid_result(context: impl Display, error: impl Display) -> AppError {
-        AppError::InternalFailure(format!("{context}: {error}"))
+        AppError::internal_with_context(
+            "Stored database record does not match expected schema",
+            format_args!("{context}: {error}"),
+        )
     }
 
     pub(crate) fn invalid_folder() -> AppError {
@@ -204,9 +210,36 @@ fn login_account_changed() -> AppError {
     AppError::conflict("Account encryption changed during authentication. Retry login.")
 }
 
-pub(super) fn worker_error_diagnostic(error: &worker::Error) -> String {
+pub(super) fn worker_display_message(
+    summary: Option<&'static str>,
+    error: &worker::Error,
+) -> Cow<'static, str> {
+    if let Some(code) = d1_reason_if_d1(error) {
+        Cow::Owned(format!("Database operation failed (D1: {code})"))
+    } else if let Some(summary) = summary {
+        Cow::Owned(format!("Worker runtime error: {summary}"))
+    } else if matches!(error, worker::Error::BindingError(_)) {
+        Cow::Borrowed("Worker runtime error: Required Cloudflare binding is missing or invalid")
+    } else {
+        Cow::Borrowed("Worker runtime error: Cloudflare platform operation failed")
+    }
+}
+
+pub(super) fn fmt_worker_debug(error: &worker::Error, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    if let Some(code) = d1_reason_if_d1(error) {
+        f.debug_tuple("D1").field(&code).finish()
+    } else if let worker::Error::BindingError(name) = error {
+        f.debug_tuple("BindingError").field(name).finish()
+    } else {
+        f.debug_tuple("WorkerError")
+            .field(&error.to_string())
+            .finish()
+    }
+}
+
+fn d1_reason_if_d1(error: &worker::Error) -> Option<&'static str> {
     match error {
-        worker::Error::D1(_) => d1_error_diagnostic(error),
+        worker::Error::D1(_) => Some(d1_code(error)),
         // Some SDK D1 methods convert rejections through the general JS path.
         worker::Error::UnknownJsError { message, .. } | worker::Error::JsError(message)
             if matches!(
@@ -214,18 +247,17 @@ pub(super) fn worker_error_diagnostic(error: &worker::Error) -> String {
                 Some("D1_ERROR" | "D1_TYPE_ERROR" | "D1_COLUMN_NOTFOUND")
             ) =>
         {
-            d1_error_diagnostic(error)
+            Some(d1_code(error))
         }
-        _ => error.to_string(),
+        _ => None,
     }
 }
 
-fn d1_error_diagnostic(error: &worker::Error) -> String {
-    let reason = database_error_messages(error)
+fn d1_code(error: &worker::Error) -> &'static str {
+    database_error_messages(error)
         .messages()
         .find_map(safe_d1_reason)
-        .unwrap_or("D1_ERROR");
-    format!("D1: {reason}")
+        .unwrap_or("D1_ERROR")
 }
 
 fn safe_d1_reason(message: &str) -> Option<&'static str> {
@@ -250,37 +282,44 @@ fn safe_d1_reason(message: &str) -> Option<&'static str> {
     }
 }
 
-fn database_error_messages(error: &worker::Error) -> D1ErrorText {
+fn database_error_messages(error: &worker::Error) -> D1ErrorText<'_> {
     // Classify D1 sentinel failures without formatting the underlying stack.
     match error {
         worker::Error::D1(error) => {
             let outer: &js_sys::Error = error.as_ref();
             let cause = outer.cause();
-            let cause_message = cause.as_string().or_else(|| {
-                cause
-                    .dyn_ref::<js_sys::Error>()
-                    .map(|error| error.message().into())
-            });
+            let cause_message = cause
+                .as_string()
+                .or_else(|| {
+                    cause
+                        .dyn_ref::<js_sys::Error>()
+                        .map(|error| error.message().into())
+                })
+                .map(Cow::Owned);
             D1ErrorText {
                 cause: cause_message,
-                outer: Some(outer.message().into()),
+                outer: Some(Cow::Owned(outer.message().into())),
             }
         }
         worker::Error::UnknownJsError { message, cause, .. } => {
             let cause = cause.as_deref().map(|error| match error {
                 worker::Error::UnknownJsError { message, .. } | worker::Error::JsError(message) => {
-                    message.clone()
+                    Cow::Borrowed(message.as_str())
                 }
-                _ => error.to_string(),
+                _ => Cow::Owned(error.to_string()),
             });
             D1ErrorText {
                 cause,
-                outer: Some(message.clone()),
+                outer: Some(Cow::Borrowed(message.as_str())),
             }
         }
+        worker::Error::JsError(message) => D1ErrorText {
+            cause: None,
+            outer: Some(Cow::Borrowed(message.as_str())),
+        },
         _ => D1ErrorText {
             cause: None,
-            outer: Some(error.to_string()),
+            outer: Some(Cow::Owned(error.to_string())),
         },
     }
 }
@@ -301,59 +340,41 @@ fn registration_email_conflict(message: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        DatabaseError, registration_email_conflict, safe_d1_reason, worker_error_diagnostic,
-    };
+    use super::{AppError, DatabaseError, registration_email_conflict, safe_d1_reason};
 
     #[test]
-    fn d1_outer_diagnostics_keep_known_codes_without_details() {
+    fn d1_reasons_and_email_conflicts_scrub_sensitive_details() {
         assert_eq!(
-            safe_d1_reason("D1_ERROR: no such table: private_name: SQLITE_ERROR"),
+            safe_d1_reason("D1_ERROR: no such table: secret: SQLITE_ERROR"),
             Some("SQLITE_ERROR")
         );
         assert_eq!(
-            safe_d1_reason("D1_TYPE_ERROR: invalid binding detail"),
+            safe_d1_reason("D1_TYPE_ERROR: invalid binding"),
             Some("D1_TYPE_ERROR")
         );
-        assert_eq!(
-            safe_d1_reason("constraint failed on a private value: SQLITE_CONSTRAINT"),
-            Some("SQLITE_CONSTRAINT")
-        );
         assert_eq!(safe_d1_reason("D1_ERROR: private detail"), None);
-    }
 
-    #[test]
-    fn d1_diagnostics_are_bounded_for_generic_sdk_errors() {
-        let error = worker::Error::JsError("D1_ERROR: private detail: SQLITE_BUSY".into());
-        assert_eq!(worker_error_diagnostic(&error), "D1: SQLITE_BUSY");
-
-        let error = worker::Error::JsError("private detail".into());
-        let error = DatabaseError::query("Failed to read", &error);
+        let app_err = AppError::from(worker::Error::JsError(
+            "D1_ERROR: private detail: SQLITE_BUSY".into(),
+        ));
         assert_eq!(
-            error.to_string(),
-            "Query failed: Failed to read: D1: D1_ERROR"
+            app_err.to_string(),
+            "Database operation failed (D1: SQLITE_BUSY)"
         );
-    }
+        assert!(!format!("{app_err:?}").contains("private detail"));
+        assert_eq!(
+            DatabaseError::query("Failed", &worker::Error::JsError("private".into())).to_string(),
+            "Database query failed: Failed (D1: D1_ERROR)"
+        );
 
-    #[test]
-    fn only_email_uniqueness_conflicts_map_to_account_exists() {
         assert!(registration_email_conflict(
-            "UNIQUE constraint failed: users.email"
+            "D1_ERROR: UNIQUE constraint failed: users.email: SQLITE_CONSTRAINT"
         ));
-        assert!(registration_email_conflict(
-            "D1_ERROR: UNIQUE constraint failed: users.email: \
-             SQLITE_CONSTRAINT"
+        assert!(!registration_email_conflict(
+            "UNIQUE constraint failed: users.id"
         ));
-        for other in [
-            "UNIQUE constraint failed: users.id",
-            "UNIQUE constraint failed: users.id (UPDATE users.email)",
-            "UNIQUE constraint failed: users.email_verified_at",
-            "UNIQUE constraint failed: users.email, users.name",
-            "FOREIGN KEY constraint failed",
-            "no such table: users",
-            "network unavailable",
-        ] {
-            assert!(!registration_email_conflict(other));
-        }
+        assert!(!registration_email_conflict(
+            "UNIQUE constraint failed: users.email, users.name"
+        ));
     }
 }

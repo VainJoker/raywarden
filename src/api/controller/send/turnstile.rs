@@ -2,7 +2,7 @@
 use std::sync::Arc;
 
 use axum::{
-    extract::{Query, State},
+    extract::State,
     http::{HeaderMap, HeaderValue, header},
     response::{IntoResponse, Response},
 };
@@ -12,6 +12,7 @@ use crate::{
     api::{
         AppState,
         common::{
+            extract::Query,
             json::Json,
             response::{ApiResponse, NoStore, WithCookies},
         },
@@ -69,21 +70,23 @@ pub(in crate::api) async fn verify_send(
     headers: HeaderMap,
     Json(payload): Json<VerifyTurnstileRequest>,
 ) -> AppResult<Response> {
-    let verifier = turnstile::TurnstileVerifier {
-        db: state.database(),
-        env: &state.env,
-        domain: state.domain(),
-        access_secret: &state.jwt_keys.access_secret,
-    };
-    let token = verifier
-        .issue_send_access(&headers, &payload.token, &payload.send_id)
-        .await?;
+    let token = turnstile::issue_send_access(
+        state.database(),
+        &state.env,
+        state.domain(),
+        &state.jwt_keys.access_secret,
+        &headers,
+        &payload.token,
+        &payload.send_id,
+    )
+    .await?;
     let cookie = format!(
         "cf_send_pass={token}; Path=/; HttpOnly; Secure; SameSite=Lax; \
          Max-Age=300"
     );
     let cookies = vec![
-        HeaderValue::from_str(&cookie).map_err(AppError::internal_error)?,
+        HeaderValue::from_str(&cookie)
+            .map_err(|error| AppError::internal_debug("Failed to build Send pass cookie", error))?,
         HeaderValue::from_static("cf_send_pass_ok=1; Path=/; Secure; SameSite=Lax; Max-Age=300"),
     ];
     Ok(NoStore::private(WithCookies {

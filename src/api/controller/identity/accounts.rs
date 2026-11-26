@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use axum::{
-    extract::{Query, State},
+    extract::State,
     http::{HeaderMap, HeaderValue},
     response::{IntoResponse as _, Response},
 };
@@ -13,13 +13,13 @@ use crate::{
     api::{
         AppState,
         common::{
-            extract::ClientIp,
+            extract::{ClientIp, Query},
             json::Json,
             response::{ApiResponse, EmptyListResponse, EmptyObject, NoStore, WithCookies},
         },
     },
     errors::{AppError, AppResult, AuthError},
-    models::{identity::user::UserRow, usage},
+    models::identity::user::UserRow,
     service::{
         identity::{
             kdf::{ValidatedKdfParams, unknown_email_kdf, validate_stored_kdf},
@@ -27,10 +27,9 @@ use crate::{
             setup,
             two_factor::is_two_factor_enabled,
             user::{
-                AccountCredentials, AccountLookup, AccountVerificationRequest, ChangeKdfRequest,
+                AccountCredentials, AccountVerificationRequest, ChangeKdfRequest,
                 ChangePasswordRequest, KdfParams, PreloginResponse, ProfileResponse,
-                RegisterRequest, SetPasswordRequest, UpdateAvatarColorRequest,
-                UpdateProfileRequest,
+                RegisterRequest, UpdateAvatarColorRequest, UpdateProfileRequest,
             },
         },
         notifications::{self, UpdateType, admin as admin_notify, admin::Event},
@@ -107,12 +106,7 @@ pub(in crate::api) async fn register(
     )
     .await?;
 
-    let kdf = KdfParams::from(ValidatedKdfParams::try_from(KdfParams {
-        kdf_type: payload.kdf,
-        iterations: payload.kdf_iterations,
-        memory: payload.kdf_memory,
-        parallelism: payload.kdf_parallelism,
-    })?);
+    let kdf = KdfParams::from(ValidatedKdfParams::try_from(payload.kdf)?);
     let password =
         crate::service::identity::user::new_stored_password(&payload.master_password_hash).await?;
     let now = crate::utils::time::now_rfc3339();
@@ -151,7 +145,7 @@ pub(in crate::api) async fn register(
     };
 
     let clear_cookie = HeaderValue::from_str(&setup::clear_cookie(state.domain()))
-        .map_err(AppError::internal_error)?;
+        .map_err(|error| AppError::internal_debug("Failed to build setup clear cookie", error))?;
     UserRow::insert(state.database(), &user, verification.as_ref()).await?;
     Ok(WithCookies {
         response: NoStore(ApiResponse(EmptyObject {})),
@@ -199,12 +193,7 @@ pub(in crate::api) async fn verify_password(
         || AppError::Auth(AuthError::UserNotFound),
     )
     .await?;
-    if !crate::service::identity::user::verify_master_password(&user, &hash)
-        .await?
-        .is_valid()
-    {
-        return Err(AuthError::InvalidPassword.into());
-    }
+    crate::service::identity::user::require_master_password(&user, &hash).await?;
     Ok(ApiResponse(MasterPasswordPolicyResponse {
         object: "masterPasswordPolicy",
     }))
@@ -339,32 +328,6 @@ pub(in crate::api) async fn delete_account(
     Ok(ApiResponse(EmptyObject {}))
 }
 
-#[derive(Serialize)]
-pub(in crate::api) struct SetPasswordResponse {
-    object: &'static str,
-}
-
-/// Set the first password on an already authenticated, empty V1 account.
-#[worker::send]
-pub(in crate::api) async fn set_password(
-    claims: Claims,
-    State(state): State<Arc<AppState>>,
-    Json(payload): Json<SetPasswordRequest>,
-) -> AppResult<ApiResponse<SetPasswordResponse>> {
-    AccountCredentials::load(
-        state.database(),
-        &state.env,
-        &claims,
-        AccountLookup::PasswordInitialization,
-    )
-    .await?
-    .initialize(payload)
-    .await?;
-    Ok(ApiResponse(SetPasswordResponse {
-        object: "set-password",
-    }))
-}
-
 /// POST /accounts/password - Change master password
 #[worker::send]
 pub(in crate::api) async fn change_password(
@@ -376,13 +339,11 @@ pub(in crate::api) async fn change_password(
         state.database(),
         &state.env,
         &claims,
-        AccountLookup::PasswordChange,
+        "Failed to fetch user for password change",
     )
     .await?
     .change_password(payload)
     .await?;
-    notifications::publish_account_logout(&state.env, &claims, &crate::utils::time::now_rfc3339())
-        .await;
     Ok(ApiResponse(EmptyObject {}))
 }
 
@@ -400,13 +361,11 @@ pub(in crate::api) async fn change_kdf(
         state.database(),
         &state.env,
         &claims,
-        AccountLookup::KdfChange,
+        "Failed to fetch user for KDF change",
     )
     .await?
     .change_kdf(payload)
     .await?;
-    notifications::publish_account_logout(&state.env, &claims, &crate::utils::time::now_rfc3339())
-        .await;
     Ok(ApiResponse(EmptyObject {}))
 }
 
@@ -420,7 +379,7 @@ pub(in crate::api) struct HibpBreachQuery {
 pub(in crate::api) async fn hibp_breach(
     claims: crate::service::identity::session::Claims,
     State(state): State<Arc<AppState>>,
-    axum::extract::Query(query): axum::extract::Query<HibpBreachQuery>,
+    Query(query): Query<HibpBreachQuery>,
 ) -> AppResult<ApiResponse<Value>> {
     crate::service::rate_limit::check_auth_attempt(&state.env, format!("hibp:{}", claims.sub))
         .await?;
@@ -431,9 +390,9 @@ pub(in crate::api) async fn hibp_breach(
 
 async fn hibp_breaches(secret: &str, username: &str) -> AppResult<Value> {
     let mut url = url::Url::parse("https://haveibeenpwned.com/api/v3/breachedaccount/")
-        .map_err(AppError::internal_error)?;
+        .map_err(|error| AppError::internal_debug("Invalid HIBP base URL", error))?;
     url.path_segments_mut()
-        .map_err(AppError::internal_error)?
+        .map_err(|()| AppError::internal("Invalid HIBP URL path segments"))?
         .push(username);
     url.set_query(Some("truncateResponse=false&includeUnverified=false"));
     let mut request = worker::Request::new(url.as_str(), worker::Method::Get)?;
@@ -447,96 +406,4 @@ async fn hibp_breaches(secret: &str, username: &str) -> AppResult<Value> {
         return Err(AppError::bad_request("HIBP service is unavailable"));
     }
     Ok(response.json().await?)
-}
-
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub(in crate::api) struct UsageQuery {
-    user_id: Option<String>,
-}
-
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-pub(in crate::api) struct UsageResponse {
-    object: &'static str,
-    user_id: String,
-    total_bytes: i64,
-    d1_bytes: i64,
-    r2_bytes: i64,
-    max_bytes: i64,
-    total_percent: f64,
-    remaining_bytes: i64,
-    remaining_percent: f64,
-    send_files_bytes: i64,
-    quota_is_estimate: bool,
-    quota_source: &'static str,
-    file_bytes: i64,
-    is_estimate: bool,
-    items: Vec<UsageItem>,
-}
-
-#[derive(Serialize)]
-struct UsageItem {
-    key: usage::UsageCategory,
-    name: usage::UsageCategory,
-    bytes: i64,
-    storage: &'static str,
-}
-
-#[worker::send]
-pub(in crate::api) async fn usage(
-    claims: Claims,
-    State(state): State<Arc<AppState>>,
-    Query(query): Query<UsageQuery>,
-) -> AppResult<ApiResponse<UsageResponse>> {
-    if query.user_id.as_deref().is_some_and(|id| id != claims.sub) {
-        return Err(AppError::Unauthorized {
-            message: "Cannot inspect another account".into(),
-        });
-    }
-    let mut rows = usage::for_user(state.database(), &claims.sub).await?;
-    let mut total = 0i64;
-    let mut files = 0i64;
-    let mut send_files = 0i64;
-    for row in &rows {
-        if row.name.is_file() {
-            files += row.bytes;
-            if row.name == usage::UsageCategory::SendFiles {
-                send_files = row.bytes;
-            }
-        } else {
-            total += row.bytes;
-        }
-    }
-    rows.sort_by_key(|row| std::cmp::Reverse(row.bytes));
-    let items = rows
-        .into_iter()
-        .map(|row| UsageItem {
-            key: row.name,
-            bytes: row.bytes,
-            storage: if row.name.is_file() { "r2" } else { "d1" },
-            name: row.name,
-        })
-        .collect();
-    // Reference UI budget, never an assertion about this account's plan or an
-    // enforcement limit. Row sizes and referenced files are logical estimates.
-    let budget = 500 * 1024 * 1024_i64;
-    let remaining = (budget - total).max(0);
-    Ok(ApiResponse(UsageResponse {
-        object: "d1-usage",
-        user_id: claims.sub,
-        total_bytes: total + files,
-        d1_bytes: total,
-        r2_bytes: files,
-        max_bytes: budget,
-        total_percent: total as f64 * 100.0 / budget as f64,
-        remaining_bytes: remaining,
-        remaining_percent: remaining as f64 * 100.0 / budget as f64,
-        send_files_bytes: send_files,
-        quota_is_estimate: true,
-        quota_source: "reference-budget",
-        file_bytes: files,
-        is_estimate: true,
-        items,
-    }))
 }

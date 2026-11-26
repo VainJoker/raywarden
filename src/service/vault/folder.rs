@@ -5,7 +5,7 @@ use worker::{D1Database, Env};
 
 use crate::{
     errors::AppResult,
-    models::vault::folder::FolderRow,
+    models::{page::Page, vault::folder::FolderRow},
     service::{identity::session::Claims, notifications::UpdateType, vault_write::VaultWrite},
 };
 
@@ -39,81 +39,62 @@ pub(crate) async fn visit_folder_responses(
     user_id: &str,
     mut visit: impl FnMut(FolderResponse) -> AppResult<()>,
 ) -> AppResult<()> {
-    let mut after = None;
-    loop {
-        let page = FolderRow::list_page(db, user_id, after.as_ref()).await?;
-        for row in page.rows {
-            visit(row.into())?;
-        }
-        let Some(next) = page.next else { return Ok(()) };
-        after = Some(next);
-    }
+    Page::visit(
+        async |after| FolderRow::list_page(db, user_id, after).await,
+        async |rows| rows.into_iter().try_for_each(|row| visit(row.into())),
+    )
+    .await
 }
 
-pub async fn create_folder(
-    db: &D1Database,
-    env: &Env,
-    claims: &Claims,
-    payload: CreateFolderRequest,
-) -> AppResult<FolderResponse> {
+pub async fn delete_folder(db: &D1Database, env: &Env, claims: &Claims, id: &str) -> AppResult<()> {
     let mut mutation = VaultWrite::new(db, env, claims);
-    mutation.guard_account_key().await?;
-    let now = crate::utils::time::now_rfc3339();
-    let folder = FolderRow {
-        id: Uuid::new_v4().to_string(),
-        user_id: mutation.user_id().to_owned(),
-        name: payload.name,
-        created_at: now.clone(),
-        updated_at: now,
-    };
-    let write = folder.insert_statement(db)?;
-    let committed = mutation.commit(vec![write]).await?;
-    committed
-        .publish_folder(UpdateType::SyncFolderCreate, &folder.id)
-        .await;
-    Ok(folder.into())
-}
-
-pub async fn delete_folder(
-    db: &D1Database,
-    env: &Env,
-    claims: &Claims,
-    id: String,
-) -> AppResult<()> {
-    let mut mutation = VaultWrite::new(db, env, claims);
-    let old = FolderRow::fetch_for_user(db, &id, mutation.user_id()).await?;
-    let write = FolderRow::delete_statement(db, &id, mutation.user_id())?;
+    let old = FolderRow::fetch_for_user(db, id, mutation.user_id()).await?;
+    let write = FolderRow::delete_statement(db, id, mutation.user_id())?;
     mutation.add_guard(old.snapshot_guard(db)?);
     let committed = mutation.commit(vec![write]).await?;
     committed
-        .publish_folder(UpdateType::SyncFolderDelete, &id)
+        .publish_folder(UpdateType::SyncFolderDelete, id)
         .await;
     Ok(())
 }
 
-pub async fn update_folder(
+pub(crate) async fn save_folder(
     db: &D1Database,
     env: &Env,
     claims: &Claims,
-    id: String,
+    id: Option<String>,
     payload: CreateFolderRequest,
 ) -> AppResult<FolderResponse> {
     let mut mutation = VaultWrite::new(db, env, claims);
     mutation.guard_account_key().await?;
-    let old = FolderRow::fetch_for_user(db, &id, mutation.user_id()).await?;
-    mutation.add_guard(old.snapshot_guard(db)?);
-    let now = crate::utils::time::now_rfc3339();
-    let folder = FolderRow {
-        id,
-        user_id: mutation.user_id().to_owned(),
-        name: payload.name,
-        created_at: old.created_at,
-        updated_at: now,
+    let existing = if let Some(id) = id {
+        let folder = FolderRow::fetch_for_user(db, &id, mutation.user_id()).await?;
+        mutation.add_guard(folder.snapshot_guard(db)?);
+        Some(folder)
+    } else {
+        None
     };
-    let write = folder.update_statement(db)?;
-    let committed = mutation.commit(vec![write]).await?;
-    committed
-        .publish_folder(UpdateType::SyncFolderUpdate, &folder.id)
+    let now = crate::utils::time::now_rfc3339();
+    let (folder, write, update) = if let Some(mut folder) = existing {
+        folder.name = payload.name;
+        folder.updated_at = now;
+        let write = folder.update_statement(db)?;
+        (folder, write, UpdateType::SyncFolderUpdate)
+    } else {
+        let folder = FolderRow {
+            id: Uuid::new_v4().to_string(),
+            user_id: mutation.user_id().to_owned(),
+            name: payload.name,
+            created_at: now.clone(),
+            updated_at: now,
+        };
+        let write = folder.insert_statement(db)?;
+        (folder, write, UpdateType::SyncFolderCreate)
+    };
+    mutation
+        .commit(vec![write])
+        .await?
+        .publish_folder(update, &folder.id)
         .await;
     Ok(folder.into())
 }

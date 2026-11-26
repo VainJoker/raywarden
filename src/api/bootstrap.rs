@@ -1,7 +1,10 @@
 //! Assemble the application stack shared by the Worker and `heavydo`.
 use std::sync::Arc;
 
-use axum::response::{IntoResponse as _, Response};
+use axum::{
+    http::Method,
+    response::{IntoResponse as _, Response},
+};
 use tower_service::Service as _;
 use worker::{Env, HttpRequest};
 
@@ -14,7 +17,7 @@ use super::{
     routers,
 };
 use crate::{
-    errors::{AppError, AppResult},
+    errors::{AppError, AppResult, extract_ray_id_from_headers, finalize_error_response},
     infra::{config::Config, db},
     service::identity::jwt_keys,
 };
@@ -24,7 +27,9 @@ pub(crate) async fn handle_request(
     env: Env,
     cors: &CorsPolicy,
 ) -> AppResult<Response> {
+    let head = request.method() == Method::HEAD;
     let path = request.uri().path().to_owned();
+    let ray_id = extract_ray_id_from_headers(request.headers());
     let router = if let Some(public) = routers::public_router(&path) {
         public.with_state(env)
     } else {
@@ -43,6 +48,7 @@ pub(crate) async fn handle_request(
         Ok(response) => response,
         Err(infallible) => match infallible {},
     };
+    finalize_error_response(&mut response, ray_id.as_deref(), head);
     headers::apply_http(&path, &mut response);
     Ok(response)
 }
@@ -51,7 +57,11 @@ pub(crate) async fn handle_request(
 pub(super) fn worker_error_response(
     error: AppError,
     cors: &CorsContext,
+    ray_id: Option<&str>,
+    head: bool,
 ) -> worker::Result<worker::Response> {
-    let response = error.into_response().try_into()?;
+    let mut response = error.into_response();
+    finalize_error_response(&mut response, ray_id, head);
+    let response = response.try_into()?;
     Ok(cors.apply(response)?)
 }

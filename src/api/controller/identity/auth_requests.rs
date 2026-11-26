@@ -1,16 +1,16 @@
 use std::sync::Arc;
 
-use axum::extract::{Path, Query, State};
-use serde::{Deserialize, Serialize};
+use axum::extract::State;
+use serde::Deserialize;
 use worker::D1Database;
 
 use crate::{
     api::{
         AppState,
         common::{
-            extract::{ClientIp, DeviceTypeHeader},
+            extract::{ClientIp, DeviceTypeHeader, Path, Query},
             json::Json,
-            response::ApiResponse,
+            response::{ApiResponse, ListResponse},
         },
     },
     errors::{AppError, AppResult},
@@ -49,14 +49,6 @@ pub(in crate::api) struct UpdateAuthRequest {
 #[derive(Deserialize)]
 pub(in crate::api) struct AuthRequestResponseQuery {
     code: String,
-}
-
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-pub(in crate::api) struct AuthRequestListResponse {
-    data: Vec<AuthRequestResponse>,
-    continuation_token: Option<String>,
-    object: &'static str,
 }
 
 async fn load_owned_active_request(
@@ -146,17 +138,13 @@ pub(in crate::api) async fn create_auth_request(
 pub(in crate::api) async fn list_pending_auth_requests(
     claims: Claims,
     State(state): State<Arc<AppState>>,
-) -> AppResult<ApiResponse<AuthRequestListResponse>> {
+) -> AppResult<ApiResponse<ListResponse<AuthRequestResponse>>> {
     let requests = AuthRequestRow::list_pending_for_user(state.database(), &claims.sub).await?;
     let data = requests
         .into_iter()
         .map(|request| AuthRequestResponse::new(request, state.domain()))
-        .collect();
-    Ok(ApiResponse(AuthRequestListResponse {
-        data,
-        continuation_token: None,
-        object: "list",
-    }))
+        .collect::<Vec<_>>();
+    Ok(ApiResponse(data.into()))
 }
 
 #[worker::send]

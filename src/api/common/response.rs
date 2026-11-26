@@ -1,21 +1,12 @@
 //! Shared API response wrappers and conversion to Worker responses.
+pub(in crate::api) use axum::Json as ApiResponse;
 use axum::{
-    Json,
     http::{HeaderValue, header},
     response::{IntoResponse, Response},
 };
 use serde::Serialize;
 
 use crate::errors::worker_failure;
-
-/// Serialize the response body as JSON using its public wire format.
-pub(in crate::api) struct ApiResponse<T>(pub T);
-
-impl<T: Serialize> IntoResponse for ApiResponse<T> {
-    fn into_response(self) -> Response {
-        Json(self.0).into_response()
-    }
-}
 
 pub(in crate::api) struct NoStore<R>(pub R);
 
@@ -55,19 +46,27 @@ pub(in crate::api) struct EmptyObject {}
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
-pub(in crate::api) struct EmptyListResponse {
-    data: [(); 0],
+pub(in crate::api) struct ListResponse<T> {
+    data: Vec<T>,
     object: &'static str,
     continuation_token: (),
 }
 
-impl EmptyListResponse {
-    pub(in crate::api) const fn new() -> Self {
+impl<T> From<Vec<T>> for ListResponse<T> {
+    fn from(data: Vec<T>) -> Self {
         Self {
-            data: [],
+            data,
             object: "list",
             continuation_token: (),
         }
+    }
+}
+
+pub(in crate::api) type EmptyListResponse = ListResponse<()>;
+
+impl ListResponse<()> {
+    pub(in crate::api) fn new() -> Self {
+        Vec::new().into()
     }
 }
 
@@ -105,60 +104,29 @@ pub(crate) fn set_native_stream(response: &mut Response, stream: web_sys::Readab
 
 #[cfg(test)]
 mod tests {
-    use std::{
-        future::Future as _,
-        task::{Context, Poll, Waker},
-    };
-
     use axum::http::StatusCode;
-    use serde_json::{Value, json};
+    use futures_util::FutureExt as _;
 
     use super::*;
 
-    fn body(response: Response) -> (StatusCode, Vec<u8>) {
-        let status = response.status();
-        let mut body = std::pin::pin!(axum::body::to_bytes(response.into_body(), usize::MAX));
-        let Poll::Ready(bytes) = body.as_mut().poll(&mut Context::from_waker(Waker::noop())) else {
-            panic!("fixed JSON/string responses must be ready without I/O");
-        };
-        (status, bytes.expect("valid response fixture").to_vec())
-    }
-
     #[test]
-    fn typed_success_preserves_json_shape_and_status() {
-        let response = (StatusCode::CREATED, ApiResponse(EmptyListResponse::new())).into_response();
-        assert_eq!(
-            response.headers()[axum::http::header::CONTENT_TYPE],
-            "application/json"
-        );
-        let (status, bytes) = body(response);
-        assert_eq!(status, StatusCode::CREATED);
-        assert_eq!(
-            serde_json::from_slice::<Value>(&bytes).expect("valid response fixture"),
-            json!({"data":[],"object":"list","continuationToken":null})
-        );
-        assert_eq!(body(ApiResponse(()).into_response()).1, b"null");
-    }
-
-    #[test]
-    fn response_modifiers_compose_without_replacing_cookie_headers() {
-        let response = NoStore(WithCookies {
+    fn response_wrappers_preserve_json_status_and_multiple_cookies() {
+        let resp = NoStore(WithCookies {
             response: (
-                [(header::SET_COOKIE, "original=1")],
+                StatusCode::CREATED,
+                [(header::SET_COOKIE, "a=1")],
                 ApiResponse(EmptyObject {}),
             ),
-            cookies: vec![HeaderValue::from_static("added=2")],
+            cookies: vec![HeaderValue::from_static("b=2")],
         })
         .into_response();
-        assert_eq!(response.headers()[header::CACHE_CONTROL], "no-store");
-        assert_eq!(
-            response
-                .headers()
-                .get_all(header::SET_COOKIE)
-                .iter()
-                .count(),
-            2
-        );
-        assert_eq!(body(response).1, b"{}");
+        assert_eq!(resp.status(), StatusCode::CREATED);
+        assert_eq!(resp.headers()[header::CACHE_CONTROL], "no-store");
+        assert_eq!(resp.headers().get_all(header::SET_COOKIE).iter().count(), 2);
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .now_or_never()
+            .expect("ready")
+            .expect("body");
+        assert_eq!(&*bytes, b"{}");
     }
 }

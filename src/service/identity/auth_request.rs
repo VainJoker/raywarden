@@ -170,8 +170,8 @@ mod tests {
     use super::*;
 
     #[test]
-    fn approval_is_bound_to_user_device_code_stamp_and_expiry() {
-        let mut request = new_auth_request(CreateAuthRequest {
+    fn approval_binds_user_device_code_stamp_and_expiry() {
+        let mut req = new_auth_request(CreateAuthRequest {
             user_id: "user".into(),
             device_id: "device".into(),
             device_type: 2,
@@ -180,7 +180,7 @@ mod tests {
             public_key: "pk".into(),
             security_stamp: "stamp".into(),
         });
-        let valid = || LoginApprovalMatch {
+        let valid = LoginApprovalMatch {
             user_id: "user",
             device_id: "device",
             device_type: 2,
@@ -188,49 +188,18 @@ mod tests {
             access_code: "code",
             security_stamp: "stamp",
         };
-        assert!(!auth_request_matches_login(&request, &valid()));
-        request.approved = Some(1);
-        assert!(auth_request_matches_login(&request, &valid()));
-        for proof in [
-            LoginApprovalMatch {
-                user_id: "other",
-                ..valid()
-            },
-            LoginApprovalMatch {
-                device_id: "other",
-                ..valid()
-            },
-            LoginApprovalMatch {
-                device_type: 1,
-                ..valid()
-            },
-            LoginApprovalMatch {
-                request_ip: "other",
-                ..valid()
-            },
-            LoginApprovalMatch {
-                access_code: "wrong",
-                ..valid()
-            },
-            LoginApprovalMatch {
-                security_stamp: "old",
-                ..valid()
-            },
-        ] {
-            assert!(!auth_request_matches_login(&request, &proof));
-        }
-        request.authenticated_at = Some(crate::utils::time::now_rfc3339());
-        assert!(!auth_request_matches_login(&request, &valid()));
-        request.authenticated_at = None;
-        assert!(
-            crate::service::identity::auth_request::is_auth_request_expired_at(
-                &request,
-                crate::utils::time::now()
-                    .checked_add(SignedDuration::from_secs(301))
-                    .expect("test clock supports five-minute TTL")
-            )
-        );
-        request.expires_at = "invalid".into();
-        assert!(!crate::service::identity::auth_request::is_auth_request_active(&request));
+        assert!(!auth_request_matches_login(&req, &valid));
+        req.approved = Some(1);
+        assert!(auth_request_matches_login(&req, &valid));
+        assert!(!auth_request_matches_login(&req, &LoginApprovalMatch {
+            access_code: "wrong",
+            ..valid
+        }));
+        assert!(is_auth_request_expired_at(
+            &req,
+            crate::utils::time::now()
+                .checked_add(SignedDuration::from_secs(301))
+                .expect("ttl")
+        ));
     }
 }

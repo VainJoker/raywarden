@@ -8,41 +8,22 @@ import { promisify } from "node:util";
 
 export const PROJECT_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const DATABASE_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+const DNS_LABEL = /^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/i;
 
 // Wrangler's JSONC subset: comments and trailing commas. Scan outside JSON
 // strings so URLs, escaped quotes and comment-like text retain their contents.
 export function parseJsonc(source) {
-  let clean = "";
-  let string = false;
-  for (let i = 0; i < source.length; i++) {
-    const c = source[i];
-    if (string) {
-      clean += c;
-      if (c === "\\") clean += source[++i] ?? "";
-      else if (c === '"') string = false;
-    } else if (c === '"') { string = true; clean += c; }
-    else if (c === "/" && source[i + 1] === "/") {
-      while (i < source.length && source[i] !== "\n") i++;
-      clean += "\n";
-    } else if (c === "/" && source[i + 1] === "*") {
-      const end = source.indexOf("*/", i + 2);
-      if (end < 0) throw new Error("Unterminated JSONC comment");
-      clean += " ";
-      i = end + 1;
-    } else clean += c;
-  }
-  let json = "";
-  string = false;
-  for (let i = 0; i < clean.length; i++) {
-    const c = clean[i];
-    if (string) {
-      json += c;
-      if (c === "\\") json += clean[++i] ?? "";
-      else if (c === '"') string = false;
-    } else if (c === '"') { string = true; json += c; }
-    else if (c === "," && /^[\s]*[}\]]/.test(clean.slice(i + 1))) json += " ";
-    else json += c;
-  }
+  const strings = /"(?:[^"\\]|\\[\s\S])*"/.source;
+  const comments = /\/\/[^\n]*|\/\*[\s\S]*?(?:\*\/|$)/.source;
+  const cleaned = source.replace(new RegExp(`${strings}|${comments}`, "g"), token => {
+    if (token[0] === '"') return token;
+    if (token.startsWith("/*") && (token.length < 4 || !token.endsWith("*/"))) {
+      throw new Error("Unterminated JSONC comment");
+    }
+    return " ";
+  });
+  const trailingCommas = /,(?=\s*[}\]])/.source;
+  const json = cleaned.replace(new RegExp(`${strings}|${trailingCommas}`, "g"), token => token === "," ? "" : token);
   return JSON.parse(json.replace(/^\uFEFF/, ""));
 }
 
@@ -67,7 +48,8 @@ function validateRateLimitBindings(config) {
 
 export function readTargetConfig({ configPath = resolve(PROJECT_ROOT, "wrangler.jsonc") } = {}) {
   configPath = resolve(configPath);
-  const config = parseJsonc(readFileSync(configPath, "utf8"));
+  const configSource = readFileSync(configPath);
+  const config = parseJsonc(configSource.toString("utf8"));
   const name = config.name;
   if (typeof name !== "string" || name.length > 255 || !/^[a-z0-9][a-z0-9_-]*$/i.test(name)) throw new Error("Invalid or missing production Worker name");
   if (!Array.isArray(config.d1_databases) || config.d1_databases.length !== 1) throw new Error("production must configure exactly one explicit D1 binding");
@@ -103,10 +85,13 @@ export function readTargetConfig({ configPath = resolve(PROJECT_ROOT, "wrangler.
   if (config.workers_dev !== undefined && typeof config.workers_dev !== "boolean") throw new Error("workers_dev must be a boolean");
   // Wrangler infers false when routes exist and workers_dev is omitted.
   const workersDev = config.workers_dev ?? routes.length === 0;
-  if (workersDev && !/^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/i.test(name)) throw new Error("Worker name must be a DNS label of at most 63 characters when workers_dev is enabled");
+  if (workersDev && !DNS_LABEL.test(name)) throw new Error("Worker name must be a DNS label of at most 63 characters when workers_dev is enabled");
   const buckets = config.r2_buckets ?? [];
   if (!Array.isArray(buckets) || buckets.some((b) => b.binding !== "ATTACHMENTS_BUCKET" || typeof b.bucket_name !== "string" || !b.bucket_name)) throw new Error("production contains an incomplete R2 binding");
-  return { configPath, projectDir, name, database, migrationsDir, buckets, domain, workersDev, accountId: config.account_id ?? "" };
+  return {
+    config, configPath, configurationSha256: sha256(configSource), projectDir, name, database, migrationsDir,
+    buckets, domain, workersDev, accountId: config.account_id ?? "",
+  };
 }
 
 const ACCOUNT_ID = /^[0-9a-f]{32}$/i;
@@ -142,16 +127,12 @@ export async function resolveAccountId(api, configuredAccountId = "") {
     if (!ACCOUNT_ID.test(supplied)) throw new Error("CLOUDFLARE_ACCOUNT_ID must contain 32 hexadecimal characters");
     return supplied;
   }
-  const accounts = [];
-  for (let page = 1; page <= 100; page++) {
-    const payload = await api.request(`/accounts?page=${page}&per_page=50`);
-    if (!Array.isArray(payload.result)) throw new Error("Cloudflare did not return an account list");
-    accounts.push(...payload.result);
-    if (payload.result.length < 50 || page >= Number(payload.result_info?.total_pages || Infinity)) break;
-    if (page === 100) throw new Error("Account pagination exceeded 100 pages");
+  const payload = await api.request("/accounts?page=1&per_page=2");
+  if (!Array.isArray(payload.result)) throw new Error("Cloudflare did not return an account list");
+  if (payload.result.length !== 1 || !ACCOUNT_ID.test(payload.result[0]?.id ?? "")) {
+    throw new Error("API token must access exactly one account, or set CLOUDFLARE_ACCOUNT_ID explicitly");
   }
-  if (accounts.length !== 1 || !ACCOUNT_ID.test(accounts[0]?.id ?? "")) throw new Error("API token must access exactly one account, or set CLOUDFLARE_ACCOUNT_ID explicitly");
-  return accounts[0].id;
+  return payload.result[0].id;
 }
 
 export async function resolveWorkerUrl(target, api, accountId) {
@@ -159,7 +140,7 @@ export async function resolveWorkerUrl(target, api, accountId) {
   if (!target.workersDev) throw new Error("No public health endpoint: enable workers_dev or configure a custom_domain route");
   const { result } = await api.request(`/accounts/${accountId}/workers/subdomain`);
   const subdomain = result?.subdomain;
-  if (typeof subdomain !== "string" || !/^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/i.test(subdomain)) {
+  if (typeof subdomain !== "string" || !DNS_LABEL.test(subdomain)) {
     throw new Error("Configure an account workers.dev subdomain in Cloudflare Dashboard before deploying without routes");
   }
   return `https://${target.name.toLowerCase()}.${subdomain.toLowerCase()}.workers.dev`;
@@ -227,7 +208,8 @@ export async function checkHealth({ configPath, attempts = 12, interval: retryIn
 
 
 const SHA = /^[0-9a-f]{40}$/;
-const fileSha256 = (file) => createHash("sha256").update(readFileSync(file)).digest("hex");
+const BUNDLE_DIRECTORY = ".wrangler/deploy-check/production";
+const sha256 = data => createHash("sha256").update(data).digest("hex");
 const posix = (path) => path.split(sep).join("/");
 function withoutSetupSecrets(environment) {
   const { ALLOWED_EMAILS: _email, OWNER_SETUP_TOKEN: _token, KEY_ENCRYPTION_KEY: _key, ...remaining } = environment;
@@ -252,38 +234,34 @@ function filesBelow(projectDir, path) {
   if (!stat.isDirectory()) throw new Error(`Unsupported artifact input: ${path}`);
   return readdirSync(full).sort().flatMap((name) => filesBelow(projectDir, posix(relative(projectDir, resolve(full, name)))));
 }
-function collectArtifactFiles(target, bundleFiles) {
-  const remainingFiles = ["static/web-vault", "Cargo.lock", "package-lock.json"]
-    .flatMap((path) => filesBelow(target.projectDir, path));
-  return [...bundleFiles, ...remainingFiles].sort();
-}
-function validateArtifactInputs(target, bundleDirectory) {
-  const assets = resolveArtifactPath(target.projectDir, "static/web-vault/index.html");
+function digestArtifactFiles(projectDir) {
+  const assets = resolveArtifactPath(projectDir, "static/web-vault/index.html");
   if (!existsSync(assets)) throw new Error("Missing prepared Web Vault; obtain a validated release artifact");
-  const bundleFiles = filesBelow(target.projectDir, bundleDirectory);
-  const wasm = bundleFiles.filter((file) => file.endsWith(".wasm"));
-  if (!wasm.length) throw new Error("Prebundled Worker artifact contains no WASM module");
-  for (const file of wasm) {
-    if (!readFileSync(resolveArtifactPath(target.projectDir, file)).subarray(0, 8).equals(Buffer.from([0, 97, 115, 109, 1, 0, 0, 0]))) throw new Error(`Invalid WASM module: ${file}`);
-  }
-  return bundleFiles;
+  const bundleFiles = filesBelow(projectDir, BUNDLE_DIRECTORY);
+  const wasm = new Set(bundleFiles.filter(file => file.endsWith(".wasm")));
+  if (!wasm.size) throw new Error("Prebundled Worker artifact contains no WASM module");
+  const files = [...bundleFiles, ...["static/web-vault", "Cargo.lock", "package-lock.json"]
+    .flatMap(path => filesBelow(projectDir, path))].sort();
+  const wasmHeader = Buffer.from([0, 97, 115, 109, 1, 0, 0, 0]);
+  return Object.fromEntries(files.map(file => {
+    const data = readFileSync(resolveArtifactPath(projectDir, file));
+    if (wasm.has(file) && !data.subarray(0, 8).equals(wasmHeader)) throw new Error(`Invalid WASM module: ${file}`);
+    return [file, sha256(data)];
+  }));
 }
 export async function createArtifactManifest({ configPath, manifestPath, expectedSha } = {}, head = readGitHead) {
   const target = readTargetConfig({ configPath });
   const sourceSha = await head(target.projectDir);
   if (!SHA.test(sourceSha) || (expectedSha && sourceSha !== expectedSha)) throw new Error("Artifact source SHA does not match the checked-out commit");
-  const bundleDirectory = ".wrangler/deploy-check/production";
-  const bundleFiles = validateArtifactInputs(target, bundleDirectory);
-  const config = parseJsonc(readFileSync(target.configPath, "utf8"));
-  const entryName = basename(config.main).replace(/\.[cm]?tsx?$/, ".js");
-  const entrypoint = `${bundleDirectory}/${entryName}`;
-  if (!bundleFiles.includes(entrypoint)) throw new Error(`Missing prebundled entrypoint ${entrypoint}; run the release dry-run for this environment`);
-  const files = Object.fromEntries(collectArtifactFiles(target, bundleFiles).map((file) => [file, fileSha256(resolveArtifactPath(target.projectDir, file))]));
-  const manifest = { formatVersion: 1, sourceSha, environment: "production", configurationSha256: fileSha256(target.configPath), bundleDirectory, entrypoint, files };
+  const files = digestArtifactFiles(target.projectDir);
+  const entryName = basename(target.config.main).replace(/\.[cm]?tsx?$/, ".js");
+  const entrypoint = `${BUNDLE_DIRECTORY}/${entryName}`;
+  if (!Object.hasOwn(files, entrypoint)) throw new Error(`Missing prebundled entrypoint ${entrypoint}; run the release dry-run for this environment`);
+  const manifest = { formatVersion: 1, sourceSha, environment: "production", configurationSha256: target.configurationSha256, bundleDirectory: BUNDLE_DIRECTORY, entrypoint, files };
   const output = manifestPath ? resolve(manifestPath) : resolve(target.projectDir, ".wrangler/artifact-manifest.json");
   mkdirSync(dirname(output), { recursive: true });
   writeFileSync(output, `${JSON.stringify(manifest, null, 2)}\n`);
-  console.log(`Recorded ${files && Object.keys(files).length} artifact files for production at ${sourceSha}`);
+  console.log(`Recorded ${Object.keys(files).length} artifact files for production at ${sourceSha}`);
   return manifest;
 }
 
@@ -294,14 +272,12 @@ export async function verifyArtifact({ configPath, manifestPath, expectedSha } =
   const sourceSha = await head(target.projectDir);
   if (manifest.formatVersion !== 1 || !SHA.test(manifest.sourceSha ?? "") || manifest.sourceSha !== sourceSha || (expectedSha && sourceSha !== expectedSha)) throw new Error("Artifact source SHA does not match the selected successful run and checkout");
   if (manifest.environment !== "production") throw new Error("Artifact environment does not match the deployment target");
-  if (manifest.configurationSha256 !== fileSha256(target.configPath)) throw new Error("Deployment configuration changed after this artifact was built");
-  const bundleDirectory = ".wrangler/deploy-check/production";
-  if (manifest.bundleDirectory !== bundleDirectory || !manifest.entrypoint?.startsWith(`${bundleDirectory}/`)) throw new Error("Invalid artifact bundle path");
-  const bundleFiles = validateArtifactInputs(target, bundleDirectory);
-  const files = collectArtifactFiles(target, bundleFiles);
-  if (!manifest.files || JSON.stringify(Object.keys(manifest.files).sort()) !== JSON.stringify(files)) throw new Error("Artifact file inventory changed or files are missing");
-  for (const path of files) if (manifest.files[path] !== fileSha256(resolveArtifactPath(target.projectDir, path))) throw new Error(`Artifact digest mismatch: ${path}`);
-  if (!files.includes(manifest.entrypoint)) throw new Error("Artifact entrypoint is missing");
+  if (manifest.configurationSha256 !== target.configurationSha256) throw new Error("Deployment configuration changed after this artifact was built");
+  if (manifest.bundleDirectory !== BUNDLE_DIRECTORY || !manifest.entrypoint?.startsWith(`${BUNDLE_DIRECTORY}/`)) throw new Error("Invalid artifact bundle path");
+  const files = digestArtifactFiles(target.projectDir);
+  if (!manifest.files || JSON.stringify(Object.keys(manifest.files).sort()) !== JSON.stringify(Object.keys(files).sort())) throw new Error("Artifact file inventory changed or files are missing");
+  for (const [path, digest] of Object.entries(files)) if (manifest.files[path] !== digest) throw new Error(`Artifact digest mismatch: ${path}`);
+  if (!Object.hasOwn(files, manifest.entrypoint)) throw new Error("Artifact entrypoint is missing");
   console.log(`Verified production artifact from ${sourceSha}`);
   return { target, manifest };
 }
@@ -315,11 +291,11 @@ export function artifactReleaseId(manifest) {
 }
 
 export function compiledConfig(target, manifest) {
-  const config = parseJsonc(readFileSync(target.configPath, "utf8"));
+  const config = { ...target.config };
   delete config.build;
   delete config.env;
   config.vars = { ...config.vars, [RELEASE_VARIABLE]: artifactReleaseId(manifest) };
-  for (const binding of config.d1_databases ?? []) if (binding.migrations_dir) binding.migrations_dir = resolve(target.projectDir, binding.migrations_dir);
+  config.d1_databases = [{ ...target.database, migrations_dir: target.migrationsDir }];
   config.main = resolveArtifactPath(target.projectDir, manifest.entrypoint);
   config.base_dir = resolveArtifactPath(target.projectDir, manifest.bundleDirectory);
   config.find_additional_modules = true;
@@ -370,7 +346,7 @@ function configuredSecrets(environment) {
       if (/[^\x00-\x7f]/.test(value) || /\p{Cc}/u.test(value) || normalized.length > 254 || parts.length !== 2 ||
           !local || local.length > 64 || !/^[a-z0-9._+-]+$/.test(local) || local.startsWith(".") || local.endsWith(".") || local.includes("..") ||
           !domain || domain.length > 253 || domain.split(".").length < 2 ||
-          domain.split(".").some(label => !/^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/.test(label))) {
+          domain.split(".").some(label => !DNS_LABEL.test(label))) {
         throw new Error("ALLOWED_EMAILS must contain complete email addresses separated by commas or newlines, without wildcards or empty entries");
       }
       return normalized;

@@ -31,7 +31,16 @@ pub fn guard(
     predicate: &str,
     values: &[JsValue],
 ) -> AppResult<D1PreparedStatement> {
-    let abort = DbSentinel::VaultWriteConflict.sql_abort_expr();
+    guard_with_sentinel(db, predicate, values, DbSentinel::VaultWriteConflict)
+}
+
+pub(crate) fn guard_with_sentinel(
+    db: &D1Database,
+    predicate: &str,
+    values: &[JsValue],
+    sentinel: DbSentinel,
+) -> AppResult<D1PreparedStatement> {
+    let abort = sentinel.sql_abort_expr();
     Ok(db
         .prepare(format!(
             "SELECT CASE WHEN ({predicate}) THEN 1 ELSE {abort} END"
@@ -96,25 +105,14 @@ pub async fn account_snapshot_guard(
 pub async fn commit_session(
     db: &D1Database,
     snapshot: &SessionSnapshot<'_>,
-    guards: Vec<D1PreparedStatement>,
+    mut guards: Vec<D1PreparedStatement>,
     writes: Vec<D1PreparedStatement>,
 ) -> AppResult<String> {
-    let abort = DbSentinel::VaultWriteSession.sql_abort_expr();
-    let session = db
-        .prepare(format!(
-            "SELECT CASE WHEN EXISTS(
-        SELECT 1 FROM users u JOIN devices d ON d.user_id=u.id
-        WHERE u.id=?1 AND u.security_stamp IS ?2 AND d.device_id=?3 AND \
-             d.session_token=?4
-    ) THEN 1 ELSE {abort} END"
-        ))
-        .bind(&db::d1_params![
-            snapshot.user_id,
-            snapshot.security_stamp,
-            snapshot.device_id,
-            snapshot.session_token,
-        ])?;
-    let mut guards = guards;
+    let session = crate::models::identity::authorization::session_guard_with_sentinel(
+        db,
+        snapshot,
+        DbSentinel::VaultWriteSession,
+    )?;
     guards.insert(0, session);
     commit(db, snapshot.user_id, guards, writes).await
 }
@@ -141,19 +139,19 @@ pub async fn commit(
     let results = db.batch(statements).await.map_err(map_database_error)?;
     results
         .last()
-        .ok_or(AppError::Internal)?
+        .ok_or_else(|| AppError::internal("Missing vault mutation batch result"))?
         .results::<RevisionRow>()?
         .into_iter()
         .next()
         .map(|row| row.updated_at)
-        .ok_or(AppError::Internal)
+        .ok_or_else(|| AppError::internal("Missing updated user revision row"))
 }
 
 /// Count only the rows directly affected by the last write.
 pub(super) async fn batch_count_last_write(
     db: &D1Database,
     mut writes: Vec<D1PreparedStatement>,
-    context: &str,
+    context: &'static str,
 ) -> AppResult<u32> {
     #[derive(serde::Deserialize)]
     struct CountRow {
@@ -162,12 +160,14 @@ pub(super) async fn batch_count_last_write(
 
     writes.push(db.prepare("SELECT changes() AS count"));
     let results = db::run_query(db.batch(writes), context).await?;
-    let count = results.last().ok_or(AppError::Internal)?;
+    let count = results
+        .last()
+        .ok_or_else(|| AppError::internal("Missing batch change-count result"))?;
     count
         .results::<CountRow>()?
         .first()
         .map(|row| row.count)
-        .ok_or(AppError::Internal)
+        .ok_or_else(|| AppError::internal("Missing batch change-count row"))
 }
 
 pub fn map_database_error(error: worker::Error) -> AppError {

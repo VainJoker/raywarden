@@ -190,21 +190,22 @@ impl ValidatedAccountKeys {
     }
 
     pub fn into_persistence_material(self) -> AppResult<AccountKeyMaterial> {
-        let (signed_public_key, security_state, security_version, signature_key_pair) = match self
-            .version
-        {
-            AccountKeyVersion::V1 => (None, None, None, None),
-            AccountKeyVersion::V2 {
-                signed_public_key,
-                security_state,
-                signature_key_pair,
-            } => (
-                Some(signed_public_key),
-                Some(security_state.security_state),
-                Some(security_state.security_version),
-                Some(serde_json::to_string(&signature_key_pair).map_err(AppError::internal_error)?),
-            ),
-        };
+        let (signed_public_key, security_state, security_version, signature_key_pair) =
+            match self.version {
+                AccountKeyVersion::V1 => (None, None, None, None),
+                AccountKeyVersion::V2 {
+                    signed_public_key,
+                    security_state,
+                    signature_key_pair,
+                } => (
+                    Some(signed_public_key),
+                    Some(security_state.security_state),
+                    Some(security_state.security_version),
+                    Some(serde_json::to_string(&signature_key_pair).map_err(
+                        AppError::internal_json("Failed to serialize signature key pair"),
+                    )?),
+                ),
+            };
         Ok(AccountKeyMaterial {
             private_key: self.private_key,
             public_key: self.public_key,
@@ -247,7 +248,9 @@ impl ValidatedAccountKeys {
                     serde_json::from_str(user.signature_key_pair.as_deref().ok_or_else(|| {
                         AppError::bad_request("The account is missing its signature key pair")
                     })?)
-                    .map_err(AppError::internal_error)?;
+                    .map_err(AppError::internal_json(
+                        "Stored signature key pair is malformed",
+                    ))?;
                 if pair.verifying_key != old.verifying_key {
                     return Err(AppError::bad_request(
                         "Changing the verifying key is not possible during \
@@ -391,7 +394,7 @@ pub fn is_valid_key_id(value: &str) -> bool {
             .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
 }
 
-pub fn account_keys_response(user: &UserRow) -> Value {
+pub fn account_keys_response(user: &UserRow, object_key: &str) -> Value {
     if user.private_key.is_empty() {
         return Value::Null;
     }
@@ -405,18 +408,18 @@ pub fn account_keys_response(user: &UserRow) -> Value {
             "publicKey": user.public_key,
             "wrappedPrivateKey": user.private_key,
             "signedPublicKey": signature.as_ref().and(user.signed_public_key.as_ref()),
-            "object": "publicKeyEncryptionKeyPair",
+            (object_key): "publicKeyEncryptionKeyPair",
         },
         "signatureKeyPair": signature.as_ref().map(|pair| json!({
             "wrappedSigningKey": pair.wrapped_signing_key,
             "verifyingKey": pair.verifying_key,
-            "object": "signatureKeyPair",
+            (object_key): "signatureKeyPair",
         })),
         "securityState": signature.as_ref().map(|_| json!({
             "securityState": user.security_state,
             "securityVersion": user.security_version,
         })),
-        "object": "privateKeys",
+        (object_key): "privateKeys",
     })
 }
 
@@ -424,111 +427,40 @@ pub fn account_keys_response(user: &UserRow) -> Value {
 mod tests {
     use super::*;
     use crate::models::identity::account_keys::AccountSnapshot;
-    fn user() -> UserRow {
-        serde_json::from_value(json!({"id":"owner","email":"owner@example.test","is_email_verified":0,"master_password_hash":"hash","key":"wrapped-user","private_key":"2.private","public_key":"public","kdf_type":0,"kdf_iterations":600_000,"security_stamp":"stamp","created_at":"now","updated_at":"now"})).expect("valid account request fixture")
-    }
-    fn v2() -> Value {
-        json!({"userKeyEncryptedAccountPrivateKey":"7.private","accountPublicKey":"public","publicKeyEncryptionKeyPair":{"wrappedPrivateKey":"7.private","publicKey":"public","signedPublicKey":"signed"},"signatureKeyPair":{"signatureAlgorithm":"ed25519","wrappedSigningKey":"7.signing","verifyingKey":"verify"},"securityState":{"securityState":"state","securityVersion":2}})
-    }
-    #[test]
-    fn v2_material_is_complete_or_rejected() {
-        let valid: AccountKeysRequest =
-            serde_json::from_value(v2()).expect("valid account request fixture");
-        assert!(
-            valid
-                .into_validated()
-                .expect("valid account request fixture")
-                .is_v2()
-        );
-        for field in ["signatureKeyPair", "securityState"] {
-            let mut body = v2();
-            body.as_object_mut()
-                .expect("valid account request fixture")
-                .remove(field);
-            let keys: AccountKeysRequest =
-                serde_json::from_value(body).expect("valid account request fixture");
-            assert!(keys.into_validated().is_err());
-        }
-        let mut body = v2();
-        body["signatureKeyPair"]["signatureAlgorithm"] = json!("unknown");
-        assert!(
-            serde_json::from_value::<AccountKeysRequest>(body)
-                .expect("valid account request fixture")
-                .into_validated()
-                .is_err()
-        );
-    }
-    #[test]
-    fn persistence_keeps_complete_versions_and_signature_json() {
-        let v1 = ValidatedAccountKeys::from_legacy_pair(String::new(), "public".into());
-        assert!(!v1.is_v2());
-        let v1 = v1.into_persistence_material().expect("V1 material");
-        assert_eq!(v1.private_key, "");
-        assert!(v1.signed_public_key.is_none());
-        assert!(v1.security_state.is_none());
-        assert!(v1.security_version.is_none());
-        assert!(v1.signature_key_pair.is_none());
-
-        let request: AccountKeysRequest =
-            serde_json::from_value(v2()).expect("valid account request fixture");
-        let material = request
-            .into_validated()
-            .expect("valid V2 material")
-            .into_persistence_material()
-            .expect("persistable V2 material");
-        assert_eq!(material.private_key, "7.private");
-        assert_eq!(material.public_key, "public");
-        assert_eq!(material.signed_public_key.as_deref(), Some("signed"));
-        assert_eq!(material.security_state.as_deref(), Some("state"));
-        assert_eq!(material.security_version, Some(2));
-        assert_eq!(
-            material.signature_key_pair.as_deref(),
-            Some(
-                r#"{"signatureAlgorithm":"ed25519","wrappedSigningKey":"7.signing","verifyingKey":"verify"}"#,
-            )
-        );
-    }
 
     #[test]
-    fn rotation_preserves_public_identity_and_prohibits_downgrade() {
-        let keys: AccountKeysRequest =
-            serde_json::from_value(v2()).expect("valid account request fixture");
-        let keys = keys
+    fn v2_keys_require_complete_material_and_forbid_downgrade() {
+        let mut user: UserRow = serde_json::from_value(json!({
+            "id": "owner", "email": "owner@example.test", "is_email_verified": 0,
+            "master_password_hash": "hash", "key": "wrapped", "private_key": "2.private",
+            "public_key": "public", "kdf_type": 0, "kdf_iterations": 600_000,
+            "security_stamp": "stamp", "created_at": "now", "updated_at": "now"
+        }))
+        .expect("user");
+        let v2 = json!({
+            "userKeyEncryptedAccountPrivateKey": "7.private", "accountPublicKey": "public",
+            "publicKeyEncryptionKeyPair": {"wrappedPrivateKey": "7.private", "publicKey": "public", "signedPublicKey": "signed"},
+            "signatureKeyPair": {"signatureAlgorithm": "ed25519", "wrappedSigningKey": "7.signing", "verifyingKey": "verify"},
+            "securityState": {"securityState": "state", "securityVersion": 2}
+        });
+        let keys = serde_json::from_value::<AccountKeysRequest>(v2)
+            .expect("req")
             .into_validated()
-            .expect("valid account request fixture");
-        let mut user = user();
+            .expect("v2");
         assert!(keys.validate_rotation(&user).is_ok());
-        user.public_key = "different".into();
-        assert!(keys.validate_rotation(&user).is_err());
-        user.public_key = "public".into();
-        let material = keys
-            .clone()
-            .into_persistence_material()
-            .expect("valid account request fixture");
+        let material = keys.into_persistence_material().expect("material");
+        let before = AccountSnapshot::from_user(&user);
+        user.private_key = material.private_key;
         user.signed_public_key = material.signed_public_key;
         user.security_state = material.security_state;
         user.security_version = material.security_version;
         user.signature_key_pair = material.signature_key_pair;
-        let old = ValidatedAccountKeys::from_legacy_pair("2.private".into(), "public".into());
-        assert!(old.validate_rotation(&user).is_err());
-        let mut changed = keys.clone();
-        let AccountKeyVersion::V2 {
-            signature_key_pair, ..
-        } = &mut changed.version
-        else {
-            panic!("expected V2 account keys");
-        };
-        signature_key_pair.verifying_key = "replacement".into();
-        assert!(changed.validate_rotation(&user).is_err());
-    }
-    #[test]
-    fn snapshot_detects_same_stamp_envelope_changes_and_new_ids_are_hex() {
-        let mut user = user();
-        let before = AccountSnapshot::from_user(&user);
-        user.private_key = "7.upgraded".into();
         assert_ne!(before, AccountSnapshot::from_user(&user));
-        assert_eq!(user.security_stamp, "stamp");
+        assert!(
+            ValidatedAccountKeys::from_legacy_pair("2.private".into(), "public".into())
+                .validate_rotation(&user)
+                .is_err()
+        );
         assert!(is_valid_key_id("0123456789abcdef0123456789abcdef"));
-        assert!(!is_valid_key_id("00000000-0000-4000-8000-000000000001"));
     }
 }

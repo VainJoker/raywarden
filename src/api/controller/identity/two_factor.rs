@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use axum::extract::State;
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 use sha2::{Digest as _, Sha256};
 
 use crate::{
@@ -10,7 +10,7 @@ use crate::{
         common::{
             extract::ClientIp,
             json::Json,
-            response::{ApiResponse, EmptyObject},
+            response::{ApiResponse, EmptyObject, ListResponse},
         },
     },
     errors::{AppError, AppResult, AuthError},
@@ -35,14 +35,6 @@ use crate::{
     },
     utils::constant_time_eq,
 };
-
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-pub(in crate::api) struct TwoFactorProvidersResponse {
-    data: Vec<TwoFactorProviderResponse>,
-    object: &'static str,
-    continuation_token: Option<String>,
-}
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -95,23 +87,18 @@ pub(in crate::api) struct DeviceVerificationSettingsResponse {
 pub(in crate::api) async fn list_two_factor_providers(
     State(state): State<Arc<AppState>>,
     claims: Claims,
-) -> AppResult<ApiResponse<TwoFactorProvidersResponse>> {
-    let user_id = claims.sub.clone();
+) -> AppResult<ApiResponse<ListResponse<TwoFactorProviderResponse>>> {
     let db = state.database();
-    let providers = TwoFactorRow::list_for_user(db, &user_id).await?;
+    let providers = TwoFactorRow::list_for_user(db, &claims.sub).await?;
     let providers = providers
         .iter()
         .filter(|factor| {
             factor.is_enabled && factor.provider_type != i32::from(TwoFactorProvider::Remember)
         })
         .map(TwoFactorProviderResponse::from)
-        .collect();
+        .collect::<Vec<_>>();
 
-    Ok(ApiResponse(TwoFactorProvidersResponse {
-        data: providers,
-        object: "list",
-        continuation_token: None,
-    }))
+    Ok(ApiResponse(providers.into()))
 }
 
 /// POST /api/two-factor/get-authenticator - Get or generate TOTP secret
@@ -121,7 +108,6 @@ pub(in crate::api) async fn prepare_authenticator(
     claims: Claims,
     Json(data): Json<AccountVerificationRequest>,
 ) -> AppResult<ApiResponse<AuthenticatorResponse>> {
-    let user_id = claims.sub.clone();
     let db = state.database();
 
     state
@@ -130,7 +116,7 @@ pub(in crate::api) async fn prepare_authenticator(
         .await?;
 
     let existing =
-        TwoFactorRow::find_provider(db, &user_id, i32::from(TwoFactorProvider::Authenticator))
+        TwoFactorRow::find_provider(db, &claims.sub, i32::from(TwoFactorProvider::Authenticator))
             .await?;
 
     let (enabled, key, factor_id) = match existing {
@@ -138,7 +124,13 @@ pub(in crate::api) async fn prepare_authenticator(
         None => (false, generate_factor_secret()?, None),
     };
 
-    let token = mint_authenticator_proof(&state, &claims, &key, enabled, factor_id.as_deref())?;
+    let token = two_factor::mint_factor_proof(
+        &state.jwt_keys.access_secret,
+        &claims,
+        "authenticator-factor",
+        authenticator_state_hash(&key, enabled),
+        factor_id.as_deref(),
+    )?;
     Ok(ApiResponse(AuthenticatorResponse::new(
         enabled,
         key,
@@ -156,7 +148,7 @@ pub(in crate::api) async fn activate_authenticator(
     let db = state.database();
     let key = normalize_authenticator_key(&data.key)?;
     let existing = TwoFactorRow::find_provider(db, &claims.sub, 0).await?;
-    let proof = AccountVerificationRequest::from(data.verification);
+    let proof = data.verification;
     if proof.user_verification_token.is_some()
         && existing.as_ref().is_some_and(|factor| {
             !factor.is_enabled && !constant_time_eq(factor.data.as_bytes(), key.as_bytes())
@@ -229,7 +221,7 @@ pub(in crate::api) async fn disable_two_factor(
 
     let provider_kind = StoredProvider::from(data.provider_type);
     let provider_type = i32::from(provider_kind);
-    let proof = AccountVerificationRequest::from(data.verification);
+    let proof = data.verification;
     let provider = TwoFactorRow::find_provider(db, user_id, provider_type).await?;
     let was_enabled = provider.as_ref().is_some_and(|factor| factor.is_enabled);
     if let Some(factor) = provider
@@ -286,7 +278,7 @@ pub(in crate::api) async fn disable_authenticator(
         .await?
         .ok_or_else(|| AppError::bad_request("TOTP not configured"))?;
     let key = data.key.trim().to_uppercase();
-    let proof = AccountVerificationRequest::from(data.verification);
+    let proof = data.verification;
     let authorization =
         prepare_authenticator_delete(&state, &claims, &proof, &key, &existing).await?;
     if !constant_time_eq(existing.data.as_bytes(), key.as_bytes()) {
@@ -304,14 +296,15 @@ pub(in crate::api) async fn get_two_factor_recovery_code(
     claims: Claims,
     Json(data): Json<AccountVerificationRequest>,
 ) -> AppResult<ApiResponse<TwoFactorRecoveryResponse>> {
-    let user_id = claims.sub.clone();
     let db = state.database();
 
-    let user =
-        UserRow::fetch_by_id_with(db, &user_id, "Failed to fetch user in get_recover", || {
-            AppError::Auth(AuthError::UserNotFound)
-        })
-        .await?;
+    let user = UserRow::fetch_by_id_with(
+        db,
+        &claims.sub,
+        "Failed to fetch user in get_recover",
+        || AppError::Auth(AuthError::UserNotFound),
+    )
+    .await?;
 
     state
         .email_verifier()
@@ -380,44 +373,6 @@ pub(in crate::api) async fn recover(
     Ok(ApiResponse(EmptyObject {}))
 }
 
-#[derive(Serialize, Deserialize)]
-struct AuthenticatorProofClaims {
-    sub: String,
-    sstamp: String,
-    session_token: String,
-    purpose: String,
-    state_hash: String,
-    #[serde(default)]
-    factor_id: Option<String>,
-    exp: i64,
-    nbf: i64,
-    iat: i64,
-}
-
-fn mint_authenticator_proof(
-    state: &AppState,
-    claims: &Claims,
-    key: &str,
-    enabled: bool,
-    factor_id: Option<&str>,
-) -> AppResult<String> {
-    let now = crate::utils::time::now_seconds();
-    crate::infra::jwt::encode(
-        &AuthenticatorProofClaims {
-            sub: claims.sub.clone(),
-            sstamp: claims.sstamp.clone(),
-            session_token: claims.session_token.clone(),
-            purpose: "authenticator-factor".into(),
-            state_hash: authenticator_state_hash(key, enabled),
-            factor_id: factor_id.map(str::to_string),
-            exp: now + 300,
-            nbf: now,
-            iat: now,
-        },
-        state.jwt_keys.access_secret.as_bytes(),
-    )
-}
-
 fn authenticator_state_hash(key: &str, enabled: bool) -> String {
     hex::encode(Sha256::digest(format!(
         "{}:{}",
@@ -467,30 +422,14 @@ fn verify_authenticator_proof(
             "Provide exactly one verification method",
         ));
     }
-    let proof = crate::infra::jwt::decode::<AuthenticatorProofClaims>(
+    two_factor::verify_factor_proof(
+        &state.jwt_keys.access_secret,
+        claims,
         token,
-        state.jwt_keys.access_secret.as_bytes(),
-        &crate::infra::jwt::ValidationOptions {
-            leeway_seconds: 0,
-            ..Default::default()
-        },
-    )?;
-    if proof.sub != claims.sub
-        || proof.sstamp != claims.sstamp
-        || proof.session_token != claims.session_token
-        || proof.purpose != "authenticator-factor"
-        || proof
-            .factor_id
-            .as_deref()
-            .is_some_and(|id| observed.is_none_or(|factor| factor.id != id))
-        || !constant_time_eq(
-            proof.state_hash.as_bytes(),
-            authenticator_state_hash(key, enabled).as_bytes(),
-        )
-    {
-        return Err(AppError::invalid_credentials("Invalid authenticator proof"));
-    }
-    Ok(())
+        "authenticator-factor",
+        &authenticator_state_hash(key, enabled),
+        observed.map(|factor| factor.id.as_str()),
+    )
 }
 
 #[worker::send]

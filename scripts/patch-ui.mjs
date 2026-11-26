@@ -2,7 +2,7 @@ import { readFileSync, writeFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
-export function readPinnedVaultVersion(root) {
+function readPinnedVaultVersion(root) {
   const version = JSON.parse(readFileSync(join(root, "package.json"), "utf8")).config?.webVaultVersion;
   if (typeof version !== "string" || !/^\d{4}\.\d+\.\d+$/.test(version)) {
     throw new Error("package.json config.webVaultVersion must pin a release such as 2026.7.0");
@@ -11,16 +11,6 @@ export function readPinnedVaultVersion(root) {
 }
 
 const CLOSE_HEAD = /<\/head\s*>/i;
-
-export function readVaultIndex(root, directory) {
-  const version = readPinnedVaultVersion(root);
-  const metadata = JSON.parse(readFileSync(join(directory, "vw-version.json"), "utf8"));
-  if (metadata?.version !== version) throw new Error(`Web Vault version ${metadata?.version} does not match pinned ${version}`);
-  const index = join(directory, "index.html");
-  const html = readFileSync(index, "utf8");
-  if (!CLOSE_HEAD.test(html)) throw new Error("Web Vault index.html has no closing head tag");
-  return { version, index, html };
-}
 
 // One compiled policy also drives the API middleware. `_headers` only affects
 // assets; Worker and DO responses apply the same defaults in Rust.
@@ -60,8 +50,13 @@ export function renderAssetHeaders(root) {
   return lines.join("\n");
 }
 
-export function patchUi(root, directory) {
-  const { version, index, html } = readVaultIndex(root, directory);
+function patchUi(root, directory) {
+  const version = readPinnedVaultVersion(root);
+  const metadata = JSON.parse(readFileSync(join(directory, "vw-version.json"), "utf8"));
+  if (metadata?.version !== version) throw new Error(`Web Vault version ${metadata?.version} does not match pinned ${version}`);
+  const index = join(directory, "index.html");
+  const html = readFileSync(index, "utf8");
+  if (!CLOSE_HEAD.test(html)) throw new Error("Web Vault index.html has no closing head tag");
   const headers = renderAssetHeaders(root);
   const cleaned = html
     .replace(/<script\b[^>]*>\s*\/\* turnstile-send-guard[\s\S]*?<\/script\s*>/gi, "")
@@ -71,7 +66,6 @@ export function patchUi(root, directory) {
   const patched = cleaned.replace(CLOSE_HEAD, `${stylesheet}<script defer src="js/raywarden.js"></script></head>`);
   writeFileSync(index, patched);
   writeFileSync(join(directory, "_headers"), headers);
-  return version;
 }
 
 if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {

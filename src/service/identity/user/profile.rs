@@ -24,7 +24,7 @@ pub struct ProfileResponse {
     pub security_stamp: String,
     pub user_key_id: Option<String>,
     pub account_keys: Value,
-    pub object: String,
+    pub object: &'static str,
     #[serde(rename = "premiumFromOrganization")]
     pub has_organization_premium: bool,
     #[serde(rename = "forcePasswordReset")]
@@ -56,7 +56,7 @@ impl ProfileResponse {
             crate::utils::time::parse(&user.created_at).unwrap_or(jiff::Timestamp::UNIX_EPOCH),
         );
 
-        let account_keys = account_keys::account_keys_response(&user);
+        let account_keys = account_keys::account_keys_response(&user, "object");
         Self {
             account_keys,
             id: user.id,
@@ -70,7 +70,7 @@ impl ProfileResponse {
             master_password_hint: user.master_password_hint,
             security_stamp: user.security_stamp,
             user_key_id: user.user_key_id,
-            object: "profile".to_string(),
+            object: "profile",
             has_organization_premium: false,
             must_reset_password: false,
             is_email_verified: user.is_email_verified,

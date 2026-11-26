@@ -1,12 +1,13 @@
 //! Server discovery, health, usage and compatibility endpoints.
-use std::{collections::BTreeMap, sync::Arc};
+use std::sync::Arc;
 
 use axum::{
     extract::State,
     http::{HeaderMap, HeaderValue},
     response::{IntoResponse as _, Response},
 };
-use serde::{Serialize, de::IgnoredAny};
+use serde::de::IgnoredAny;
+use serde_json::json;
 
 use crate::{
     api::{
@@ -84,52 +85,6 @@ pub(in crate::api) async fn empty_emergency_contacts() -> ApiResponse<EmptyListR
 #[worker::send]
 pub(in crate::api) async fn accept_events(_claims: Claims, Json(_events): Json<Vec<IgnoredAny>>) {}
 
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-struct ClientConfigResponse<'a> {
-    version: &'static str,
-    git_hash: Option<&'static str>,
-    server: ClientServer,
-    settings: ClientSettings,
-    environment: ClientEnvironment<'a>,
-    push: ClientPush,
-    feature_states: BTreeMap<String, bool>,
-    communication: (),
-    object: &'static str,
-}
-
-#[derive(Serialize)]
-struct ClientServer {
-    name: &'static str,
-    url: &'static str,
-}
-
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-struct ClientSettings {
-    disable_user_registration: bool,
-    suppress_onboarding_interstitials: bool,
-}
-
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-struct ClientEnvironment<'a> {
-    vault: &'a str,
-    api: String,
-    identity: String,
-    notifications: String,
-    sso: &'static str,
-    fill_assist_rules: String,
-    cloud_region: (),
-}
-
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-struct ClientPush {
-    push_technology: u8,
-    vapid_public_key: (),
-}
-
 #[worker::send]
 pub(in crate::api) async fn client_config(
     State(state): State<Arc<AppState>>,
@@ -142,37 +97,31 @@ pub(in crate::api) async fn client_config(
         "email-verification".into(),
         crate::service::identity::email::registration_verification_required(&state.env),
     );
-    let fill_assist = fill_assist_rules_url(&state.env);
-
-    let response = ApiResponse(ClientConfigResponse {
+    let response = ApiResponse(json!({
         // Clients use this version to select compatible server features.
-        version: SERVER_VERSION,
-        git_hash: option_env!("GIT_REV"),
-        server: ClientServer {
-            name: "Vaultwarden",
-            url: "https://github.com/dani-garcia/vaultwarden",
+        "version": SERVER_VERSION,
+        "gitHash": option_env!("GIT_REV"),
+        "server": {
+            "name": "Vaultwarden",
+            "url": "https://github.com/dani-garcia/vaultwarden",
         },
-        settings: ClientSettings {
-            disable_user_registration: registration_disabled,
-            suppress_onboarding_interstitials: web_vault_ui::suppress_onboarding(&state.env),
+        "settings": {
+            "disableUserRegistration": registration_disabled,
+            "suppressOnboardingInterstitials": web_vault_ui::suppress_onboarding(&state.env),
         },
-        environment: ClientEnvironment {
-            vault: domain,
-            api: format!("{domain}/api"),
-            identity: format!("{domain}/identity"),
-            notifications: format!("{domain}/notifications"),
-            sso: "",
-            fill_assist_rules: fill_assist,
-            cloud_region: (),
+        "environment": {
+            "vault": domain,
+            "api": format!("{domain}/api"),
+            "identity": format!("{domain}/identity"),
+            "notifications": format!("{domain}/notifications"),
+            "sso": "",
+            "fillAssistRules": fill_assist_rules_url(&state.env),
+            "cloudRegion": null,
         },
-        // Bitwarden's default push technology for self-hosted servers.
-        push: ClientPush {
-            push_technology: 0,
-            vapid_public_key: (),
-        },
-        feature_states: features,
-        communication: (),
-        object: "config",
-    });
+        "push": {"pushTechnology": 0, "vapidPublicKey": null},
+        "featureStates": features,
+        "communication": null,
+        "object": "config",
+    }));
     Ok(NoStore(response).into_response())
 }

@@ -51,73 +51,51 @@ pub struct AttachmentRow {
 impl AttachmentRow {
     /// Prepare publication; the caller supplies account/source assertions and
     /// commits these statements with the sync cursor in the same transaction.
-    pub fn finalize_upload(
+    pub(crate) fn upload_statements(
+        &self,
         db: &D1Database,
-        attachment: &Self,
         user_id: &str,
         now: &str,
+        is_replacement: bool,
     ) -> AppResult<Vec<D1PreparedStatement>> {
-        Ok(vec![
-            query!(
+        // Replacing a published row queues its prior object through the storage trigger.
+        let mut writes = if is_replacement {
+            vec![query!(
                 db,
-                "INSERT INTO attachments \
-                 (id,cipher_id,file_name,file_size_bytes,encrypted_key,\
-                 created_at,updated_at,organization_id,storage_key) \
-                 VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9)",
-                attachment.id,
-                attachment.cipher_id,
-                attachment.file_name,
-                attachment.file_size_bytes,
-                attachment.encrypted_key,
-                attachment.created_at,
-                now,
-                attachment.organization_id,
-                attachment.storage_key
-            )?,
-            query!(
-                db,
-                "DELETE FROM attachments_pending WHERE id=?1",
-                attachment.id
-            )?,
-            query!(
-                db,
-                "UPDATE ciphers SET updated_at=?1 WHERE id=?2 AND user_id=?3",
-                now,
-                attachment.cipher_id,
-                user_id
-            )?,
-        ])
+                "UPDATE attachments SET file_size_bytes=?1,encrypted_key=?2,storage_key=?3,updated_at=?4
+                 WHERE id=?5 AND cipher_id=?6",
+                self.file_size_bytes, self.encrypted_key, self.storage_key, now, self.id, self.cipher_id
+            )?]
+        } else {
+            vec![
+                query!(
+                    db,
+                    "INSERT INTO attachments
+                     (id,cipher_id,file_name,file_size_bytes,encrypted_key,created_at,updated_at,organization_id,storage_key)
+                     VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9)",
+                    self.id, self.cipher_id, self.file_name, self.file_size_bytes, self.encrypted_key,
+                    self.created_at, now, self.organization_id, self.storage_key
+                )?,
+                query!(db, "DELETE FROM attachments_pending WHERE id=?1", self.id)?,
+            ]
+        };
+        writes.push(self.cipher_revision_statement(db, user_id, now)?);
+        Ok(writes)
     }
 
-    /// Replace a committed file only after its captured row is asserted by
-    /// the bearer upload transaction. The storage trigger queues the old key.
-    pub fn replace_upload(
+    fn cipher_revision_statement(
+        &self,
         db: &D1Database,
-        attachment: &Self,
         user_id: &str,
         now: &str,
-    ) -> AppResult<Vec<D1PreparedStatement>> {
-        Ok(vec![
-            query!(
-                db,
-                "UPDATE attachments SET \
-                 file_size_bytes=?1,encrypted_key=?2,storage_key=?3,\
-                 updated_at=?4 WHERE id=?5 AND cipher_id=?6",
-                attachment.file_size_bytes,
-                attachment.encrypted_key,
-                attachment.storage_key,
-                now,
-                attachment.id,
-                attachment.cipher_id
-            )?,
-            query!(
-                db,
-                "UPDATE ciphers SET updated_at=?1 WHERE id=?2 AND user_id=?3",
-                now,
-                attachment.cipher_id,
-                user_id
-            )?,
-        ])
+    ) -> AppResult<D1PreparedStatement> {
+        Ok(query!(
+            db,
+            "UPDATE ciphers SET updated_at=?1 WHERE id=?2 AND user_id=?3",
+            now,
+            self.cipher_id,
+            user_id
+        )?)
     }
 
     pub async fn purge_pending_before(db: &D1Database, cutoff_exclusive: &str) -> AppResult<u32> {
@@ -257,7 +235,7 @@ impl AttachmentRow {
                 row.encrypted_key,
                 row.updated_at,
                 row.storage_key,
-                row.file_size_bytes as f64,
+                db::safe_int(row.file_size_bytes)?,
             ],
         )?;
         let update = db
@@ -282,7 +260,7 @@ impl AttachmentRow {
                 self.id,
                 self.cipher_id,
                 self.file_name,
-                self.file_size_bytes as f64,
+                db::safe_int(self.file_size_bytes)?,
                 self.encrypted_key,
                 self.created_at,
                 self.organization_id,
@@ -315,56 +293,45 @@ impl AttachmentRow {
         Ok(vec![
             db.prepare("DELETE FROM attachments WHERE id=?1 AND cipher_id=?2")
                 .bind(&db::d1_params![self.id, self.cipher_id])?,
-            db.prepare("UPDATE ciphers SET updated_at=?1 WHERE id=?2 AND user_id=?3")
-                .bind(&db::d1_params![now, self.cipher_id, owner])?,
+            self.cipher_revision_statement(db, owner, now)?,
         ])
     }
 }
 
-pub(crate) fn pending_snapshot_guard(
+pub(crate) fn upload_snapshot_guard(
     db: &D1Database,
     row: &AttachmentRow,
+    is_replacement: bool,
 ) -> AppResult<D1PreparedStatement> {
+    let (table, extra) = if is_replacement {
+        (
+            "attachments",
+            " AND storage_key IS ?9) AND NOT EXISTS(SELECT 1 FROM attachments_pending WHERE id=?1)",
+        )
+    } else {
+        ("attachments_pending", ")")
+    };
+    let mut params = db::d1_params![
+        row.id,
+        row.cipher_id,
+        row.file_name,
+        db::safe_int(row.file_size_bytes)?,
+        row.encrypted_key,
+        row.created_at,
+        row.updated_at,
+        row.organization_id,
+    ]
+    .to_vec();
+    if is_replacement {
+        params.push(crate::infra::db::IntoD1Param::to_d1_param(&row.storage_key));
+    }
     crate::models::mutation::guard(
         db,
-        "EXISTS(SELECT 1 FROM attachments_pending WHERE id=?1 AND \
-         cipher_id=?2 AND file_name IS ?3 AND file_size_bytes IS ?4 AND \
-         encrypted_key IS ?5 AND created_at IS ?6 AND updated_at IS ?7 AND \
-         organization_id IS ?8)",
-        &db::d1_params![
-            row.id,
-            row.cipher_id,
-            row.file_name,
-            row.file_size_bytes as f64,
-            row.encrypted_key,
-            row.created_at,
-            row.updated_at,
-            row.organization_id,
-        ],
-    )
-}
-
-pub(crate) fn attachment_snapshot_guard(
-    db: &D1Database,
-    row: &AttachmentRow,
-) -> AppResult<D1PreparedStatement> {
-    crate::models::mutation::guard(
-        db,
-        "EXISTS(SELECT 1 FROM attachments WHERE id=?1 AND cipher_id=?2 AND \
-         file_name IS ?3 AND file_size_bytes IS ?4 AND encrypted_key IS ?5 \
-         AND created_at IS ?6 AND updated_at IS ?7 AND organization_id IS ?8 \
-         AND storage_key IS ?9) AND NOT EXISTS(SELECT 1 FROM \
-         attachments_pending WHERE id=?1)",
-        &db::d1_params![
-            row.id,
-            row.cipher_id,
-            row.file_name,
-            row.file_size_bytes as f64,
-            row.encrypted_key,
-            row.created_at,
-            row.updated_at,
-            row.organization_id,
-            row.storage_key,
-        ],
+        &format!(
+            "EXISTS(SELECT 1 FROM {table} WHERE id=?1 AND cipher_id=?2 AND
+            file_name IS ?3 AND file_size_bytes IS ?4 AND encrypted_key IS ?5 AND
+            created_at IS ?6 AND updated_at IS ?7 AND organization_id IS ?8{extra}"
+        ),
+        &params,
     )
 }

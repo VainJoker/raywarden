@@ -50,6 +50,17 @@ impl EmailPurpose {
             Self::PasswordHint => "password-hint",
         }
     }
+
+    const fn uses_long_token(self) -> bool {
+        matches!(
+            self,
+            Self::VerifyEmail | Self::Registration | Self::DeleteRecover
+        )
+    }
+
+    const fn can_reuse_active_code(self) -> bool {
+        matches!(self, Self::Login | Self::DeleteRecover)
+    }
 }
 
 pub(crate) fn mail_configured(env: &Env) -> bool {
@@ -114,20 +125,19 @@ pub fn code_hash(
     owner: &str,
     purpose: EmailPurpose,
     recipient: &str,
-    context: &str,
     code: &str,
 ) -> AppResult<String> {
-    let mut mac =
-        Hmac::<Sha256>::new_from_slice(secret.as_bytes()).map_err(AppError::internal_error)?;
-    for part in [owner, purpose.as_str(), recipient, context, code] {
+    let mut mac = Hmac::<Sha256>::new_from_slice(secret.as_bytes())
+        .map_err(|error| AppError::internal_debug("Failed to initialize OTP HMAC", error))?;
+    for part in [owner, purpose.as_str(), recipient, code] {
         mac.update(&(part.len() as u64).to_be_bytes());
         mac.update(part.as_bytes());
     }
     Ok(hex::encode(mac.finalize().into_bytes()))
 }
 
-fn generate_code(format: OtpFormat) -> AppResult<String> {
-    if format == OtpFormat::LongToken {
+fn generate_code(purpose: EmailPurpose) -> AppResult<String> {
+    if purpose.uses_long_token() {
         return Ok(format!(
             "{}{}",
             Uuid::new_v4().simple(),
@@ -136,7 +146,8 @@ fn generate_code(format: OtpFormat) -> AppResult<String> {
     }
     loop {
         let mut bytes = [0; 4];
-        getrandom::fill(&mut bytes).map_err(AppError::internal_error)?;
+        getrandom::fill(&mut bytes)
+            .map_err(|error| AppError::internal_debug("OTP random generation failed", error))?;
         let number = u32::from_be_bytes(bytes);
         if number < u32::MAX - (u32::MAX % 1_000_000) {
             return Ok(format!("{:06}", number % 1_000_000));
@@ -158,29 +169,43 @@ fn query_value(value: &str) -> String {
 }
 
 pub(crate) struct VerificationTarget<'a> {
-    pub user: Option<&'a UserRow>,
-    pub purpose: EmailPurpose,
-    pub recipient: &'a str,
-    pub context: &'a str,
-    pub session: &'a str,
+    user: Option<&'a UserRow>,
+    purpose: EmailPurpose,
+    recipient: &'a str,
+    session: &'a str,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub(crate) enum OtpFormat {
-    SixDigit,
-    LongToken,
-}
+impl<'a> VerificationTarget<'a> {
+    pub(crate) const fn account(
+        user: &'a UserRow,
+        purpose: EmailPurpose,
+        session: &'a str,
+    ) -> Self {
+        Self::for_recipient(user, purpose, user.email.as_str(), session)
+    }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub(crate) enum ReservationMode {
-    ReuseActive,
-    Fresh,
-}
+    pub(crate) const fn for_recipient(
+        user: &'a UserRow,
+        purpose: EmailPurpose,
+        recipient: &'a str,
+        session: &'a str,
+    ) -> Self {
+        Self {
+            user: Some(user),
+            purpose,
+            recipient,
+            session,
+        }
+    }
 
-#[derive(Clone, Copy)]
-pub(crate) struct IssuePolicy {
-    pub format: OtpFormat,
-    pub reservation: ReservationMode,
+    pub(crate) const fn registration(recipient: &'a str) -> Self {
+        Self {
+            user: None,
+            purpose: EmailPurpose::Registration,
+            recipient,
+            session: "",
+        }
+    }
 }
 
 pub(crate) struct EmailVerifier<'a> {
@@ -193,11 +218,7 @@ pub(crate) struct EmailVerifier<'a> {
 impl EmailVerifier<'_> {
     /// Reserve first, deliver synchronously, then enable the code. Failed delivery
     /// cannot leave an active code behind or report a successful send.
-    pub(crate) async fn issue_code(
-        &self,
-        target: VerificationTarget<'_>,
-        policy: IssuePolicy,
-    ) -> AppResult<()> {
+    pub(crate) async fn issue_code(&self, target: VerificationTarget<'_>) -> AppResult<()> {
         let Self {
             db,
             env,
@@ -208,7 +229,6 @@ impl EmailVerifier<'_> {
             user,
             purpose,
             recipient,
-            context,
             session,
         } = target;
         if !mail_configured(env) {
@@ -218,8 +238,8 @@ impl EmailVerifier<'_> {
         let owner = user.map_or(recipient.as_str(), |user| user.id.as_str());
         let stamp = user.map_or("", |user| user.security_stamp.as_str());
         let id = Uuid::new_v4().to_string();
-        let raw = generate_code(policy.format)?;
-        let hash = code_hash(access_secret, owner, purpose, &recipient, context, &raw)?;
+        let raw = generate_code(purpose)?;
+        let hash = code_hash(access_secret, owner, purpose, &recipient, &raw)?;
         let purpose_str = purpose.as_str();
         let code = VerificationCode {
             id: &id,
@@ -227,13 +247,12 @@ impl EmailVerifier<'_> {
             user_id: user.map(|user| user.id.as_str()),
             purpose: purpose_str,
             recipient: &recipient,
-            context,
             hash: &hash,
             stamp,
             session,
         };
         let Some(mail) = ReservedMail::reserve(db, code).await? else {
-            if policy.reservation == ReservationMode::ReuseActive
+            if purpose.can_reuse_active_code()
                 && email_model::can_reuse(db, &code, crate::utils::time::now_seconds()).await?
             {
                 return Ok(());
@@ -269,7 +288,7 @@ impl EmailVerifier<'_> {
         };
         let text = format!(
             "Your raywarden {purpose_str} verification code is:\n\n{raw}\n\nIt \
-         expires in 10 minutes.\nAccount: {recipient}\nContext: {context}{}",
+         expires in 10 minutes.\nAccount: {recipient}{}",
             link.map_or(String::new(), |url| format!("\n\nContinue: {url}"))
         );
         mail.deliver(env, "raywarden verification", &text).await
@@ -279,18 +298,42 @@ impl EmailVerifier<'_> {
         let email = email_provider(self.db, &user.id).await?.ok_or_else(|| {
             AppError::bad_request("Email two-factor authentication is not enabled")
         })?;
-        self.issue_code(
-            VerificationTarget {
-                user: Some(user),
-                purpose: EmailPurpose::Login,
-                recipient: &email,
-                context: "",
-                session: "",
-            },
-            IssuePolicy {
-                format: OtpFormat::SixDigit,
-                reservation: ReservationMode::ReuseActive,
-            },
+        self.issue_code(VerificationTarget::for_recipient(
+            user,
+            EmailPurpose::Login,
+            &email,
+            "",
+        ))
+        .await
+    }
+
+    pub(crate) async fn verify_code(
+        &self,
+        target: VerificationTarget<'_>,
+        raw: &str,
+        consume: bool,
+    ) -> AppResult<()> {
+        let mode = if consume {
+            CodeCheck::Consume
+        } else {
+            CodeCheck::CountAttempt
+        };
+        check_code(self.db, self.access_secret, target, raw, mode)
+            .await
+            .map(|_| ())
+    }
+
+    pub(crate) async fn prepare_code(
+        &self,
+        target: VerificationTarget<'_>,
+        raw: &str,
+    ) -> AppResult<VerifiedCode> {
+        check_code(
+            self.db,
+            self.access_secret,
+            target,
+            raw,
+            CodeCheck::PreserveOnSuccess,
         )
         .await
     }
@@ -308,7 +351,16 @@ impl EmailVerifier<'_> {
         claims: &Claims,
         payload: &AccountVerificationRequest,
     ) -> AppResult<Option<VerifiedCode>> {
-        prepare_password_or_otp(self.db, self.env, self.access_secret, claims, payload).await
+        check_password_or_otp(
+            self.db,
+            self.env,
+            self.access_secret,
+            claims,
+            payload,
+            CodeCheck::PreserveOnSuccess,
+        )
+        .await
+        .map(|(_, proof)| proof)
     }
 
     pub(crate) async fn prepare_account_action<'a>(
@@ -329,32 +381,6 @@ impl EmailVerifier<'_> {
     }
 }
 
-pub(crate) async fn verify_code(
-    db: &D1Database,
-    access_secret: &str,
-    target: VerificationTarget<'_>,
-    raw: &str,
-    consume: bool,
-) -> AppResult<()> {
-    let mode = if consume {
-        CodeCheck::Consume
-    } else {
-        CodeCheck::CountAttempt
-    };
-    check_code(db, access_secret, target, raw, mode)
-        .await
-        .map(|_| ())
-}
-
-pub(crate) async fn prepare_code(
-    db: &D1Database,
-    access_secret: &str,
-    target: VerificationTarget<'_>,
-    raw: &str,
-) -> AppResult<VerifiedCode> {
-    check_code(db, access_secret, target, raw, CodeCheck::PreserveOnSuccess).await
-}
-
 async fn check_code(
     db: &D1Database,
     access_secret: &str,
@@ -366,7 +392,6 @@ async fn check_code(
         user,
         purpose,
         recipient,
-        context,
         session,
     } = target;
     if raw.is_empty() || raw.len() > 1024 {
@@ -374,21 +399,13 @@ async fn check_code(
     }
     let recipient = normalize_email(recipient)?;
     let owner = user.map_or(recipient.as_str(), |user| user.id.as_str());
-    let hash = code_hash(
-        access_secret,
-        owner,
-        purpose,
-        &recipient,
-        context,
-        raw.trim(),
-    )?;
+    let hash = code_hash(access_secret, owner, purpose, &recipient, raw.trim())?;
     let code = VerificationCode {
         id: "",
         owner,
         user_id: user.map(|user| user.id.as_str()),
         purpose: purpose.as_str(),
         recipient: &recipient,
-        context,
         hash: &hash,
         stamp: user.map_or("", |user| user.security_stamp.as_str()),
         session,
@@ -418,25 +435,6 @@ pub async fn verify_password_or_otp(
         .map(|_| ())
 }
 
-pub(crate) async fn prepare_password_or_otp(
-    db: &D1Database,
-    env: &Env,
-    access_secret: &str,
-    claims: &Claims,
-    payload: &AccountVerificationRequest,
-) -> AppResult<Option<VerifiedCode>> {
-    check_password_or_otp(
-        db,
-        env,
-        access_secret,
-        claims,
-        payload,
-        CodeCheck::PreserveOnSuccess,
-    )
-    .await
-    .map(|(_, proof)| proof)
-}
-
 async fn check_password_or_otp(
     db: &D1Database,
     env: &Env,
@@ -448,13 +446,8 @@ async fn check_password_or_otp(
     let user = fetch_user(db, claims).await?;
     rate_limit::check_auth_attempt(env, format!("protected-action:{}", claims.sub)).await?;
     if let Some(hash) = payload.master_password_hash.as_deref() {
-        if crate::service::identity::user::verify_master_password(&user, hash)
-            .await?
-            .is_valid()
-        {
-            return Ok((user, None));
-        }
-        return Err(AuthError::InvalidPassword.into());
+        crate::service::identity::user::require_master_password(&user, hash).await?;
+        return Ok((user, None));
     }
     if payload.user_verification_token.is_some() {
         return Err(AppError::bad_request(
@@ -468,13 +461,7 @@ async fn check_password_or_otp(
     let proof = check_code(
         db,
         access_secret,
-        VerificationTarget {
-            user: Some(&user),
-            purpose: EmailPurpose::ProtectedAction,
-            recipient: &user.email,
-            context: "",
-            session: &claims.session_token,
-        },
+        VerificationTarget::account(&user, EmailPurpose::ProtectedAction, &claims.session_token),
         otp,
         mode,
     )
@@ -493,8 +480,9 @@ pub async fn email_provider(db: &D1Database, user_id: &str) -> AppResult<Option<
     let Some(provider) = provider.filter(|provider| provider.is_enabled) else {
         return Ok(None);
     };
-    let data: EmailProviderData =
-        serde_json::from_str(&provider.data).map_err(AppError::internal_error)?;
+    let data: EmailProviderData = serde_json::from_str(&provider.data).map_err(
+        AppError::internal_json("Stored email two-factor configuration is malformed"),
+    )?;
     Ok(data.email)
 }
 
@@ -516,13 +504,7 @@ pub(crate) async fn prepare_login_code(
     check_code(
         db,
         access_secret,
-        VerificationTarget {
-            user: Some(user),
-            purpose: EmailPurpose::Login,
-            recipient: &email,
-            context: "",
-            session: "",
-        },
+        VerificationTarget::for_recipient(user, EmailPurpose::Login, &email, ""),
         code,
         CodeCheck::PreserveOnSuccess,
     )
@@ -544,17 +526,12 @@ pub(crate) async fn registration_proof(
     if !required {
         return Ok(None);
     }
-    prepare_code(
+    check_code(
         db,
         access_secret,
-        VerificationTarget {
-            user: None,
-            purpose: EmailPurpose::Registration,
-            recipient: email,
-            context: "",
-            session: "",
-        },
+        VerificationTarget::registration(email),
         token.ok_or_else(|| AppError::bad_request("Email verification is required"))?,
+        CodeCheck::PreserveOnSuccess,
     )
     .await
     .map(Some)
@@ -593,7 +570,6 @@ pub async fn send_password_hint(
         &user.id,
         EmailPurpose::PasswordHint,
         &user.email,
-        "",
         &id,
     )?;
     let marker = VerificationCode {
@@ -602,7 +578,6 @@ pub async fn send_password_hint(
         user_id: Some(&user.id),
         purpose: EmailPurpose::PasswordHint.as_str(),
         recipient: &user.email,
-        context: "",
         hash: &hash,
         stamp: &user.security_stamp,
         session: "",
@@ -655,9 +630,11 @@ impl<'a> ReservedMail<'a> {
             .await
             .is_err()
         {
-            log::warn!("Email webhook delivery failed for {}", self.code.purpose);
+            log::warn!("Email delivery failed for {}", self.code.purpose);
             email_model::cancel(db, self.code.id).await?;
-            return Err(AppError::ServiceUnavailable);
+            return Err(AppError::service_unavailable(
+                "Email verification delivery failed",
+            ));
         }
         email_model::mark_ready(db, self.code.id).await
     }
@@ -667,13 +644,12 @@ impl<'a> ReservedMail<'a> {
 mod tests {
     use super::*;
     #[test]
-    fn code_hash_is_bound_to_recipient_purpose_and_context() {
+    fn code_hash_is_bound_to_recipient_and_purpose() {
         let hash = code_hash(
             "secret",
             "owner",
             EmailPurpose::Login,
             "a@example.com",
-            "",
             "123456",
         )
         .expect("valid email fixture");
@@ -684,7 +660,6 @@ mod tests {
                 "owner",
                 EmailPurpose::Setup,
                 "a@example.com",
-                "",
                 "123456"
             )
             .expect("valid email fixture")
@@ -696,19 +671,6 @@ mod tests {
                 "owner",
                 EmailPurpose::Login,
                 "b@example.com",
-                "",
-                "123456"
-            )
-            .expect("valid email fixture")
-        );
-        assert_ne!(
-            hash,
-            code_hash(
-                "secret",
-                "owner",
-                EmailPurpose::Login,
-                "a@example.com",
-                "device",
                 "123456"
             )
             .expect("valid email fixture")

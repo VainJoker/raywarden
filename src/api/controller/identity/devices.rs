@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use axum::{
-    extract::{FromRequestParts, Path, State},
+    extract::{FromRequestParts, State},
     http::request::Parts,
 };
 use base64::{
@@ -14,16 +14,16 @@ use crate::{
     api::{
         AppState,
         common::{
-            extract::ClientIp,
+            extract::{ClientIp, Path},
             json::Json,
-            response::{ApiResponse, EmptyObject},
+            response::{ApiResponse, EmptyObject, ListResponse},
         },
     },
     errors::{AppError, AppResult},
     models::identity::{auth_request::AuthRequestRow, device::DeviceRow},
     service::{
         identity::{session::Claims, user::AccountVerificationRequest},
-        notifications::{admin as admin_notify, admin::Event, push},
+        notifications::{admin as admin_notify, admin::Event},
         rate_limit,
     },
 };
@@ -63,15 +63,7 @@ impl From<DeviceRow> for DeviceResponse {
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
-pub(in crate::api) struct DeviceListResponse {
-    data: Vec<DeviceListItem>,
-    continuation_token: Option<String>,
-    object: &'static str,
-}
-
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-struct DeviceListItem {
+pub(in crate::api) struct DeviceListItem {
     #[serde(flatten)]
     device: DeviceResponse,
     device_pending_auth_request: Option<PendingDeviceAuthRequest>,
@@ -88,7 +80,7 @@ struct PendingDeviceAuthRequest {
 pub(in crate::api) async fn list_devices(
     claims: Claims,
     State(state): State<Arc<AppState>>,
-) -> AppResult<ApiResponse<DeviceListResponse>> {
+) -> AppResult<ApiResponse<ListResponse<DeviceListItem>>> {
     let db = state.database();
     let devices = DeviceRow::list_for_user(db, &claims.sub).await?;
     let requests = AuthRequestRow::list_pending_for_user(db, &claims.sub).await?;
@@ -107,12 +99,8 @@ pub(in crate::api) async fn list_devices(
                 device_pending_auth_request,
             }
         })
-        .collect();
-    Ok(ApiResponse(DeviceListResponse {
-        data,
-        continuation_token: None,
-        object: "list",
-    }))
+        .collect::<Vec<_>>();
+    Ok(ApiResponse(data.into()))
 }
 
 pub(in crate::api) struct KnownDeviceHeaders {
@@ -199,35 +187,18 @@ pub(in crate::api) struct SetDevicePushTokenRequest {
     push_token: String,
 }
 
-enum PushTokenOp<'a> {
-    Set(&'a str),
-    Clear,
-}
-
 async fn set_token(
     state: &AppState,
     claims: &Claims,
     device_id: &str,
-    operation: PushTokenOp<'_>,
+    token: Option<&str>,
 ) -> AppResult<ApiResponse<EmptyObject>> {
     if claims.device() != Some(device_id) {
         return Err(AppError::bad_request(
             "Can only update the authenticated device",
         ));
     }
-    let db = state.database();
-    match operation {
-        PushTokenOp::Set(token) => {
-            DeviceRow::set_push_token(db, &claims.sub, device_id, Some(token)).await?;
-            push::register_device(&state.env, &claims.sub, device_id).await?;
-        }
-        PushTokenOp::Clear => {
-            if let Err(error) = push::unregister_device(&state.env, &claims.sub, device_id).await {
-                log::warn!("Push device unregistration failed: {error}");
-            }
-            DeviceRow::set_push_token(db, &claims.sub, device_id, None).await?;
-        }
-    }
+    DeviceRow::set_push_token(state.database(), &claims.sub, device_id, token).await?;
     Ok(ApiResponse(EmptyObject {}))
 }
 
@@ -242,7 +213,7 @@ pub(in crate::api) async fn set_device_push_token(
     if token.is_empty() || token.len() > 4096 {
         return Err(AppError::bad_request("Invalid push token"));
     }
-    set_token(&state, &claims, &device_id, PushTokenOp::Set(token)).await
+    set_token(&state, &claims, &device_id, Some(token)).await
 }
 
 #[worker::send]
@@ -251,7 +222,7 @@ pub(in crate::api) async fn clear_device_push_token(
     State(state): State<Arc<AppState>>,
     Path(device_id): Path<String>,
 ) -> AppResult<ApiResponse<EmptyObject>> {
-    set_token(&state, &claims, &device_id, PushTokenOp::Clear).await
+    set_token(&state, &claims, &device_id, None).await
 }
 
 #[worker::send]
@@ -260,9 +231,6 @@ pub(in crate::api) async fn delete_device(
     State(state): State<Arc<AppState>>,
     Path(device_id): Path<String>,
 ) -> AppResult<ApiResponse<EmptyObject>> {
-    if let Err(error) = push::unregister_device(&state.env, &claims.sub, &device_id).await {
-        log::warn!("Push device unregistration failed: {error}");
-    }
     DeviceRow::delete_for_user(state.database(), &claims.sub, &device_id).await?;
     Ok(ApiResponse(EmptyObject {}))
 }
@@ -279,8 +247,7 @@ pub(in crate::api) async fn revoke_all_sessions(
         .prepare_account_action(&claims, &payload)
         .await?;
     let stamp = uuid::Uuid::new_v4().to_string();
-    let devices = DeviceRow::revoke_all_with_stamp(db, &authorization, &stamp).await?;
-    push::unregister_devices(&state.env, &devices).await;
+    DeviceRow::revoke_all_with_stamp(db, &authorization, &stamp).await?;
     crate::service::notifications::publish_account_logout(
         &state.env,
         &claims,

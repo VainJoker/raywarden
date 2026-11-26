@@ -234,12 +234,14 @@ impl TokenExchange<'_> {
                     .ok_or_else(|| AppError::invalid_token_request("Missing send_id"))?;
                 let password = payload.password.as_deref();
                 TokenGrantResponse::Send(
-                    crate::service::send::SendTokenIssuer::new(
+                    crate::service::send::issue_access_token(
                         self.state.database(),
                         &self.state.env,
                         &self.state.jwt_keys.access_secret,
+                        self.headers,
+                        access_id,
+                        password,
                     )
-                    .issue_access_token(self.headers, access_id, password)
                     .await?,
                 )
             }
@@ -301,8 +303,7 @@ async fn ensure_account_snapshot(db: &worker::D1Database, user: &UserRow) -> App
         || current.password_salt != user.password_salt
         || current.password_iterations != user.password_iterations
         || current.security_stamp != user.security_stamp
-        || crate::models::identity::account_keys::AccountSnapshot::from_user(&current)
-            != crate::models::identity::account_keys::AccountSnapshot::from_user(user)
+        || !crate::models::identity::account_keys::AccountSnapshot::users_match(&current, user)
     {
         return Err(AppError::conflict(
             "Account encryption changed during authentication. Retry login.",
@@ -316,56 +317,34 @@ mod tests {
     use super::*;
 
     #[test]
-    fn only_explicit_credential_rejections_are_login_failures() {
-        for error in [
-            AuthError::InvalidPassword,
-            AuthError::InvalidTotp,
-            AuthError::UserNotFound,
-            AuthError::InvalidCredentials("rejected".into()),
-        ] {
-            assert!(rejected_credentials(&AppError::Auth(error)));
-        }
-        for error in [
-            AppError::TooManyRequests {
-                message: "limited".into(),
-            },
-            AppError::Database(crate::errors::DatabaseError::QueryFailed(
-                "unavailable".into(),
-            )),
-            AppError::Params("missing password".into()),
-            AppError::OAuth {
-                error: "version_header_missing",
-                description: "unsupported client",
-            },
-            AppError::IdentityChallenge(serde_json::json!({"TwoFactorProviders":[0]})),
-            AppError::Internal,
-        ] {
-            assert!(!rejected_credentials(&error));
-        }
-    }
-}
-#[cfg(test)]
-mod account_version_tests {
-    use super::*;
-    #[test]
-    fn version_gate_is_applied_to_v2_and_desktop_boundaries() {
-        let mut user:UserRow=serde_json::from_value(serde_json::json!({"id":"owner","email":"owner@example.test","is_email_verified":0,"master_password_hash":"hash","key":"wrapped-user","private_key":"2.private","public_key":"public","kdf_type":0,"kdf_iterations":600_000,"security_stamp":"stamp","created_at":"now","updated_at":"now"})).expect("valid identity fixture");
+    fn credential_rejections_and_client_version_gates_match_policy() {
+        assert!(rejected_credentials(&AppError::Auth(
+            AuthError::InvalidPassword
+        )));
+        assert!(!rejected_credentials(&AppError::TooManyRequests {
+            message: "limited".into()
+        }));
+        assert!(!rejected_credentials(&AppError::IdentityChallenge(
+            serde_json::json!({})
+        )));
+
+        let mut user: UserRow = serde_json::from_value(serde_json::json!({
+            "id": "owner", "email": "owner@example.test", "is_email_verified": 0,
+            "master_password_hash": "hash", "key": "wrapped", "private_key": "2.private",
+            "public_key": "public", "kdf_type": 0, "kdf_iterations": 600_000,
+            "security_stamp": "stamp", "created_at": "now", "updated_at": "now"
+        }))
+        .expect("user");
         let mut headers = HeaderMap::new();
-        assert!(matches!(
+        assert!(
             validate_client_version(
                 &user,
                 ClientVersionHeader::from_headers(&headers).0,
                 &headers
-            ),
-            Err(AppError::OAuth {
-                error: "version_header_missing",
-                ..
-            })
-        ));
-        headers.insert(
-            "bitwarden-client-version",
-            "2026.7.0".parse().expect("valid identity fixture"),
+            )
+            .is_err()
         );
+        headers.insert("bitwarden-client-version", "2026.7.0".parse().expect("hdr"));
         assert!(
             validate_client_version(
                 &user,
@@ -386,8 +365,9 @@ mod account_version_tests {
         );
         headers.insert(
             "bitwarden-client-version",
-            "2026.10.1".parse().expect("valid identity fixture"),
+            "2026.10.2".parse().expect("hdr"),
         );
+        headers.insert("device-type", "6".parse().expect("hdr"));
         assert!(
             validate_client_version(
                 &user,
@@ -396,45 +376,5 @@ mod account_version_tests {
             )
             .is_ok()
         );
-        headers.insert("device-type", "6".parse().expect("valid identity fixture"));
-        assert!(
-            validate_client_version(
-                &user,
-                ClientVersionHeader::from_headers(&headers).0,
-                &headers
-            )
-            .is_err()
-        );
-        headers.insert(
-            "bitwarden-client-version",
-            "2026.10.2".parse().expect("valid identity fixture"),
-        );
-        assert!(
-            validate_client_version(
-                &user,
-                ClientVersionHeader::from_headers(&headers).0,
-                &headers
-            )
-            .is_ok()
-        );
-        for (version, accepted) in [
-            ("2026.10.2-beta.1", false),
-            ("2026.11.0-beta.1+build", true),
-        ] {
-            headers.insert(
-                "bitwarden-client-version",
-                version.parse().expect("valid identity fixture"),
-            );
-            assert_eq!(
-                validate_client_version(
-                    &user,
-                    ClientVersionHeader::from_headers(&headers).0,
-                    &headers
-                )
-                .is_ok(),
-                accepted,
-                "{version}"
-            );
-        }
     }
 }

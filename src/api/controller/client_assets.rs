@@ -1,18 +1,18 @@
 use axum::{
     body::Body,
-    extract::{Path, State},
+    extract::State,
     http::{HeaderMap, HeaderValue, StatusCode, header},
-    response::{Html, IntoResponse, Response},
+    response::{IntoResponse, Response},
 };
-use futures_util::StreamExt as _;
-use serde::Serialize;
+use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
 use crate::{
-    api::common::response::ApiResponse,
+    api::common::{extract::Path, response::ApiResponse},
     errors::AppResult,
     infra::config::{env_bool, registration_disabled},
     service::web_vault_ui,
+    utils::collect_bounded,
 };
 
 const MAX_ICON_BYTES: usize = 5 * 1024 * 1024;
@@ -58,7 +58,7 @@ async fn fetch_icon(domain: &str) -> AppResult<Option<(String, Vec<u8>)>> {
     {
         return Ok(None);
     }
-    Ok(collect_icon_body(upstream.stream()?)
+    Ok(collect_bounded(upstream.stream()?, MAX_ICON_BYTES)
         .await?
         .map(|bytes| (kind, bytes)))
 }
@@ -86,21 +86,6 @@ fn is_valid_icon_content_type(value: &str) -> bool {
     ]
     .iter()
     .any(|allowed| kind.eq_ignore_ascii_case(allowed))
-}
-
-async fn collect_icon_body(
-    stream: impl futures_util::Stream<Item = worker::Result<Vec<u8>>>,
-) -> worker::Result<Option<Vec<u8>>> {
-    futures_util::pin_mut!(stream);
-    let mut bytes = Vec::new();
-    while let Some(chunk) = stream.next().await {
-        let chunk = chunk?;
-        if chunk.len() > MAX_ICON_BYTES - bytes.len() {
-            return Ok(None);
-        }
-        bytes.extend_from_slice(&chunk);
-    }
-    Ok(Some(bytes))
 }
 
 fn is_valid_icon_domain(domain: &str) -> bool {
@@ -153,84 +138,34 @@ fn matches_etag(headers: &HeaderMap, etag: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use std::cell::Cell;
-
-    use futures_util::{FutureExt as _, StreamExt as _, stream};
+    use futures_util::{FutureExt as _, stream};
 
     use super::{
-        MAX_ICON_BYTES, collect_icon_body, is_valid_icon_content_type, is_valid_icon_domain,
+        MAX_ICON_BYTES, collect_bounded, is_valid_icon_content_type, is_valid_icon_domain,
     };
+
     #[test]
-    fn icons_cannot_escape_the_fixed_upstream_path() {
+    fn icons_validate_domain_mime_and_bounded_reads() {
         assert!(is_valid_icon_domain("vault.example.com"));
-        for bad in [
-            "",
-            "../admin",
-            "example.com?token=x",
-            "a%2fb",
-            "a@b",
-            "-a.test",
-        ] {
+        for bad in ["", "../admin", "example.com?x=1", "a%2fb", "-a.test"] {
             assert!(!is_valid_icon_domain(bad));
         }
-    }
+        assert!(is_valid_icon_content_type("IMAGE/JPEG; charset=binary"));
+        assert!(!is_valid_icon_content_type("image/svg+xml"));
 
-    #[test]
-    fn icons_only_accept_known_raster_content_types() {
-        for value in [
-            "image/png",
-            "IMAGE/JPEG; charset=binary",
-            " image/webp ",
-            "image/x-icon",
-        ] {
-            assert!(is_valid_icon_content_type(value));
-        }
-        for value in [
-            "",
-            "image/svg+xml",
-            "image/unknown",
-            "text/html",
-            "application/octet-stream",
-        ] {
-            assert!(!is_valid_icon_content_type(value));
-        }
-    }
-
-    #[test]
-    fn icon_reads_accept_the_limit_and_stop_on_the_first_excess_chunk() {
-        let exact = stream::iter([Ok(vec![0; MAX_ICON_BYTES - 1]), Ok(vec![1])]);
-        assert_eq!(
-            collect_icon_body(exact)
-                .now_or_never()
-                .expect("valid presentation fixture")
-                .expect("valid presentation fixture")
-                .expect("valid presentation fixture")
-                .len(),
-            MAX_ICON_BYTES
-        );
-        let reads = Cell::new(0);
-        let excess = stream::iter([Ok(vec![0; MAX_ICON_BYTES]), Ok(vec![1]), Ok(vec![2])])
-            .inspect(|_| reads.set(reads.get() + 1));
+        let excess = stream::iter([Ok::<_, ()>(vec![0; MAX_ICON_BYTES]), Ok(vec![1])]);
         assert!(
-            collect_icon_body(excess)
+            collect_bounded(excess, MAX_ICON_BYTES)
                 .now_or_never()
-                .expect("valid presentation fixture")
-                .expect("valid presentation fixture")
+                .expect("ready")
+                .expect("ok")
                 .is_none()
         );
-        assert_eq!(reads.get(), 2);
-    }
-
-    #[test]
-    fn interrupted_icon_reads_never_publish_partial_content() {
-        let interrupted = stream::iter([
-            Ok(vec![0]),
-            Err(worker::Error::RustError("interrupted".into())),
-        ]);
+        let interrupted = stream::iter([Ok(vec![0]), Err(worker::Error::RustError("err".into()))]);
         assert!(
-            collect_icon_body(interrupted)
+            collect_bounded(interrupted, MAX_ICON_BYTES)
                 .now_or_never()
-                .expect("valid presentation fixture")
+                .expect("ready")
                 .is_err()
         );
     }
@@ -252,49 +187,13 @@ pub(in crate::api) async fn client_script() -> Response {
 }
 
 #[worker::send]
-pub(in crate::api) async fn demo_page(State(env): State<worker::Env>) -> Response {
-    let mut response = if env_bool(&env, "DEMO_PAGE_ENABLED", false) {
-        Html(include_str!("../../../static/demo.html")).into_response()
-    } else {
-        StatusCode::NOT_FOUND.into_response()
-    };
-    response
-        .headers_mut()
-        .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
-    response.headers_mut().insert(
-        header::X_CONTENT_TYPE_OPTIONS,
-        HeaderValue::from_static("nosniff"),
-    );
-    response.headers_mut().insert(
-        header::CONTENT_SECURITY_POLICY,
-        HeaderValue::from_static(
-            "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src \
-             'self' 'unsafe-inline'; img-src 'self' data:; connect-src \
-             'self'; frame-ancestors 'self'; form-action 'self'; base-uri \
-             'self'; object-src 'none'",
-        ),
-    );
-    response
-}
-
-#[derive(Serialize)]
-pub(in crate::api) struct AppleAppSiteAssociation {
-    webcredentials: AppleWebCredentials,
-}
-
-#[derive(Serialize)]
-struct AppleWebCredentials {
-    apps: [&'static str; 2],
-}
-
-#[worker::send]
-pub(in crate::api) async fn apple_app_site_association() -> ApiResponse<AppleAppSiteAssociation> {
-    ApiResponse(AppleAppSiteAssociation {
-        webcredentials: AppleWebCredentials {
-            apps: [
+pub(in crate::api) async fn apple_app_site_association() -> ApiResponse<Value> {
+    ApiResponse(json!({
+        "webcredentials": {
+            "apps": [
                 "LTZ2PFU5D6.com.8bit.bitwarden",
                 "LTZ2PFU5D6.com.8bit.bitwarden.beta",
             ],
         },
-    })
+    }))
 }

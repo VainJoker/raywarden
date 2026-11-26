@@ -1,9 +1,6 @@
 use std::sync::Arc;
 
-use axum::{
-    extract::{Query, State},
-    response::Response,
-};
+use axum::{extract::State, response::Response};
 use serde::Deserialize;
 use serde_json::{Value, json};
 
@@ -11,7 +8,7 @@ use crate::{
     api::{
         AppState,
         common::{
-            extract::ClientVersionHeader,
+            extract::{ClientVersionHeader, Query},
             snapshot::{ReadSnapshot, SnapshotJson},
         },
     },
@@ -43,85 +40,64 @@ pub(in crate::api) async fn sync_vault(
     let show_ssh_keys = version
         .is_some_and(|version| !version.is_prerelease && version.satisfies_minimum(2024, 12, 0));
 
-    VaultSync {
-        state: &state,
-        claims: &claims,
-    }
-    .respond(show_ssh_keys, query.exclude_domains)
-    .await
-}
+    let db = state.database();
+    let mut user = ReadSnapshot::user(db, &claims, "Failed to fetch user for sync").await?;
+    let snapshot = ReadSnapshot::from_user(&user);
+    let exclude_domains = query.exclude_domains;
+    let user_id = &claims.sub;
+    let is_two_factor_enabled =
+        crate::service::identity::two_factor::is_two_factor_enabled(db, user_id).await?;
+    let has_master_password = !user.master_password_hash.is_empty();
+    let decryption = user_decryption(&user, has_master_password);
 
-/// Validate the source account and session again before releasing a response
-/// assembled from multiple reads.
-struct VaultSync<'a> {
-    state: &'a AppState,
-    claims: &'a Claims,
-}
+    let equivalent_domains = std::mem::take(&mut user.equivalent_domains);
+    let excluded_globals = std::mem::take(&mut user.excluded_globals);
+    let mut profile = ProfileResponse::from_user(user, is_two_factor_enabled);
+    profile.status = i32::from(!has_master_password);
 
-impl VaultSync<'_> {
-    async fn respond(self, show_ssh_keys: bool, exclude_domains: bool) -> AppResult<Response> {
-        let db = self.state.database();
-        let user = ReadSnapshot::user(db, self.claims, "Failed to fetch user for sync").await?;
-        let snapshot = ReadSnapshot::from_user(&user);
-        let response = self.render(user, show_ssh_keys, exclude_domains).await?;
-        snapshot.verify(db, self.claims).await?;
-        admin_notify::emit(&self.state.env, Event::Sync, &self.claims.sub).await;
-        Ok(response)
-    }
-
-    async fn render(
-        &self,
-        mut user: UserRow,
-        show_ssh_keys: bool,
-        exclude_domains: bool,
-    ) -> AppResult<Response> {
-        let db = self.state.database();
-        let user_id = &self.claims.sub;
-        let is_two_factor_enabled =
-            crate::service::identity::two_factor::is_two_factor_enabled(db, user_id).await?;
-        let has_master_password = !user.master_password_hash.is_empty();
-        let decryption = user_decryption(&user, has_master_password);
-
-        let equivalent_domains = std::mem::take(&mut user.equivalent_domains);
-        let excluded_globals = std::mem::take(&mut user.excluded_globals);
-        let mut profile = ProfileResponse::from_user(user, is_two_factor_enabled);
-        profile.status = i32::from(!has_master_password);
-
-        let mut response = SnapshotJson::new();
-        response.field("profile", &profile)?;
-        let mut folders = response.array("folders")?;
-        folder::visit_folder_responses(db, user_id, |folder| folders.push(&folder)).await?;
-        folders.finish()?;
-        response.field("collections", &[] as &[()])?;
-        response.field("policies", &[] as &[()])?;
-        response.field("policiesNew", &[] as &[()])?;
-
-        let mut ciphers = response.array("ciphers")?;
-        cipher::visit_cipher_responses(
-            db,
-            user_id,
-            attachment::include_metadata(&self.state.env),
-            show_ssh_keys,
-            false,
-            self.state.domain(),
-            |cipher| ciphers.push(&cipher),
-        )
+    let mut response = SnapshotJson::new();
+    response.field("profile", &profile)?;
+    response
+        .write_array("folders", async |folders| {
+            folder::visit_folder_responses(db, user_id, |folder| folders.push(&folder)).await
+        })
         .await?;
-        ciphers.finish()?;
+    response.field("collections", &[] as &[()])?;
+    response.field("policies", &[] as &[()])?;
+    response.field("policiesNew", &[] as &[()])?;
 
-        let domains = if exclude_domains {
-            None
-        } else {
-            Some(domains::render_settings(db, &equivalent_domains, &excluded_globals, false).await)
-        };
-        response.field("domains", &domains)?;
-        let mut sends = response.array("sends")?;
-        send::visit_send_responses(db, user_id, |send| sends.push(&send)).await?;
-        sends.finish()?;
-        response.field("userDecryption", &decryption)?;
-        response.field("object", &"sync")?;
-        response.finish()
-    }
+    response
+        .write_array("ciphers", async |ciphers| {
+            cipher::visit_cipher_responses(
+                db,
+                user_id,
+                attachment::include_metadata(&state.env),
+                show_ssh_keys,
+                false,
+                state.domain(),
+                |cipher| ciphers.push(&cipher),
+            )
+            .await
+        })
+        .await?;
+
+    let domains = if exclude_domains {
+        None
+    } else {
+        Some(domains::render_settings(db, &equivalent_domains, &excluded_globals, false).await)
+    };
+    response.field("domains", &domains)?;
+    response
+        .write_array("sends", async |sends| {
+            send::visit_send_responses(db, user_id, |send| sends.push(&send)).await
+        })
+        .await?;
+    response.field("userDecryption", &decryption)?;
+    response.field("object", &"sync")?;
+    let response = response.finish()?;
+    snapshot.verify(db, &claims).await?;
+    admin_notify::emit(&state.env, Event::Sync, &claims.sub).await;
+    Ok(response)
 }
 
 fn user_decryption(user: &UserRow, has_master_password: bool) -> Value {

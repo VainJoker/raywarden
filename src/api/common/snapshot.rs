@@ -41,7 +41,7 @@ impl ReadSnapshot {
     pub(in crate::api) async fn user(
         db: &D1Database,
         claims: &Claims,
-        context: &str,
+        context: &'static str,
     ) -> AppResult<UserRow> {
         UserRow::fetch_by_id_with(db, &claims.sub, context, || {
             AppError::Auth(AuthError::UserNotFound)
@@ -51,9 +51,7 @@ impl ReadSnapshot {
 
     pub(in crate::api) async fn verify(&self, db: &D1Database, claims: &Claims) -> AppResult<()> {
         let current = Self::user(db, claims, "Failed to verify vault snapshot").await?;
-        if self.account != AccountSnapshot::from_user(&current)
-            || self.revision != current.updated_at
-        {
+        if !self.account.matches_user(&current) || self.revision != current.updated_at {
             return Err(AppError::conflict(
                 "Account or vault changed during sync. Retry sync.",
             ));
@@ -73,7 +71,33 @@ pub(in crate::api) struct SnapshotJson {
     empty: bool,
 }
 
+pub(in crate::api) enum ListOrder {
+    ObjectFirst,
+    ContinuationFirst,
+}
+
 impl SnapshotJson {
+    pub(in crate::api) async fn list(
+        db: &D1Database,
+        claims: &Claims,
+        order: ListOrder,
+        write: impl AsyncFnOnce(&mut SnapshotArray<'_>) -> AppResult<()>,
+    ) -> AppResult<Response> {
+        let snapshot = ReadSnapshot::capture(db, claims).await?;
+        let mut response = Self::new();
+        response.write_array("data", write).await?;
+        let mut metadata = [("object", Some("list")), ("continuationToken", None)];
+        if matches!(order, ListOrder::ContinuationFirst) {
+            metadata.swap(0, 1);
+        }
+        for (key, value) in metadata {
+            response.field(key, &value)?;
+        }
+        let response = response.finish()?;
+        snapshot.verify(db, claims).await?;
+        Ok(response)
+    }
+
     pub(in crate::api) fn new() -> Self {
         let mut current = Vec::with_capacity(CHUNK_BYTES);
         current.push(b'{');
@@ -105,13 +129,19 @@ impl SnapshotJson {
         self.output.value(value)
     }
 
-    pub(in crate::api) fn array(&mut self, key: &str) -> AppResult<SnapshotArray<'_>> {
+    pub(in crate::api) async fn write_array(
+        &mut self,
+        key: &str,
+        write: impl AsyncFnOnce(&mut SnapshotArray<'_>) -> AppResult<()>,
+    ) -> AppResult<()> {
         self.key(key)?;
         self.output.literal(b"[")?;
-        Ok(SnapshotArray {
+        let mut array = SnapshotArray {
             output: &mut self.output,
             empty: true,
-        })
+        };
+        write(&mut array).await?;
+        self.output.literal(b"]")
     }
 
     pub(in crate::api) fn finish(mut self) -> AppResult<Response> {
@@ -139,10 +169,6 @@ impl SnapshotArray<'_> {
         self.empty = false;
         self.output.value(value)
     }
-
-    pub(in crate::api) fn finish(self) -> AppResult<()> {
-        self.output.literal(b"]")
-    }
 }
 
 struct ChunkBuffer {
@@ -161,7 +187,7 @@ impl ChunkBuffer {
             if error.io_error_kind() == Some(io::ErrorKind::FileTooLarge) {
                 oversized_snapshot()
             } else {
-                AppError::internal_with_context("Failed to encode vault response", error)
+                AppError::internal_json("Failed to encode vault response")(error)
             }
         })
     }

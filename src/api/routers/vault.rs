@@ -2,14 +2,18 @@
 use std::sync::Arc;
 
 use axum::{
-    Router,
+    Extension, Router,
     extract::DefaultBodyLimit,
+    handler::Handler,
     routing::{get, post, put},
 };
 
-use crate::api::{
-    AppState,
-    controller::vault::{attachments, ciphers, domains, folders},
+use crate::{
+    api::{
+        AppState,
+        controller::vault::{attachments, ciphers, domains, folders},
+    },
+    models::vault::cipher::CipherMutation,
 };
 
 pub(super) fn router() -> Router<Arc<AppState>> {
@@ -59,12 +63,18 @@ fn attachments() -> Router<Arc<AppState>> {
 }
 
 fn ciphers() -> Router<Arc<AppState>> {
+    use CipherMutation::{Archive, HardDelete, Move, Restore, SoftDelete, Unarchive};
+
+    let mutate = ciphers::mutate_cipher;
+    let select = ciphers::mutate_cipher_selection;
+    let archive = ciphers::mutate_cipher_archive;
+    let move_ciphers = select.layer(Extension(Move { folder_id: None }));
     Router::new()
         .route(
             "/api/ciphers",
             get(ciphers::list_ciphers)
                 .post(ciphers::create_cipher)
-                .delete(ciphers::hard_delete_ciphers_bulk),
+                .delete(select.layer(Extension(HardDelete))),
         )
         .route(
             "/api/ciphers/create",
@@ -75,36 +85,48 @@ fn ciphers() -> Router<Arc<AppState>> {
             get(ciphers::get_cipher)
                 .put(ciphers::update_cipher)
                 .post(ciphers::update_cipher)
-                .delete(ciphers::hard_delete_cipher),
+                .delete(mutate.layer(Extension(HardDelete))),
         )
         .route("/api/ciphers/{id}/details", get(ciphers::get_cipher))
         .route(
             "/api/ciphers/{id}/delete",
-            put(ciphers::soft_delete_cipher).post(ciphers::hard_delete_cipher),
+            put(mutate.layer(Extension(SoftDelete))).post(mutate.layer(Extension(HardDelete))),
         )
         .route(
             "/api/ciphers/{id}/partial",
             put(ciphers::update_cipher_partial).post(ciphers::update_cipher_partial),
         )
-        .route("/api/ciphers/{id}/restore", put(ciphers::restore_cipher))
-        .route("/api/ciphers/{id}/archive", put(ciphers::archive_cipher))
+        .route(
+            "/api/ciphers/{id}/restore",
+            put(mutate.layer(Extension(Restore))),
+        )
+        .route(
+            "/api/ciphers/{id}/archive",
+            put(mutate.layer(Extension(Archive))),
+        )
         .route(
             "/api/ciphers/{id}/unarchive",
-            put(ciphers::unarchive_cipher),
+            put(mutate.layer(Extension(Unarchive))),
         )
         .route(
             "/api/ciphers/delete",
-            put(ciphers::soft_delete_ciphers_bulk).post(ciphers::hard_delete_ciphers_bulk),
+            put(select.layer(Extension(SoftDelete))).post(select.layer(Extension(HardDelete))),
         )
-        .route("/api/ciphers/restore", put(ciphers::restore_ciphers_bulk))
-        .route("/api/ciphers/archive", put(ciphers::archive_ciphers_bulk))
+        .route(
+            "/api/ciphers/restore",
+            put(select.layer(Extension(Restore))),
+        )
+        .route(
+            "/api/ciphers/archive",
+            put(archive.layer(Extension(Archive))),
+        )
         .route(
             "/api/ciphers/unarchive",
-            put(ciphers::unarchive_ciphers_bulk),
+            put(archive.layer(Extension(Unarchive))),
         )
         .route(
             "/api/ciphers/move",
-            post(ciphers::move_ciphers).put(ciphers::move_ciphers),
+            post(move_ciphers.clone()).put(move_ciphers),
         )
         .route("/api/ciphers/purge", post(ciphers::purge_vault))
         .route("/api/ciphers/import", post(ciphers::import_data))

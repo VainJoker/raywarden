@@ -77,7 +77,10 @@ pub(in crate::api) async fn authorize(
             object: "ownerSetup",
             expires_in: setup::TTL_SECONDS,
         }),
-        cookies: vec![HeaderValue::from_str(&cookie).map_err(AppError::internal_error)?],
+        cookies: vec![
+            HeaderValue::from_str(&cookie)
+                .map_err(|error| AppError::internal_debug("Failed to build setup cookie", error))?,
+        ],
     }))
 }
 

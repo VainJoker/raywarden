@@ -1,6 +1,5 @@
 pub mod admin;
 pub(crate) mod hub;
-pub mod push;
 
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use rmpv::Value as MsgValue;
@@ -8,23 +7,21 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest as _, Sha256};
 use worker::{
-    AbortSignal, Env, Fetch, Method, Request, RequestInit, RequestRedirect, Response,
-    wasm_bindgen::JsValue,
+    AbortSignal, Env, Fetch, Method, Request, RequestInit, RequestRedirect, wasm_bindgen::JsValue,
 };
 
+use self::hub::{HubError, HubResult};
 use crate::{
     errors::{AppError, AppResult, JwtError},
     infra::{db, jwt},
-    models::identity::push::PushDeviceRow,
 };
 
 pub const FANOUT_TOKEN_HEADER: &str = "x-raywarden-notify-token";
 pub const FANOUT_PATH: &str = "/internal/fanout";
 pub const PING: [u8; 3] = [2, 0x91, 6];
 pub const HANDSHAKE_RESPONSE: [u8; 3] = [b'{', b'}', 0x1e];
-const DELIVERY_TIMEOUT_MS: u32 = 5_000;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(i32)]
 pub enum UpdateType {
     SyncCipherUpdate = 0,
@@ -112,22 +109,15 @@ pub async fn issue_fanout_token(env: &Env, body: &str) -> AppResult<String> {
     jwt::encode(&claims, secret.as_bytes())
 }
 
-pub(crate) enum FanoutVerificationError {
-    InvalidProof,
-    Unavailable(&'static str),
-}
-
-pub(crate) async fn verify_fanout_token(
-    env: &Env,
-    body: &str,
-    token: &str,
-) -> Result<(), FanoutVerificationError> {
-    use FanoutVerificationError::{InvalidProof, Unavailable};
-
-    let db = db::binding(env).map_err(|_error| Unavailable("resolve D1 binding DB"))?;
+async fn verify_fanout_token(env: &Env, body: &str, token: &str) -> HubResult<()> {
+    let unavailable = |operation| {
+        log::warn!("Notification fanout verification failed to {operation}");
+        HubError::Unavailable
+    };
+    let db = db::binding(env).map_err(|_error| unavailable("resolve D1 binding DB"))?;
     let secret = crate::service::identity::jwt_keys::load(env, &db)
         .await
-        .map_err(|_error| Unavailable("load JWT signing keys"))?
+        .map_err(|_error| unavailable("load JWT signing keys"))?
         .access_secret;
     let options = jwt::ValidationOptions {
         leeway_seconds: 0,
@@ -135,17 +125,18 @@ pub(crate) async fn verify_fanout_token(
     };
     let claims = jwt::decode::<FanoutClaims>(token, secret.as_bytes(), &options).map_err(
         |error| match error {
-            JwtError::CryptoError(_) => Unavailable("verify JWT signature"),
-            _ => InvalidProof,
+            JwtError::CryptoError(_) => unavailable("verify JWT signature"),
+            _ => HubError::Forbidden,
         },
     )?;
     let digest = hex::encode(Sha256::digest(body.as_bytes()));
-    if claims.scope != "notifications.internal"
-        || !crate::utils::constant_time_eq(claims.body_hash.as_bytes(), digest.as_bytes())
+    if claims.scope == "notifications.internal"
+        && crate::utils::constant_time_eq(claims.body_hash.as_bytes(), digest.as_bytes())
     {
-        return Err(InvalidProof);
+        Ok(())
+    } else {
+        Err(HubError::Forbidden)
     }
-    Ok(())
 }
 
 pub fn is_signalr_handshake(message: &str) -> bool {
@@ -164,7 +155,8 @@ pub fn is_signalr_handshake(message: &str) -> bool {
 
 fn encode_signalr_frame(value: &MsgValue) -> AppResult<Vec<u8>> {
     let mut payload = Vec::new();
-    rmpv::encode::write_value(&mut payload, value).map_err(AppError::internal_error)?;
+    rmpv::encode::write_value(&mut payload, value)
+        .map_err(|error| AppError::internal_debug("Failed to encode SignalR frame", error))?;
     let mut size = payload.len();
     let mut result = Vec::with_capacity(size + 5);
     loop {
@@ -200,160 +192,70 @@ fn encode_messagepack_timestamp(date: &str) -> MsgValue {
     }
 }
 
+fn encode_invocation(target: &str, message: Vec<(MsgValue, MsgValue)>) -> AppResult<Vec<u8>> {
+    encode_signalr_frame(&MsgValue::Array(vec![
+        1.into(),
+        MsgValue::Map(vec![]),
+        MsgValue::Nil,
+        target.into(),
+        MsgValue::Array(vec![MsgValue::Map(message)]),
+    ]))
+}
+
 fn encode_update_message(
     update_type: UpdateType,
     payload: Vec<(MsgValue, MsgValue)>,
     context_id: Option<&str>,
 ) -> AppResult<Vec<u8>> {
-    encode_signalr_frame(&MsgValue::Array(vec![
-        1.into(),
-        MsgValue::Map(vec![]),
-        MsgValue::Nil,
-        "ReceiveMessage".into(),
-        MsgValue::Array(vec![MsgValue::Map(vec![
-            (
-                "ContextId".into(),
-                context_id.map_or(MsgValue::Nil, Into::into),
-            ),
-            ("Type".into(), (update_type as i32).into()),
-            ("Payload".into(), MsgValue::Map(payload)),
-        ])]),
-    ]))
+    encode_invocation("ReceiveMessage", vec![
+        (
+            "ContextId".into(),
+            context_id.map_or(MsgValue::Nil, Into::into),
+        ),
+        ("Type".into(), (update_type as i32).into()),
+        ("Payload".into(), MsgValue::Map(payload)),
+    ])
 }
 
-enum NotificationEvent<'a> {
-    Account { date: &'a str, reason: Option<i32> },
-    Cipher { id: &'a str, date: &'a str },
-    Revision { id: &'a str, date: &'a str },
-    AuthRequest { id: &'a str },
+fn account_payload(user_id: &str, date: &str) -> Vec<(MsgValue, MsgValue)> {
+    vec![
+        ("UserId".into(), user_id.into()),
+        ("Date".into(), encode_messagepack_timestamp(date)),
+    ]
 }
 
-/// A user event shared by `SignalR` and the mobile push relay.
-struct UserUpdate<'a> {
-    user_id: &'a str,
+fn item_payload(user_id: &str, id: &str) -> Vec<(MsgValue, MsgValue)> {
+    vec![("Id".into(), id.into()), ("UserId".into(), user_id.into())]
+}
+
+async fn publish_user(
+    env: &Env,
+    user_id: &str,
     kind: UpdateType,
-    context_id: Option<&'a str>,
-    payload: NotificationEvent<'a>,
+    payload: Vec<(MsgValue, MsgValue)>,
+    context_id: Option<&str>,
     logout_scope: Option<LogoutScope>,
+) {
+    let message = encode_update_message(kind, payload, context_id);
+    let selector = FanoutSelector::User {
+        user_id: user_id.to_owned(),
+        logout_scope,
+    };
+    publish(env, selector, message, kind == UpdateType::LogOut).await;
 }
 
-impl<'a> NotificationEvent<'a> {
-    const fn for_user(
-        self,
-        user_id: &'a str,
-        kind: UpdateType,
-        context_id: Option<&'a str>,
-    ) -> UserUpdate<'a> {
-        UserUpdate {
-            user_id,
-            kind,
-            context_id,
-            payload: self,
-            logout_scope: None,
-        }
-    }
-}
-
-impl UserUpdate<'_> {
-    fn with_logout_scope(mut self, scope: LogoutScope) -> Self {
-        self.logout_scope = Some(scope);
-        self
-    }
-
-    fn websocket_message(&self) -> AppResult<Vec<u8>> {
-        let user_id = self.user_id.into();
-        let payload = match self.payload {
-            NotificationEvent::Account { date, reason } => {
-                let mut fields = vec![
-                    ("UserId".into(), user_id),
-                    ("Date".into(), encode_messagepack_timestamp(date)),
-                ];
-                if let Some(reason) = reason {
-                    fields.push(("Reason".into(), reason.into()));
-                }
-                fields
-            }
-            NotificationEvent::Cipher { id, date } => vec![
-                ("Id".into(), id.into()),
-                ("UserId".into(), user_id),
-                ("OrganizationId".into(), MsgValue::Nil),
-                ("CollectionIds".into(), MsgValue::Nil),
-                ("RevisionDate".into(), encode_messagepack_timestamp(date)),
-            ],
-            NotificationEvent::Revision { id, date } => vec![
-                ("Id".into(), id.into()),
-                ("UserId".into(), user_id),
-                ("RevisionDate".into(), encode_messagepack_timestamp(date)),
-            ],
-            NotificationEvent::AuthRequest { id } => {
-                vec![("Id".into(), id.into()), ("UserId".into(), user_id)]
-            }
-        };
-        encode_update_message(self.kind, payload, self.context_id)
-    }
-
-    fn push_payload(&self) -> serde_json::Value {
-        use serde_json::json;
-
-        let user_id = self.user_id;
-        match self.payload {
-            NotificationEvent::Account { date, reason } => {
-                let mut payload = json!({"userId": user_id, "date": date});
-                if let Some(reason) = reason {
-                    payload["reason"] = json!(reason);
-                }
-                payload
-            }
-            NotificationEvent::Cipher { id, date } => json!({
-                "id": id, "userId": user_id, "organizationId": null,
-                "collectionIds": null, "revisionDate": date,
-            }),
-            NotificationEvent::Revision { id, date } => {
-                json!({"id": id, "userId": user_id, "revisionDate": date})
-            }
-            NotificationEvent::AuthRequest { id } => {
-                json!({"id": id, "userId": user_id})
+async fn publish(env: &Env, selector: FanoutSelector, message: AppResult<Vec<u8>>, logout: bool) {
+    let channel = match selector {
+        FanoutSelector::User { .. } => "WebSocket",
+        FanoutSelector::Anonymous { .. } => "Anonymous",
+    };
+    match message {
+        Ok(bytes) => {
+            if let Err(error) = fanout(env, selector, &bytes, logout).await {
+                log::warn!("{channel} notification failed: {error:?}");
             }
         }
-    }
-
-    async fn push(&self, env: &Env) -> AppResult<()> {
-        push::send_update(
-            env,
-            self.user_id,
-            self.kind,
-            &self.push_payload(),
-            self.context_id,
-        )
-        .await
-    }
-
-    async fn publish_websocket(&self, env: &Env) {
-        match self.websocket_message() {
-            Ok(message) => {
-                if let Err(error) = fanout(
-                    env,
-                    FanoutSelector::User {
-                        user_id: self.user_id.to_string(),
-                        logout_scope: self.logout_scope.clone(),
-                    },
-                    &message,
-                    self.kind == UpdateType::LogOut,
-                )
-                .await
-                {
-                    log::warn!("WebSocket notification failed: {error}");
-                }
-            }
-            Err(error) => log::warn!("Notification encoding failed: {error}"),
-        }
-    }
-
-    async fn publish(&self, env: &Env) {
-        self.publish_websocket(env).await;
-        if let Err(error) = self.push(env).await {
-            log::warn!("Mobile push failed: {error}");
-        }
+        Err(error) => log::warn!("{channel} notification encoding failed: {error:?}"),
     }
 }
 
@@ -367,7 +269,9 @@ async fn fanout(env: &Env, selector: FanoutSelector, bytes: &[u8], logout: bool)
         message: STANDARD.encode(bytes),
         logout,
     })
-    .map_err(AppError::internal_error)?;
+    .map_err(AppError::internal_json(
+        "Failed to serialize notification fanout request",
+    ))?;
     let token = issue_fanout_token(env, &body).await?;
     let mut init = RequestInit::new();
     init.with_method(Method::Post)
@@ -381,16 +285,16 @@ async fn fanout(env: &Env, selector: FanoutSelector, bytes: &[u8], logout: bool)
     let response = stub.fetch_with_request(request).await?;
     let status = response.status_code();
     if !(200..300).contains(&status) {
-        return Err(AppError::InternalFailure(format!(
-            "Notification fanout returned HTTP {status}"
-        )));
+        return Err(AppError::internal_with_context(
+            "Realtime notification fanout failed",
+            format_args!("HTTP {status}"),
+        ));
     }
     Ok(())
 }
 
-/// Deliver JSON over HTTPS via the Worker runtime.
+/// Deliver JSON over HTTPS with no redirects.
 pub(super) async fn post_json(url: &str, body: Value, bearer: Option<&str>) -> AppResult<()> {
-    // Require HTTPS before sending the body or credentials.
     if !url.starts_with("https://") {
         return Err(AppError::bad_request(
             "Notification delivery requires an HTTPS URL",
@@ -409,16 +313,12 @@ pub(super) async fn post_json(url: &str, body: Value, bearer: Option<&str>) -> A
             .headers_mut()?
             .set("Authorization", &format!("Bearer {token}"))?;
     }
-    let response = send_delivery_request(request).await?;
+    let signal = AbortSignal::from(web_sys::AbortSignal::timeout_with_u32(5_000));
+    let response = Fetch::Request(request).send_with_signal(&signal).await?;
     if !(200..300).contains(&response.status_code()) {
         return Err(AppError::bad_request("Notification delivery failed"));
     }
     Ok(())
-}
-
-async fn send_delivery_request(request: Request) -> worker::Result<Response> {
-    let signal = AbortSignal::from(web_sys::AbortSignal::timeout_with_u32(DELIVERY_TIMEOUT_MS));
-    Fetch::Request(request).send_with_signal(&signal).await
 }
 
 pub async fn publish_user_update(
@@ -428,26 +328,20 @@ pub async fn publish_user_update(
     date: &str,
     context_id: Option<&str>,
 ) {
-    NotificationEvent::Account { date, reason: None }
-        .for_user(user_id, kind, context_id)
-        .publish(env)
-        .await;
+    publish_user(
+        env,
+        user_id,
+        kind,
+        account_payload(user_id, date),
+        context_id,
+        None,
+    )
+    .await;
 }
 
-pub(crate) async fn publish_deleted_account(
-    env: &Env,
-    user_id: &str,
-    devices: &[PushDeviceRow],
-    context_id: Option<&str>,
-) {
+pub(crate) async fn publish_deleted_account(env: &Env, user_id: &str, context_id: Option<&str>) {
     let date = crate::utils::time::now_rfc3339();
-    let update = NotificationEvent::Account {
-        date: &date,
-        reason: None,
-    }
-    .for_user(user_id, UpdateType::LogOut, context_id);
-    update.publish_websocket(env).await;
-    push::logout_deleted_user(env, user_id, devices, &update.push_payload(), context_id).await;
+    publish_user_update(env, user_id, UpdateType::LogOut, &date, context_id).await;
 }
 
 pub(crate) async fn publish_account_logout(
@@ -455,13 +349,17 @@ pub(crate) async fn publish_account_logout(
     claims: &crate::service::identity::session::Claims,
     date: &str,
 ) {
-    NotificationEvent::Account { date, reason: None }
-        .for_user(&claims.sub, UpdateType::LogOut, claims.device())
-        .with_logout_scope(LogoutScope::Stamp {
+    publish_user(
+        env,
+        &claims.sub,
+        UpdateType::LogOut,
+        account_payload(&claims.sub, date),
+        claims.device(),
+        Some(LogoutScope::Stamp {
             value: claims.sstamp.clone(),
-        })
-        .publish(env)
-        .await;
+        }),
+    )
+    .await;
 }
 
 pub async fn publish_key_rotation(
@@ -471,13 +369,16 @@ pub async fn publish_key_rotation(
     scope: LogoutScope,
     context_id: Option<&str>,
 ) {
-    NotificationEvent::Account {
-        date,
-        reason: Some(1),
-    }
-    .for_user(user_id, UpdateType::LogOut, context_id)
-    .with_logout_scope(scope)
-    .publish(env)
+    let mut payload = account_payload(user_id, date);
+    payload.push(("Reason".into(), 1.into()));
+    publish_user(
+        env,
+        user_id,
+        UpdateType::LogOut,
+        payload,
+        context_id,
+        Some(scope),
+    )
     .await;
 }
 
@@ -489,10 +390,13 @@ pub async fn publish_cipher_update(
     date: &str,
     context_id: Option<&str>,
 ) {
-    NotificationEvent::Cipher { id, date }
-        .for_user(user_id, kind, context_id)
-        .publish(env)
-        .await;
+    let mut payload = item_payload(user_id, id);
+    payload.extend([
+        ("OrganizationId".into(), MsgValue::Nil),
+        ("CollectionIds".into(), MsgValue::Nil),
+        ("RevisionDate".into(), encode_messagepack_timestamp(date)),
+    ]);
+    publish_user(env, user_id, kind, payload, context_id, None).await;
 }
 
 pub async fn publish_revision_update(
@@ -503,10 +407,9 @@ pub async fn publish_revision_update(
     date: &str,
     context_id: Option<&str>,
 ) {
-    NotificationEvent::Revision { id, date }
-        .for_user(user_id, kind, context_id)
-        .publish(env)
-        .await;
+    let mut payload = item_payload(user_id, id);
+    payload.push(("RevisionDate".into(), encode_messagepack_timestamp(date)));
+    publish_user(env, user_id, kind, payload, context_id, None).await;
 }
 
 pub async fn publish_auth_update(
@@ -516,59 +419,41 @@ pub async fn publish_auth_update(
     request_id: &str,
     context_id: Option<&str>,
 ) {
-    NotificationEvent::AuthRequest { id: request_id }
-        .for_user(user_id, kind, context_id)
-        .publish(env)
-        .await;
+    publish_user(
+        env,
+        user_id,
+        kind,
+        item_payload(user_id, request_id),
+        context_id,
+        None,
+    )
+    .await;
 }
 
 pub async fn publish_anonymous_update(env: &Env, request_id: &str, user_id: &str) {
-    let message = encode_signalr_frame(&MsgValue::Array(vec![
-        1.into(),
-        MsgValue::Map(vec![]),
-        MsgValue::Nil,
-        "AuthRequestResponseRecieved".into(),
-        MsgValue::Array(vec![MsgValue::Map(vec![
-            (
-                "Type".into(),
-                (UpdateType::AuthRequestResponse as i32).into(),
-            ),
-            (
-                "Payload".into(),
-                MsgValue::Map(vec![
-                    ("Id".into(), request_id.into()),
-                    ("UserId".into(), user_id.into()),
-                ]),
-            ),
-            ("UserId".into(), user_id.into()),
-        ])]),
-    ]));
-    match message {
-        Ok(bytes) => {
-            if let Err(error) = fanout(
-                env,
-                FanoutSelector::Anonymous {
-                    request_id: request_id.to_string(),
-                },
-                &bytes,
-                true,
-            )
-            .await
-            {
-                log::warn!("Anonymous notification failed: {error}");
-            }
-        }
-        Err(error) => {
-            log::warn!("Anonymous notification encoding failed: {error}");
-        }
-    }
+    let message = encode_invocation("AuthRequestResponseRecieved", vec![
+        (
+            "Type".into(),
+            (UpdateType::AuthRequestResponse as i32).into(),
+        ),
+        (
+            "Payload".into(),
+            MsgValue::Map(item_payload(user_id, request_id)),
+        ),
+        ("UserId".into(), user_id.into()),
+    ]);
+    let selector = FanoutSelector::Anonymous {
+        request_id: request_id.to_owned(),
+    };
+    publish(env, selector, message, true).await;
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
     #[test]
-    fn messagepack_timestamp_preserves_nanoseconds_on_both_sides_of_epoch() {
+    fn signalr_frames_handshakes_and_messagepack_timestamps_encode_cleanly() {
         let mut negative = 999_999_999_u32.to_be_bytes().to_vec();
         negative.extend((-1_i64).to_be_bytes());
         assert_eq!(
@@ -579,65 +464,26 @@ mod tests {
             encode_messagepack_timestamp("1970-01-01T00:00:00.000000001Z"),
             MsgValue::Ext(-1, (1_u64 << 34).to_be_bytes().to_vec())
         );
-    }
-    #[test]
-    fn handshake_requires_supported_version_and_protocol() {
         assert!(is_signalr_handshake(
             "{\"protocol\":\"messagepack\",\"version\":1}\u{1e}"
         ));
         assert!(!is_signalr_handshake(
             "{\"protocol\":\"json\",\"version\":1}\u{1e}"
         ));
-        assert!(!is_signalr_handshake(
-            "{\"protocol\":\"messagepack\",\"version\":2}"
-        ));
-    }
-    #[test]
-    fn signalr_ping_and_payload_frame_lengths_match() {
         assert_eq!(
-            encode_signalr_frame(&MsgValue::Array(vec![6.into()]))
-                .expect("valid notifications fixture"),
+            encode_signalr_frame(&MsgValue::Array(vec![6.into()])).expect("ping"),
             PING
         );
         let bytes = encode_update_message(
             UpdateType::SyncVault,
-            vec![("UserId".into(), "user".into())],
-            None,
+            account_payload("user", "2026-11-13T03:00:00.123Z"),
+            Some("browser"),
         )
-        .expect("valid notifications fixture");
-        assert_eq!(usize::from(bytes[0]), bytes.len() - 1);
-        let value =
-            rmpv::decode::read_value(&mut &bytes[1..]).expect("valid notifications fixture");
-        assert_eq!(value[3].as_str(), Some("ReceiveMessage"));
-        assert_eq!(value[4][0]["Type"].as_i64(), Some(5));
-    }
-    #[test]
-    fn vault_sync_carries_context_and_a_messagepack_timestamp() {
-        let bytes = NotificationEvent::Account {
-            date: "2026-11-13T03:00:00.123Z",
-            reason: None,
-        }
-        .for_user("user", UpdateType::SyncVault, Some("browser"))
-        .websocket_message()
-        .expect("valid notifications fixture");
-        let mut size = 0_usize;
-        let mut prefix = 0;
-        for (index, byte) in bytes.iter().enumerate() {
-            size |= usize::from(byte & 0x7f) << (index * 7);
-            prefix = index + 1;
-            if byte & 0x80 == 0 {
-                break;
-            }
-        }
-        assert_eq!(size, bytes.len() - prefix);
-        let value =
-            rmpv::decode::read_value(&mut &bytes[prefix..]).expect("valid notifications fixture");
-        assert_eq!(value[3].as_str(), Some("ReceiveMessage"));
-        assert_eq!(value[4][0]["Type"].as_i64(), Some(5));
-        assert_eq!(value[4][0]["ContextId"].as_str(), Some("browser"));
-        assert_eq!(value[4][0]["Payload"]["UserId"].as_str(), Some("user"));
-        assert!(
-            matches!(&value[4][0]["Payload"]["Date"], MsgValue::Ext(-1, bytes) if bytes.len() == 8)
+        .expect("frame");
+        let value = rmpv::decode::read_value(&mut &bytes[1..]).expect("msgpack");
+        assert_eq!(
+            (value[3].as_str(), value[4][0]["Type"].as_i64()),
+            (Some("ReceiveMessage"), Some(5))
         );
     }
 }

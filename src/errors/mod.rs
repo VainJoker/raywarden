@@ -1,4 +1,4 @@
-use std::borrow::Cow;
+use std::{borrow::Cow, fmt};
 
 use serde_json::Value;
 use thiserror::Error;
@@ -7,16 +7,39 @@ mod database;
 mod response;
 
 pub(crate) use database::DbSentinel;
+pub(crate) use response::{extract_ray_id, extract_ray_id_from_headers, finalize_error_response};
 
 pub type AppResult<T> = Result<T, AppError>;
 
+/// Wraps `worker::Error` so `Debug` logs bounded D1 codes rather than raw JS/SQL causes.
+pub struct WorkerSource(pub(super) worker::Error);
+
+impl fmt::Debug for WorkerSource {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        database::fmt_worker_debug(&self.0, f)
+    }
+}
+
+impl fmt::Display for WorkerSource {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&database::worker_display_message(None, &self.0))
+    }
+}
+
+impl std::error::Error for WorkerSource {}
+
+/// `Display` renders the safe client-facing message; `Debug` records server-only diagnostics.
 #[derive(Debug, Error)]
 pub enum AppError {
     #[error(transparent)]
     Config(#[from] ConfigError),
 
-    #[error("Worker error: {}", database::worker_error_diagnostic(.0))]
-    Worker(#[from] worker::Error),
+    #[error("{}", database::worker_display_message(*summary, &source.0))]
+    Worker {
+        summary: Option<&'static str>,
+        #[source]
+        source: WorkerSource,
+    },
 
     #[error("Invalid query parameters: {0}")]
     Params(Cow<'static, str>),
@@ -48,6 +71,9 @@ pub enum AppError {
     #[error("Payload too large: {message}")]
     PayloadTooLarge { message: Cow<'static, str> },
 
+    #[error("Unsupported media type: {message}")]
+    UnsupportedMediaType { message: Cow<'static, str> },
+
     #[error("OAuth error {error}: {description}")]
     OAuth {
         error: &'static str,
@@ -69,34 +95,40 @@ pub enum AppError {
     #[error("{message}")]
     TooManyRequests { message: Cow<'static, str> },
 
-    #[error("Service temporarily unavailable")]
-    ServiceUnavailable,
-
-    #[error("Internal server error")]
-    Internal,
+    #[error("Service temporarily unavailable: {reason}")]
+    ServiceUnavailable { reason: &'static str },
 
     #[error("Additional identity verification required")]
     IdentityChallenge(Value),
 
-    #[error("{0}")]
-    Upstream(String),
+    #[error("Upstream service error: {summary}")]
+    Upstream {
+        summary: &'static str,
+        detail: Option<String>,
+    },
 
-    #[error("Internal server error: {0}")]
-    InternalFailure(String),
+    #[error("Internal server error: {summary}")]
+    Internal {
+        summary: &'static str,
+        detail: Option<String>,
+    },
 }
 
 #[derive(Debug, Error)]
 pub enum ConfigError {
     #[error("Missing config: {0}")]
-    Missing(String),
+    Missing(&'static str),
     #[error("Invalid config: {0}")]
-    Invalid(String),
+    Invalid(&'static str),
 }
 
 #[derive(Debug, Error)]
 pub enum DatabaseError {
-    #[error("Query failed: {0}")]
-    QueryFailed(String),
+    #[error("Database query failed: {context} (D1: {d1_code})")]
+    QueryFailed {
+        context: &'static str,
+        d1_code: &'static str,
+    },
 }
 
 #[derive(Debug, Error)]
@@ -119,7 +151,7 @@ pub enum AuthError {
     #[error("Invalid password")]
     InvalidPassword,
 
-    #[error("Invalid KDF parameters : {0}")]
+    #[error("Invalid KDF parameters: {0}")]
     InvalidKdf(Cow<'static, str>),
 
     #[error("Invalid TOTP code")]
@@ -134,8 +166,6 @@ pub enum CryptoError {
     HmacFailed(&'static str),
     #[error("Random value generation failed: {0}")]
     RandomGenerationFailed(&'static str),
-    #[error("Hashing operation failed: {0}")]
-    HashFailed(&'static str),
     #[error("Key derivation failed: {0}")]
     KeyDerivationFailed(&'static str),
     #[error("Invalid Base32 encoding")]
@@ -146,7 +176,7 @@ pub enum CryptoError {
 pub enum JwtError {
     /// Token format is invalid (not 3 parts, invalid base64, etc.)
     #[error("Invalid token format: {0}")]
-    InvalidFormat(String),
+    InvalidFormat(&'static str),
     /// Signature verification failed
     #[error("Invalid signature")]
     InvalidSignature,
@@ -160,41 +190,92 @@ pub enum JwtError {
     #[error("Token was issued in the future")]
     IssuedInFuture,
     /// Algorithm mismatch or unsupported algorithm
-    #[error("Invalid or unsupported algorithm: {0}")]
-    InvalidAlgorithm(String),
+    #[error("Unsupported token algorithm")]
+    InvalidAlgorithm { algorithm: String },
     /// Required claim is missing
     #[error("Missing required claim: {0}")]
-    MissingClaim(String),
+    MissingClaim(&'static str),
     /// JSON serialization/deserialization error
-    #[error("JSON error: {0}")]
-    JsonError(String),
+    #[error("Invalid token claims")]
+    JsonError { detail: String },
     /// Cryptographic operation failed
-    #[error("Crypto error: {0}")]
-    CryptoError(String),
+    #[error("Token cryptographic verification failed")]
+    CryptoError(&'static str),
     /// Token too large (`DoS` protection)
     #[error("Token exceeds maximum allowed size")]
     TokenTooLarge,
 }
 
 impl AppError {
-    /// Discard details from failures that may contain sensitive values.
-    pub(crate) fn internal_error<E>(_: E) -> Self {
-        Self::Internal
+    pub(crate) const fn internal(summary: &'static str) -> Self {
+        Self::Internal {
+            summary,
+            detail: None,
+        }
     }
 
-    pub(crate) fn internal_with_context(
-        context: impl std::fmt::Display,
-        error: impl std::fmt::Display,
-    ) -> Self {
-        Self::InternalFailure(format!("{context}: {error}"))
+    /// Discard a potentially sensitive error value while keeping a safe summary.
+    pub(crate) const fn internal_discard<E>(summary: &'static str) -> impl FnOnce(E) -> Self {
+        move |_| Self::internal(summary)
     }
 
-    pub(crate) fn kv_error(error: impl std::fmt::Display) -> Self {
-        worker_failure(format!("KV operation failed: {error}")).into()
+    pub(crate) fn internal_debug(summary: &'static str, error: impl fmt::Debug) -> Self {
+        Self::Internal {
+            summary,
+            detail: Some(format!("{error:?}")),
+        }
     }
 
-    pub(crate) fn upstream_error(error: impl std::fmt::Display) -> Self {
-        Self::Upstream(error.to_string())
+    pub(crate) fn internal_with_context(summary: &'static str, error: impl fmt::Display) -> Self {
+        Self::Internal {
+            summary,
+            detail: Some(error.to_string()),
+        }
+    }
+
+    /// Record Serde's structural error category and location in `Debug` without
+    /// capturing potentially sensitive field values.
+    pub(crate) const fn internal_json(
+        summary: &'static str,
+    ) -> impl FnOnce(serde_json::Error) -> Self {
+        move |error| Self::Internal {
+            summary,
+            detail: Some(format!(
+                "{:?} at line {} column {}",
+                error.classify(),
+                error.line(),
+                error.column()
+            )),
+        }
+    }
+
+    pub(crate) const fn service_unavailable(reason: &'static str) -> Self {
+        Self::ServiceUnavailable { reason }
+    }
+
+    pub(crate) const fn worker_with_context(summary: &'static str, error: worker::Error) -> Self {
+        Self::Worker {
+            summary: Some(summary),
+            source: WorkerSource(error),
+        }
+    }
+
+    pub(crate) const fn r2_error(error: worker::Error) -> Self {
+        Self::worker_with_context("R2 object storage operation failed", error)
+    }
+
+    pub(crate) const fn upstream(summary: &'static str) -> Self {
+        Self::Upstream {
+            summary,
+            detail: None,
+        }
+    }
+
+    pub(crate) fn upstream_with_context(summary: &'static str, error: impl fmt::Display) -> Self {
+        Self::Upstream {
+            summary,
+            detail: Some(error.to_string()),
+        }
     }
 
     pub fn bad_request(message: impl Into<Cow<'static, str>>) -> Self {
@@ -244,9 +325,18 @@ impl AppError {
     }
 }
 
+impl From<worker::Error> for AppError {
+    fn from(source: worker::Error) -> Self {
+        Self::Worker {
+            summary: None,
+            source: WorkerSource(source),
+        }
+    }
+}
+
 impl From<AppError> for worker::Error {
     fn from(error: AppError) -> Self {
-        worker_failure(error.to_string())
+        worker_failure(format!("{error:?}"))
     }
 }
 

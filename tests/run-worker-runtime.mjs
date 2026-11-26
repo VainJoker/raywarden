@@ -1,72 +1,59 @@
 import { spawn } from "node:child_process";
-import {
-  copyFileSync,
-  existsSync,
-  mkdirSync,
-  mkdtempSync,
-  readFileSync,
-  readdirSync,
-  rmSync,
-  writeFileSync,
-} from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { basename, dirname, join, resolve } from "node:path";
-import { fileURLToPath } from "node:url";
-import { parseJsonc } from "../scripts/deploy.mjs";
+import { basename, join } from "node:path";
+import { serializeConfig } from "miniflare";
+import { parseJsonc, PROJECT_ROOT as root } from "../scripts/deploy.mjs";
 
-// Run the built Worker inside workerd, without opening a listener or using any
-// local/remote application database. SQLite lives in a temporary directory;
-// object-storage bindings live in memory. The directory is removed on exit.
-const root = resolve(dirname(fileURLToPath(import.meta.url)), "..");
-const config = parseJsonc(readFileSync(resolve(root, "wrangler.jsonc"), "utf8"));
-const entry = "worker-runtime.mjs";
-const support = ["runtime-tools.mjs", "runtime-fixture.mjs"];
-const runner = basename(fileURLToPath(import.meta.url));
+// Run the compiled Worker inside workerd with temporary SQLite and in-memory
+// object storage. The test has neither a listener nor directory access beyond its fixture.
+const config = parseJsonc(readFileSync(join(root, "wrangler.jsonc"), "utf8"));
+const entry = "tests/worker-runtime.mjs";
 const suites = readdirSync(join(root, "tests"))
-  .filter(name => name.endsWith("-runtime.mjs") && name !== entry && name !== runner)
+  .filter(name => name.endsWith("-runtime.mjs") && name !== "worker-runtime.mjs" && name !== "run-worker-runtime.mjs")
   .sort();
 const inputs = [
-  ...[entry, ...support, ...suites].map(name => `tests/${name}`),
+  entry,
+  ...["runtime-tools.mjs", "runtime-fixture.mjs", ...suites].map(name => `tests/${name}`),
   "build/index.js", "build/index_bg.wasm",
 ];
-const schemaModule = "runtime-schema.mjs";
-for (const input of inputs) {
-  if (!existsSync(resolve(root, input))) throw new Error(`Missing ${input}; run just build or just dry-run first`);
-}
+const modules = inputs.map(input => {
+  const path = join(root, input);
+  if (!existsSync(path)) throw new Error(`Missing ${input}; run just build or just dry-run first`);
+  const name = basename(input);
+  return name.endsWith(".wasm") ? { name, wasm: readFileSync(path) } : { name, esModule: readFileSync(path, "utf8") };
+});
+const migrationDir = join(root, "sql/migrations");
+const schema = readdirSync(migrationDir).filter(name => name.endsWith(".sql")).sort()
+  .map(name => readFileSync(join(migrationDir, name), "utf8")).join("\n");
+const triggers = [...schema.matchAll(/CREATE TRIGGER\s+(\w+)/gi)].map(match => match[1]);
+const tables = [...schema.matchAll(/CREATE TABLE\s+(\w+)/gi)].map(match => match[1]).reverse();
+const reset = [...triggers.map(name => `DROP TRIGGER IF EXISTS ${name};`), ...tables.map(name => `DROP TABLE IF EXISTS ${name};`)].join("\n");
+modules.push({ name: "runtime-schema.mjs", esModule: `export const schema=${JSON.stringify(schema)};\nexport const reset=${JSON.stringify(reset)};\n` });
+
 const directory = mkdtempSync(join(tmpdir(), "raywarden-worker-runtime-"));
 try {
-  for (const input of inputs) copyFileSync(resolve(root, input), join(directory, basename(input)));
-  const migrationFiles = readdirSync(join(root, "sql/migrations")).filter(name => name.endsWith(".sql")).sort();
-  const schema = migrationFiles.map(name => readFileSync(join(root, "sql/migrations", name), "utf8")).join("\n");
-  const triggers = [...schema.matchAll(/CREATE TRIGGER\s+(\w+)/gi)].map(m => m[1]);
-  const tables = [...schema.matchAll(/CREATE TABLE\s+(\w+)/gi)].map(match => match[1]).reverse();
-  const reset = [...triggers.map(name => `DROP TRIGGER IF EXISTS ${name};`), ...tables.map(name => `DROP TABLE IF EXISTS ${name};`)].join("\n");
-  writeFileSync(join(directory, schemaModule), `export const schema=${JSON.stringify(schema)};\nexport const reset=${JSON.stringify(reset)};\n`);
-  mkdirSync(join(directory, "sqlite"));
-  const modules = [...inputs.map(input => basename(input)), schemaModule].map(name => {
-    const literal = JSON.stringify(name);
-    const type = name.endsWith(".wasm") ? "wasm" : "esModule";
-    return `      (name = ${literal}, ${type} = embed ${literal})`;
-  });
-  writeFileSync(join(directory, "config.capnp"), `using Workerd = import "/workerd/workerd.capnp";
-const config :Workerd.Config = (
-  services = [(name = "runtime", worker = (
-    modules = [
-${modules.join(",\n")}
-    ],
-    compatibilityDate = ${JSON.stringify(config.compatibility_date)},
-    compatibilityFlags = ${JSON.stringify(config.compatibility_flags ?? [])},
-    bindings = [(name = "SQL", durableObjectNamespace = (className = "SqlRuntime"))],
-    durableObjectNamespaces = [(className = "SqlRuntime", uniqueKey = "isolated-runtime-tests", enableSql = true)],
-    durableObjectStorage = (localDisk = "sqlite"),
-    globalOutbound = "blocked"
-  )), (name = "blocked", network = (allow = [])), (name = "sqlite", disk = (path = ${JSON.stringify(join(directory, "sqlite"))}, writable = true))],
-);
-`);
+  const sqlite = join(directory, "sqlite");
+  const configPath = join(directory, "config.bin");
+  mkdirSync(sqlite);
+  writeFileSync(configPath, serializeConfig({ services: [
+    { name: "runtime", worker: {
+      modules,
+      compatibilityDate: config.compatibility_date,
+      compatibilityFlags: config.compatibility_flags ?? [],
+      bindings: [{ name: "SQL", durableObjectNamespace: { className: "SqlRuntime" } }],
+      durableObjectNamespaces: [{ className: "SqlRuntime", uniqueKey: "isolated-runtime-tests", enableSql: true }],
+      durableObjectStorage: { localDisk: "sqlite" },
+      globalOutbound: { name: "blocked" },
+    } },
+    { name: "blocked", network: { allow: [] } },
+    { name: "sqlite", disk: { path: sqlite, writable: true } },
+  ] }));
   await new Promise((done, fail) => {
-    // The full suite also exercises production-cost PBKDF2 in WASM rather
-    // than delegating every verifier to native Web Crypto.
-    const child = spawn(resolve(root, "node_modules/.bin/workerd"), ["test", join(directory, "config.capnp")], { cwd: root, stdio: "inherit", timeout: 600_000, killSignal: "SIGKILL" });
+    // The full suite exercises production-cost PBKDF2 in WASM.
+    const child = spawn(join(root, "node_modules/.bin/workerd"), ["test", "--binary", configPath], {
+      cwd: root, stdio: "inherit", timeout: 600_000, killSignal: "SIGKILL",
+    });
     child.once("error", fail);
     child.once("close", (code, signal) => code === 0 ? done() : fail(new Error(`workerd test failed (${code ?? signal})`)));
   });

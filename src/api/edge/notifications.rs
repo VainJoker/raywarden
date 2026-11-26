@@ -36,47 +36,19 @@ impl PublicNotificationEndpoint {
     }
 }
 
-/// `SignalR` HTTP rejections emitted by the Worker edge and `notifydo`.
-enum NotificationError {
-    NotFound,
-    NotConfigured,
-    MethodNotAllowed { allow: &'static str },
-    UpgradeRequired,
-    Hub(HubError),
-}
-
-impl From<HubError> for NotificationError {
-    fn from(error: HubError) -> Self {
-        Self::Hub(error)
-    }
-}
-
-impl NotificationError {
-    pub(self) fn into_worker_response(self) -> WorkerResult<Response> {
+impl HubError {
+    fn response(self) -> WorkerResult<Response> {
         let (status, message, headers): (_, _, &[(_, _)]) = match self {
-            Self::NotFound => (404, "Not found", &[]),
-            Self::NotConfigured => (503, "Notifications are not configured", &[]),
-            Self::MethodNotAllowed { allow } => {
-                return ResponseBuilder::new()
-                    .with_header("Allow", allow)?
-                    .error("Method not allowed", 405);
-            }
-            Self::UpgradeRequired => (426, "WebSocket upgrade required", &[
-                ("Upgrade", "websocket"),
-                ("Connection", "upgrade"),
-            ]),
-            Self::Hub(HubError::Unauthorized) => (401, "Unauthorized", &[]),
-            Self::Hub(HubError::BearerRequired) => {
-                (401, "Unauthorized", &[("WWW-Authenticate", "Bearer")])
-            }
-            Self::Hub(HubError::InvalidBearerToken) => (401, "Unauthorized", &[(
+            Self::Unauthorized => (401, "Unauthorized", &[]),
+            Self::BearerRequired => (401, "Unauthorized", &[("WWW-Authenticate", "Bearer")]),
+            Self::InvalidBearerToken => (401, "Unauthorized", &[(
                 "WWW-Authenticate",
                 "Bearer error=\"invalid_token\"",
             )]),
-            Self::Hub(HubError::TooManyConnections) => (429, "Too many connections", &[]),
-            Self::Hub(HubError::Unavailable) => (503, "Service temporarily unavailable", &[]),
-            Self::Hub(HubError::Forbidden) => (403, "Forbidden", &[]),
-            Self::Hub(HubError::InvalidNotification) => (400, "Invalid notification", &[]),
+            Self::TooManyConnections => (429, "Too many connections", &[]),
+            Self::Unavailable => (503, "Service temporarily unavailable", &[]),
+            Self::Forbidden => (403, "Forbidden", &[]),
+            Self::InvalidNotification => (400, "Invalid notification", &[]),
         };
         let mut response = ResponseBuilder::new();
         for &(name, value) in headers {
@@ -117,14 +89,17 @@ impl Route {
         cors: &CorsContext,
     ) -> AppResult<Response> {
         let response = match self {
-            Self::NotFound => NotificationError::NotFound.into_worker_response()?,
+            Self::NotFound => Response::error("Not found", 404)?,
             Self::Options => Response::empty()?.with_status(204),
-            route => match (env.durable_object("notifydo"), route) {
-                (Err(_), _) => NotificationError::NotConfigured.into_worker_response()?,
-                (Ok(_), Self::MethodNotAllowed { allow }) => {
-                    NotificationError::MethodNotAllowed { allow }.into_worker_response()?
-                }
-                (Ok(namespace), _) => {
+            Self::MethodNotAllowed { allow } => match env.durable_object("notifydo") {
+                Err(_) => Response::error("Notifications are not configured", 503)?,
+                Ok(_) => ResponseBuilder::new()
+                    .with_header("Allow", allow)?
+                    .error("Method not allowed", 405)?,
+            },
+            Self::Forward => match env.durable_object("notifydo") {
+                Err(_) => Response::error("Notifications are not configured", 503)?,
+                Ok(namespace) => {
                     let result = async {
                         let stub = namespace.id_from_name("global")?.get_stub()?;
                         stub.fetch_with_request(request).await
@@ -134,7 +109,7 @@ impl Route {
                         response
                     } else {
                         log::warn!("notifydo forwarding failed");
-                        NotificationError::from(HubError::Unavailable).into_worker_response()?
+                        HubError::Unavailable.response()?
                     }
                 }
             },

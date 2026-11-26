@@ -23,40 +23,6 @@ pub fn normalize_form_key(key: &str) -> String {
         .collect()
 }
 
-/// Select a deterministic shard key for password and API-key token requests,
-/// leaving lightweight grants (refresh, device approval, Send access) local.
-pub(crate) fn token_shard_key(body: &[u8], fallback: &str) -> Option<String> {
-    let (mut grant_type, mut auth_request, mut username, mut client_id) = (None, None, None, None);
-    for (key, value) in url::form_urlencoded::parse(body) {
-        let field = match normalize_form_key(&key).as_str() {
-            "granttype" => &mut grant_type,
-            "authrequest" => &mut auth_request,
-            "username" => &mut username,
-            "clientid" => &mut client_id,
-            _ => continue,
-        };
-        field.get_or_insert(value);
-    }
-    if !grant_type.as_deref().is_some_and(|grant| {
-        grant.trim().eq_ignore_ascii_case("password")
-            || grant.trim().eq_ignore_ascii_case("client_credentials")
-    }) || auth_request
-        .as_deref()
-        .is_some_and(|value| !value.is_empty())
-    {
-        return None;
-    }
-    Some(
-        username
-            .as_deref()
-            .filter(|v| !v.is_empty())
-            .or_else(|| client_id.as_deref().filter(|v| !v.is_empty()))
-            .unwrap_or(fallback)
-            .trim()
-            .to_lowercase(),
-    )
-}
-
 pub fn allows_token_cookie_origin(headers: &HeaderMap, domain: &str) -> bool {
     if headers
         .get("sec-fetch-site")
@@ -108,7 +74,7 @@ pub fn token_cookie_header(
         "{name}={token}; Path=/identity/connect/token; HttpOnly; \
          SameSite=Strict; Max-Age={max_age_seconds}{secure}"
     ))
-    .map_err(AppError::internal_error)
+    .map_err(|error| AppError::internal_debug("Failed to build OAuth token cookie", error))
 }
 
 /// Signed access and refresh tokens for a single account generation and device
@@ -254,20 +220,8 @@ impl IssuedTokens {
         user: &UserRow,
         two_factor_token: Option<String>,
     ) -> LoginTokenResponse {
-        let mut account_keys = crate::service::identity::account_keys::account_keys_response(user);
-        if let Some(object) = account_keys.as_object_mut()
-            && let Some(value) = object.remove("object")
-        {
-            object.insert("Object".into(), value);
-        }
-        for name in ["publicKeyEncryptionKeyPair", "signatureKeyPair"] {
-            if let Some(object) = account_keys.get_mut(name).and_then(Value::as_object_mut)
-                && let Some(value) = object.remove("object")
-            {
-                object.insert("Object".into(), value);
-            }
-        }
-
+        let account_keys =
+            crate::service::identity::account_keys::account_keys_response(user, "Object");
         let has_master_password = !user.master_password_hash.is_empty();
         let master_password_unlock = has_master_password.then(|| MasterPasswordUnlock {
             kdf: UnlockKdf {

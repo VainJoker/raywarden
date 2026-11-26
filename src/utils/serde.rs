@@ -1,4 +1,37 @@
 //! Serde adapters for shared data representations.
+use serde::Deserialize;
+
+use crate::errors::{AppError, AppResult};
+
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+pub enum IntegerInput {
+    Number(i64),
+    String(String),
+}
+
+impl TryFrom<&IntegerInput> for i64 {
+    type Error = std::num::ParseIntError;
+
+    fn try_from(value: &IntegerInput) -> Result<Self, Self::Error> {
+        match value {
+            IntegerInput::Number(n) => Ok(*n),
+            IntegerInput::String(s) => s.trim().parse(),
+        }
+    }
+}
+
+impl IntegerInput {
+    pub fn parse_i64(&self) -> AppResult<i64> {
+        i64::try_from(self).map_err(|_error| AppError::bad_request("Invalid number"))
+    }
+
+    pub fn parse_i32(&self) -> AppResult<i32> {
+        self.parse_i64()?
+            .try_into()
+            .map_err(|_error| AppError::bad_request("Integer out of range"))
+    }
+}
 
 /// Serialize/deserialize booleans stored as integer `0`/`1`.
 ///

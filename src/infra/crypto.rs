@@ -24,67 +24,6 @@ fn subtle_crypto() -> Result<SubtleCrypto, CryptoError> {
     Ok(web_crypto()?.subtle())
 }
 
-/// Derives a key using PBKDF2-SHA256.
-pub async fn pbkdf2_sha256(
-    password: &[u8],
-    salt: &[u8],
-    iterations: u32,
-    key_length_bits: u32,
-) -> AppResult<Vec<u8>> {
-    if iterations == 0 || key_length_bits == 0 || !key_length_bits.is_multiple_of(8) {
-        return Err(CryptoError::Pbkdf2Failed("invalid derivation parameters").into());
-    }
-
-    // Production Workers reject Web Crypto PBKDF2 calls above 100,000
-    // iterations, even when local workerd accepts them. Preserve the exact
-    // persisted verifier format and cost using RustCrypto for higher costs.
-    if iterations > 100_000 {
-        let mut derived = vec![0; (key_length_bits / 8) as usize];
-        pbkdf2::pbkdf2_hmac::<sha2::Sha256>(password, salt, iterations, &mut derived);
-        return Ok(derived);
-    }
-
-    let subtle = subtle_crypto()?;
-
-    let password_array = Uint8Array::new_from_slice(password);
-    let password_buffer = password_array.as_ref();
-    let key_material = JsFuture::from(
-        subtle
-            .import_key_with_str(
-                "raw",
-                password_buffer,
-                "PBKDF2",
-                false,
-                &js_sys::Array::of1(&JsValue::from_str("deriveBits")),
-            )
-            .map_err(|_error| CryptoError::Pbkdf2Failed("import key"))?,
-    )
-    .await
-    .map_err(|_error| CryptoError::Pbkdf2Failed("await key import"))?;
-
-    let salt_array = Uint8Array::new_from_slice(salt);
-    let params = web_sys::Pbkdf2Params::new(
-        "PBKDF2",
-        JsValue::from_str("SHA-256").as_ref(),
-        iterations,
-        salt_array.as_ref(),
-    );
-
-    let derived_bits = JsFuture::from(
-        subtle
-            .derive_bits_with_object(
-                params.as_ref(),
-                &CryptoKey::from(key_material),
-                key_length_bits,
-            )
-            .map_err(|_error| CryptoError::Pbkdf2Failed("derive bits"))?,
-    )
-    .await
-    .map_err(|_error| CryptoError::Pbkdf2Failed("await bit derivation"))?;
-
-    Ok(js_sys::Uint8Array::new(&derived_bits).to_vec())
-}
-
 pub fn random_bytes(length_bytes: u32, operation: &'static str) -> AppResult<Vec<u8>> {
     let crypto = web_crypto()?;
     let bytes = Uint8Array::new_with_length(length_bytes);
@@ -98,19 +37,7 @@ pub fn random_bytes(length_bytes: u32, operation: &'static str) -> AppResult<Vec
 pub async fn hmac_sha1(key: &[u8], data: &[u8]) -> AppResult<Vec<u8>> {
     let subtle = subtle_crypto()?;
 
-    let algorithm = js_sys::Object::new();
-    js_sys::Reflect::set(
-        &algorithm,
-        &JsValue::from_str("name"),
-        &JsValue::from_str("HMAC"),
-    )
-    .map_err(|_error| CryptoError::HashFailed("set HMAC algorithm name"))?;
-    js_sys::Reflect::set(
-        &algorithm,
-        &JsValue::from_str("hash"),
-        &JsValue::from_str("SHA-1"),
-    )
-    .map_err(|_error| CryptoError::HashFailed("set HMAC hash algorithm"))?;
+    let algorithm = web_sys::HmacImportParams::new_with_str("HMAC", "SHA-1");
 
     // Import the key
     let key_array = Uint8Array::new_from_slice(key);

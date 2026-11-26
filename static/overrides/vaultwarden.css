@@ -13,6 +13,13 @@
 
 /* Hide unsupported UI elements */
 .vw-hide,
+.vw-sso-login,
+.vw-email-sso,
+.vw-or-text,
+.vw-other-login,
+.providers-2fa-2,
+.providers-2fa-3,
+bit-nav-item[route="settings/emergency-access"],
 bit-nav-item[route="settings/subscription"],
 a[href$="/settings/sponsored-families"],
 

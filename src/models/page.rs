@@ -20,6 +20,21 @@ pub(crate) struct Page<T> {
     pub next: Option<PageCursor>,
 }
 
+impl<T> Page<T> {
+    pub(crate) async fn visit(
+        mut fetch: impl AsyncFnMut(Option<&PageCursor>) -> AppResult<Self>,
+        mut visit: impl AsyncFnMut(Vec<T>) -> AppResult<()>,
+    ) -> AppResult<()> {
+        let mut after = None;
+        loop {
+            let page = fetch(after.as_ref()).await?;
+            visit(page.rows).await?;
+            let Some(next) = page.next else { return Ok(()) };
+            after = Some(next);
+        }
+    }
+}
+
 pub(crate) enum PageOrder {
     RowId,
     NewestFirst,
@@ -40,7 +55,8 @@ struct PageRow<T> {
     row: T,
     page_rowid: String,
     page_date: String,
-    page_has_more: i32,
+    #[serde(deserialize_with = "crate::utils::serde::bool_from_int::deserialize")]
+    page_has_more: bool,
 }
 
 impl PageQuery {
@@ -60,18 +76,18 @@ impl PageQuery {
             PAGE_ROWS + 1,
             PAGE_BYTES,
         ]);
-        let rows = db::query_all::<PageRow<T>>(db.prepare(sql).bind(&params)?).await?;
-        let next = rows
-            .last()
-            .filter(|row| row.page_has_more != 0)
-            .map(|row| PageCursor {
-                rowid: row.page_rowid.clone(),
-                date: row.page_date.clone(),
-            });
-        Ok(Page {
-            rows: rows.into_iter().map(|row| row.row).collect(),
-            next,
-        })
+        let mut rows = db::query_all::<PageRow<T>>(db.prepare(sql).bind(&params)?).await?;
+        let mut out = Vec::with_capacity(rows.len());
+        let last = rows.pop();
+        out.extend(rows.into_iter().map(|row| row.row));
+        let next = last.and_then(|last| {
+            out.push(last.row);
+            last.page_has_more.then_some(PageCursor {
+                rowid: last.page_rowid,
+                date: last.page_date,
+            })
+        });
+        Ok(Page { rows: out, next })
     }
 
     pub(crate) async fn fetch_all<T: DeserializeOwned>(
@@ -80,13 +96,14 @@ impl PageQuery {
         filter_params: &[JsValue],
     ) -> AppResult<Vec<T>> {
         let mut rows = Vec::new();
-        let mut after = None;
-        loop {
-            let page = self.fetch(db, filter_params, after.as_ref()).await?;
-            rows.extend(page.rows);
-            let Some(next) = page.next else { break };
-            after = Some(next);
-        }
+        Page::visit(
+            async |after| self.fetch(db, filter_params, after).await,
+            async |page| {
+                rows.extend(page);
+                Ok(())
+            },
+        )
+        .await?;
         Ok(rows)
     }
 

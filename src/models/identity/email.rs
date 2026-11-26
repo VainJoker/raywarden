@@ -1,13 +1,13 @@
 use serde::Deserialize;
-use worker::{D1Database, D1PreparedStatement, D1Result, query};
+use worker::{D1Database, D1PreparedStatement, query};
 
 use super::two_factor::TwoFactorRow;
 use crate::{
     errors::{AppError, AppResult, DatabaseError, DbSentinel},
     infra::db,
     models::identity::{
-        account_keys::AccountSnapshot,
-        authorization::VerifiedAccountAction,
+        account_keys::{AccountSnapshot, rotation},
+        authorization::{VerifiedAccountAction, session_guard_with_sentinel},
         device::SessionSnapshot,
         user::{StoredPassword, UserRow},
     },
@@ -20,7 +20,6 @@ pub struct VerificationCode<'a> {
     pub user_id: Option<&'a str>,
     pub purpose: &'a str,
     pub recipient: &'a str,
-    pub context: &'a str,
     pub hash: &'a str,
     pub stamp: &'a str,
     pub session: &'a str,
@@ -40,26 +39,16 @@ pub(crate) struct VerifiedCode {
 }
 
 impl VerifiedCode {
-    pub(super) async fn batch(
-        &self,
-        db: &D1Database,
-        writes: Vec<D1PreparedStatement>,
-        write_error: impl FnOnce(&worker::Error) -> AppError,
-    ) -> AppResult<Vec<D1Result>> {
-        Self::batch_with_proofs(db, [self], writes, |error| write_error(&error)).await
-    }
-
-    pub(super) async fn batch_with_proofs<'a>(
+    pub(super) async fn commit<'a>(
         db: &D1Database,
         proofs: impl IntoIterator<Item = &'a Self>,
         writes: Vec<D1PreparedStatement>,
         write_error: impl FnOnce(worker::Error) -> AppError,
-    ) -> AppResult<Vec<D1Result>> {
+    ) -> AppResult<()> {
         let mut statements = Vec::new();
         for proof in proofs {
             statements.extend(proof.consume_statements(db)?);
         }
-        let proof_statements = statements.len();
         statements.extend(writes);
         let count = statements.len();
         let results = db.batch(statements).await.map_err(|error| {
@@ -70,9 +59,11 @@ impl VerifiedCode {
             }
         })?;
         if results.len() != count {
-            return Err(AppError::Internal);
+            return Err(AppError::internal(
+                "Verification batch returned an unexpected result count",
+            ));
         }
-        Ok(results.into_iter().skip(proof_statements).collect())
+        Ok(())
     }
 
     pub(crate) fn consume_statements(
@@ -137,50 +128,32 @@ pub async fn reserve_until(
     expires_at: i64,
     cooldown_before: i64,
 ) -> AppResult<bool> {
-    let id: Option<String> = db::run_query(
-        async {
-            query!(
-                db,
-                "INSERT INTO verification_codes
-                 \
-                     (id,owner_key,user_id,purpose,recipient,context,\
-                     code_hash,security_stamp,
-                  session_token,issued_at,expires_at)
-                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)
-                 ON CONFLICT(owner_key,purpose,recipient,context) DO UPDATE SET
-                   \
-                     id=excluded.id,code_hash=excluded.code_hash,\
-                     security_stamp=excluded.security_stamp,
-                   \
-                     session_token=excluded.session_token,issued_at=excluded.\
-                     issued_at,
-                   \
-                     expires_at=excluded.expires_at,attempts=0,ready=0,\
-                     consumed_at=NULL
-                 WHERE verification_codes.issued_at<=?12 OR \
-                     verification_codes.consumed_at IS NOT NULL
-                    OR \
-                     verification_codes.security_stamp<>excluded.\
-                     security_stamp
-                    OR \
-                     verification_codes.session_token<>excluded.session_token \
-                     RETURNING id",
-                code.id,
-                code.owner,
-                code.user_id,
-                code.purpose,
-                code.recipient,
-                code.context,
-                code.hash,
-                code.stamp,
-                code.session,
-                now,
-                expires_at,
-                cooldown_before
-            )?
-            .first(Some("id"))
-            .await
-        },
+    let id: Option<String> = db::query_first(
+        query!(
+            db,
+            "INSERT INTO verification_codes
+             (id,owner_key,user_id,purpose,recipient,context,code_hash,security_stamp,session_token,issued_at,expires_at)
+             VALUES (?1,?2,?3,?4,?5,'',?6,?7,?8,?9,?10)
+             ON CONFLICT(owner_key,purpose,recipient,context) DO UPDATE SET
+               id=excluded.id,code_hash=excluded.code_hash,security_stamp=excluded.security_stamp,
+               session_token=excluded.session_token,issued_at=excluded.issued_at,
+               expires_at=excluded.expires_at,attempts=0,ready=0,consumed_at=NULL
+             WHERE verification_codes.issued_at<=?11 OR verification_codes.consumed_at IS NOT NULL
+                OR verification_codes.security_stamp<>excluded.security_stamp
+                OR verification_codes.session_token<>excluded.session_token RETURNING id",
+            code.id,
+            code.owner,
+            code.user_id,
+            code.purpose,
+            code.recipient,
+            code.hash,
+            code.stamp,
+            code.session,
+            now,
+            expires_at,
+            cooldown_before
+        ),
+        Some("id"),
         "Failed to reserve verification code",
     )
     .await?;
@@ -192,26 +165,22 @@ pub(crate) async fn can_reuse(
     code: &VerificationCode<'_>,
     now: i64,
 ) -> AppResult<bool> {
-    let id: Option<String> = db::run_query(
-        async {
-            query!(
-                db,
-                "SELECT id FROM verification_codes WHERE owner_key=?1 AND \
-                     purpose=?2 AND recipient=?3 AND context=?4 AND \
-                     security_stamp=?5 AND session_token=?6 AND ready=1 AND \
-                     consumed_at IS NULL AND expires_at>?7 AND attempts<?8",
-                code.owner,
-                code.purpose,
-                code.recipient,
-                code.context,
-                code.stamp,
-                code.session,
-                now,
-                CODE_ATTEMPTS
-            )?
-            .first(Some("id"))
-            .await
-        },
+    let id: Option<String> = db::query_first(
+        query!(
+            db,
+            "SELECT id FROM verification_codes WHERE owner_key=?1 AND \
+                 purpose=?2 AND recipient=?3 AND context='' AND \
+                 security_stamp=?4 AND session_token=?5 AND ready=1 AND \
+                 consumed_at IS NULL AND expires_at>?6 AND attempts<?7",
+            code.owner,
+            code.purpose,
+            code.recipient,
+            code.stamp,
+            code.session,
+            now,
+            CODE_ATTEMPTS
+        ),
+        Some("id"),
         "Failed to check reusable verification code",
     )
     .await?;
@@ -219,17 +188,14 @@ pub(crate) async fn can_reuse(
 }
 
 pub async fn mark_ready(db: &D1Database, id: &str) -> AppResult<()> {
-    let changed: Option<String> = db::run_query(
-        async {
-            query!(
-                db,
-                "UPDATE verification_codes SET ready=1 WHERE id=?1 \
-                     RETURNING id",
-                id
-            )?
-            .first(Some("id"))
-            .await
-        },
+    let changed: Option<String> = db::query_first(
+        query!(
+            db,
+            "UPDATE verification_codes SET ready=1 WHERE id=?1 \
+                 RETURNING id",
+            id
+        ),
+        Some("id"),
         "Failed to enable delivered verification code",
     )
     .await?;
@@ -238,12 +204,8 @@ pub async fn mark_ready(db: &D1Database, id: &str) -> AppResult<()> {
 }
 
 pub async fn cancel(db: &D1Database, id: &str) -> AppResult<()> {
-    db::run_query(
-        async {
-            query!(db, "DELETE FROM verification_codes WHERE id=?1", id)?
-                .run()
-                .await
-        },
+    db::query_run(
+        query!(db, "DELETE FROM verification_codes WHERE id=?1", id),
         "Failed to cancel verification code",
     )
     .await?;
@@ -258,34 +220,30 @@ pub(crate) async fn check(
     now: i64,
     mode: CodeCheck,
 ) -> AppResult<VerifiedCode> {
-    let result: Option<VerificationMatch> = db::run_query(
-        async {
-            query!(
-                db,
-                "UPDATE verification_codes SET attempts=attempts+CASE \
-                     WHEN code_hash=?1 AND ?2=2 THEN 0 ELSE 1 END,
-                   consumed_at=CASE WHEN code_hash=?1 AND ?2=1 THEN ?3 ELSE \
-                     consumed_at END
-                 WHERE owner_key=?4 AND purpose=?5 AND recipient=?6 AND \
-                     context=?7
-                   AND security_stamp=?8 AND session_token=?9 AND ready=1
-                   AND consumed_at IS NULL AND expires_at>?3 AND attempts<?10
-                 RETURNING id, CASE WHEN code_hash=?1 THEN 1 ELSE 0 END AS \
-                     valid",
-                code.hash,
-                mode as i32,
-                now,
-                code.owner,
-                code.purpose,
-                code.recipient,
-                code.context,
-                code.stamp,
-                code.session,
-                CODE_ATTEMPTS
-            )?
-            .first(None)
-            .await
-        },
+    let result: Option<VerificationMatch> = db::query_first(
+        query!(
+            db,
+            "UPDATE verification_codes SET attempts=attempts+CASE \
+                 WHEN code_hash=?1 AND ?2=2 THEN 0 ELSE 1 END,
+               consumed_at=CASE WHEN code_hash=?1 AND ?2=1 THEN ?3 ELSE \
+                 consumed_at END
+             WHERE owner_key=?4 AND purpose=?5 AND recipient=?6 AND \
+                 context=''
+               AND security_stamp=?7 AND session_token=?8 AND ready=1
+               AND consumed_at IS NULL AND expires_at>?3 AND attempts<?9
+             RETURNING id, CASE WHEN code_hash=?1 THEN 1 ELSE 0 END AS \
+                 valid",
+            code.hash,
+            mode as i32,
+            now,
+            code.owner,
+            code.purpose,
+            code.recipient,
+            code.stamp,
+            code.session,
+            CODE_ATTEMPTS
+        ),
+        None,
         "Failed to verify one-time code",
     )
     .await?;
@@ -299,29 +257,21 @@ pub(crate) async fn check(
 }
 
 pub async fn purge(db: &D1Database, now: i64) -> AppResult<()> {
-    db::run_query(
-        async {
-            query!(
-                db,
-                "DELETE FROM verification_codes WHERE expires_at<=?1",
-                now
-            )?
-            .run()
-            .await
-        },
+    db::query_run(
+        query!(
+            db,
+            "DELETE FROM verification_codes WHERE expires_at<=?1",
+            now
+        ),
         "Failed to purge verification codes",
     )
     .await?;
-    db::run_query(
-        async {
-            query!(
-                db,
-                "DELETE FROM turnstile_redemptions WHERE expires_at<=?1",
-                now
-            )?
-            .run()
-            .await
-        },
+    db::query_run(
+        query!(
+            db,
+            "DELETE FROM turnstile_redemptions WHERE expires_at<=?1",
+            now
+        ),
         "Failed to purge Turnstile redemptions",
     )
     .await?;
@@ -349,23 +299,22 @@ pub(crate) async fn update_verified(
         email,
         stamp
     )?;
-    verification
-        .batch(
-            db,
-            vec![
-                write,
-                require_changed_row(db, DbSentinel::EmailVerificationConflict)?,
-            ],
-            |error| {
-                if DatabaseError::has_marker(error, DbSentinel::EmailVerificationConflict) {
-                    AppError::bad_request("Account changed during verification")
-                } else {
-                    DatabaseError::query("Failed to verify account email", error)
-                }
-            },
-        )
-        .await?;
-    Ok(())
+    VerifiedCode::commit(
+        db,
+        [verification],
+        vec![
+            write,
+            require_changed_row(db, DbSentinel::EmailVerificationConflict)?,
+        ],
+        |error| {
+            if DatabaseError::has_marker(&error, DbSentinel::EmailVerificationConflict) {
+                AppError::bad_request("Account changed during verification")
+            } else {
+                DatabaseError::query("Failed to verify account email", &error)
+            }
+        },
+    )
+    .await
 }
 pub async fn pending_recipient(
     db: &D1Database,
@@ -374,39 +323,33 @@ pub async fn pending_recipient(
     now: i64,
     session: &str,
 ) -> AppResult<Option<String>> {
-    db::run_query(
-        async {
-            query!(
-                db,
-                "SELECT recipient FROM verification_codes WHERE \
-                     user_id=?1 AND purpose=?2
-                AND ready=1 AND consumed_at IS NULL AND expires_at>?3 AND \
-                     session_token=?4 ORDER BY issued_at DESC LIMIT 1",
-                user_id,
-                purpose,
-                now,
-                session
-            )?
-            .first(Some("recipient"))
-            .await
-        },
+    db::query_first(
+        query!(
+            db,
+            "SELECT recipient FROM verification_codes WHERE \
+                 user_id=?1 AND purpose=?2
+            AND ready=1 AND consumed_at IS NULL AND expires_at>?3 AND \
+                 session_token=?4 ORDER BY issued_at DESC LIMIT 1",
+            user_id,
+            purpose,
+            now,
+            session
+        ),
+        Some("recipient"),
         "Failed to fetch pending email verification",
     )
     .await
 }
 
 pub async fn email_in_use(db: &D1Database, email: &str, user_id: &str) -> AppResult<bool> {
-    let id: Option<String> = db::run_query(
-        async {
-            query!(
-                db,
-                "SELECT id FROM users WHERE email=?1 AND id<>?2",
-                email,
-                user_id
-            )?
-            .first(Some("id"))
-            .await
-        },
+    let id: Option<String> = db::query_first(
+        query!(
+            db,
+            "SELECT id FROM users WHERE email=?1 AND id<>?2",
+            email,
+            user_id
+        ),
+        Some("id"),
         "Failed to check email availability",
     )
     .await?;
@@ -469,80 +412,32 @@ pub(crate) async fn change_email(
         claim,
         require_changed_row(db, DbSentinel::EmailChangeConflict)?,
     ];
-    writes.extend(change_email_cleanup(
-        db, &user.id, &token, change.key, &snapshot,
+    writes.extend(rotation::invalidation_writes(db, &user.id, &token)?);
+    writes.push(invalidate_user_statement(db, &user.id)?);
+    writes.push(rotation::rewrap_passkey_snapshots(
+        db, &user.id, change.key, &snapshot, &token,
     )?);
-    verification
-        .batch(db, writes, |error| {
-            if DatabaseError::has_marker(error, DbSentinel::EmailChangeConflict) {
-                AppError::conflict("Account changed or email is unavailable")
-            } else {
-                DatabaseError::query("Failed to update account email", error)
-            }
-        })
-        .await?;
-    Ok(())
-}
-
-fn change_email_cleanup(
-    db: &D1Database,
-    user_id: &str,
-    token: &str,
-    key: &str,
-    snapshot: &str,
-) -> AppResult<Vec<worker::D1PreparedStatement>> {
-    Ok(vec![
-        query!(
-            db,
-            "DELETE FROM two_factors WHERE user_id=?1 AND provider_type=5 \
-                 AND EXISTS(SELECT 1 FROM users WHERE id=?1 AND \
-                 account_write_token=?2)",
-            user_id,
-            token
-        )?,
-        query!(
-            db,
-            "DELETE FROM auth_requests WHERE user_id=?1 AND EXISTS(SELECT \
-                 1 FROM users WHERE id=?1 AND account_write_token=?2)",
-            user_id,
-            token
-        )?,
-        query!(
-            db,
-            "DELETE FROM verification_codes WHERE user_id=?1 AND \
-                 EXISTS(SELECT 1 FROM users WHERE id=?1 AND \
-                 account_write_token=?2)",
-            user_id,
-            token
-        )?,
-        query!(
-            db,
-            "UPDATE webauthn_credentials SET \
-                 account_snapshot=json_set(account_snapshot,'$.key',?1) WHERE \
-                 user_id=?2 AND account_snapshot=?3 AND EXISTS(SELECT 1 FROM \
-                 users WHERE id=?2 AND account_write_token=?4)",
-            key,
-            user_id,
-            snapshot,
-            token
-        )?,
-    ])
+    VerifiedCode::commit(db, [verification], writes, |error| {
+        if DatabaseError::has_marker(&error, DbSentinel::EmailChangeConflict) {
+            AppError::conflict("Account changed or email is unavailable")
+        } else {
+            DatabaseError::query("Failed to update account email", &error)
+        }
+    })
+    .await
 }
 
 pub async fn claim_turnstile(db: &D1Database, hash: &str, expires_at: i64) -> AppResult<()> {
-    let claimed: Option<String> = db::run_query(
-        async {
-            query!(
-                db,
-                "INSERT INTO turnstile_redemptions(token_hash,expires_at) \
-                     VALUES(?1,?2)
-                ON CONFLICT(token_hash) DO NOTHING RETURNING token_hash",
-                hash,
-                expires_at
-            )?
-            .first(Some("token_hash"))
-            .await
-        },
+    let claimed: Option<String> = db::query_first(
+        query!(
+            db,
+            "INSERT INTO turnstile_redemptions(token_hash,expires_at) \
+                 VALUES(?1,?2)
+            ON CONFLICT(token_hash) DO NOTHING RETURNING token_hash",
+            hash,
+            expires_at
+        ),
+        Some("token_hash"),
         "Failed to claim Turnstile verification",
     )
     .await?;
@@ -561,23 +456,11 @@ pub(crate) async fn enable_provider(
     let id = uuid::Uuid::new_v4().to_string();
     let data = serde_json::json!({"email":email}).to_string();
     let revision_sql = crate::models::mutation::next_user_revision_sql(2);
-    VerifiedCode::batch_with_proofs(
+    VerifiedCode::commit(
         db,
         authorization.into_iter().chain([verification]),
         vec![
-            query!(
-                db,
-                "SELECT CASE WHEN EXISTS (SELECT 1 FROM users u JOIN \
-                     devices d ON d.user_id=u.id WHERE u.id=?1 AND \
-                     u.security_stamp=?2 AND d.device_id=?3 AND \
-                     d.session_token=?4) THEN 1 ELSE json_extract('[]', ?5) \
-                     END",
-                user_id,
-                session.security_stamp,
-                session.device_id,
-                session.session_token,
-                DbSentinel::EmailProviderSessionConflict.as_str()
-            )?,
+            session_guard_with_sentinel(db, session, DbSentinel::EmailProviderSessionConflict)?,
             query!(
                 db,
                 "INSERT INTO \
@@ -608,12 +491,7 @@ pub(crate) async fn enable_provider(
                      purpose='email-setup'",
                 user_id
             )?,
-            query!(
-                db,
-                "DELETE FROM two_factors WHERE user_id=?1 AND \
-                     provider_type=5",
-                user_id
-            )?,
+            TwoFactorRow::delete_remembered(db, user_id)?,
         ],
         |error| {
             if DatabaseError::has_marker(&error, DbSentinel::EmailProviderSessionConflict) {
@@ -622,8 +500,7 @@ pub(crate) async fn enable_provider(
             DatabaseError::query("Failed to enable email two-factor authentication", &error)
         },
     )
-    .await?;
-    Ok(())
+    .await
 }
 pub(super) fn invalidate_user_statement(
     db: &D1Database,
@@ -644,7 +521,7 @@ pub(crate) async fn disable_provider(
     let user_id = authorization.session.user_id;
     let revision_sql = crate::models::mutation::next_user_revision_sql(1);
     authorization.commit(db, vec![
-        TwoFactorRow::snapshot_guard(db, user_id, 1, previous)?,
+        TwoFactorRow::snapshot_guard(db, user_id, 1, previous, DbSentinel::VaultWriteConflict)?,
         query!(
             db,
             "DELETE FROM two_factors WHERE user_id=?1 AND provider_type IN (1,5)",
@@ -661,7 +538,7 @@ pub(crate) async fn disable_provider(
             crate::utils::time::now_rfc3339(),
             user_id
         )?,
-        TwoFactorRow::clear_recovery_statement(db, user_id, None)?,
+        TwoFactorRow::clear_recovery_statement(db, user_id)?,
     ], "Failed to disable email two-factor authentication").await?;
     Ok(())
 }

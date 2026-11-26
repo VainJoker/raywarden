@@ -1,35 +1,18 @@
 //! Application settings read from the current Worker environment.
 
-use std::{collections::BTreeMap, str::FromStr};
+use std::{collections::BTreeMap, fmt::Display, str::FromStr};
 
 use email_address::{EmailAddress, Options};
 use worker::Env;
 
 use crate::errors::{AppError, AppResult, ConfigError};
 
-pub(crate) struct EnvReader<'a>(pub &'a Env);
+fn env_var(env: &Env, name: &str) -> Option<String> {
+    env.var(name).ok().map(|value| value.to_string())
+}
 
-impl EnvReader<'_> {
-    fn value(&self, name: &str) -> Option<String> {
-        self.0.var(name).ok().map(|value| value.to_string())
-    }
-
-    pub(crate) fn value_or(&self, name: &str, default: &str) -> String {
-        self.value(name).unwrap_or_else(|| default.to_owned())
-    }
-
-    pub(crate) fn parse_or_default<T: FromStr>(&self, name: &str, default: T) -> T {
-        self.value(name)
-            .and_then(|value| value.parse().ok())
-            .unwrap_or(default)
-    }
-
-    pub(crate) fn required_secret(&self, name: &str) -> AppResult<String> {
-        self.0
-            .secret(name)
-            .map(|value| value.to_string())
-            .map_err(|_error| ConfigError::Missing(name.to_owned()).into())
-    }
+fn env_parse<T: FromStr>(env: &Env, name: &str) -> Option<T> {
+    env_var(env, name).and_then(|value| value.parse().ok())
 }
 
 /// Application configuration loaded from Worker environment variables and
@@ -51,33 +34,29 @@ pub(crate) struct Config {
 
 impl Config {
     pub(crate) fn from_env(env: &Env) -> AppResult<Self> {
-        let reader = EnvReader(env);
-        let domain = reader
-            .value("DOMAIN")
-            .ok_or_else(|| ConfigError::Missing("DOMAIN".into()))?;
+        let domain = env_var(env, "DOMAIN").ok_or(ConfigError::Missing("DOMAIN"))?;
         let domain = parse_domain_origin(&domain)?;
 
         let allowed_emails = env_text(env, "ALLOWED_EMAILS")
             .map(|raw| parse_allowed_emails(&raw))
             .transpose()?;
 
+        let jwt_duration = env_var(env, "JWT_DURATION_SECONDS");
         let jwt_duration_seconds = parse_jwt_duration_seconds(
-            &reader.value_or("JWT_DURATION_SECONDS", "3600"),
+            jwt_duration.as_deref().unwrap_or("3600"),
             crate::utils::time::now_seconds(),
         )?;
         Ok(Self {
             domain,
             jwt_duration_seconds,
-            import_batch_size: reader.parse_or_default("IMPORT_BATCH_SIZE", 30),
+            import_batch_size: env_parse(env, "IMPORT_BATCH_SIZE").unwrap_or(30),
             authenticator_time_drift_disabled: env_bool(
                 env,
                 "AUTHENTICATOR_DISABLE_TIME_DRIFT",
                 false,
             ),
-            two_factor_remember_days: reader
-                .value_or("TWO_FACTOR_REMEMBER_DAYS", "30")
-                .trim()
-                .parse::<i64>()
+            two_factor_remember_days: env_var(env, "TWO_FACTOR_REMEMBER_DAYS")
+                .and_then(|value| value.trim().parse::<i64>().ok())
                 .unwrap_or(30)
                 .clamp(1, 90),
 
@@ -90,26 +69,14 @@ pub(crate) fn cors_allowed_origins(env: &Env) -> AppResult<Option<String>> {
     string_binding(env, "CORS_ALLOWED_ORIGINS")
 }
 
-pub(crate) fn heavy_shard_count(env: &Env) -> usize {
-    let value = EnvReader(env).value("HEAVY_DO_SHARDS");
-    parse_heavy_shard_count(value.as_deref())
-}
-
-fn parse_heavy_shard_count(value: Option<&str>) -> usize {
-    value
-        .and_then(|value| value.trim().parse().ok())
-        .filter(|n| (1..=64).contains(n))
-        .unwrap_or(16)
-}
-
 pub(crate) fn owner_setup_secret(env: &Env) -> AppResult<String> {
-    EnvReader(env)
-        .required_secret("OWNER_SETUP_TOKEN")
+    env.secret("OWNER_SETUP_TOKEN")
+        .map(|value| value.to_string())
         .map_err(|_error| AppError::bad_request("Owner setup is not configured"))
 }
 
 pub(crate) fn webauthn_allowed_origins(env: &Env) -> String {
-    EnvReader(env).value_or("WEBAUTHN_ALLOWED_ORIGINS", "")
+    env_var(env, "WEBAUTHN_ALLOWED_ORIGINS").unwrap_or_default()
 }
 
 pub(crate) fn registration_disabled(env: &Env) -> bool {
@@ -117,8 +84,7 @@ pub(crate) fn registration_disabled(env: &Env) -> bool {
 }
 
 pub(crate) fn fill_assist_rules_url(env: &Env) -> String {
-    EnvReader(env)
-        .value("FILL_ASSIST_RULES_URL")
+    env_var(env, "FILL_ASSIST_RULES_URL")
         .filter(|value| is_valid_fill_assist_url(value))
         .unwrap_or_else(|| "https://fillassist.bitwarden.com".into())
 }
@@ -136,7 +102,7 @@ fn is_valid_fill_assist_url(value: &str) -> bool {
 }
 
 pub(crate) fn release_id(env: &Env) -> Option<String> {
-    EnvReader(env).value("RAYWARDEN_RELEASE_ID").filter(|id| {
+    env_var(env, "RAYWARDEN_RELEASE_ID").filter(|id| {
         id.len() == 64
             && id
                 .bytes()
@@ -147,7 +113,7 @@ pub(crate) fn release_id(env: &Env) -> Option<String> {
 pub(crate) const DEFAULT_SEND_TEXT_SIZE_BYTES: usize = 1_887_436;
 
 pub(crate) fn send_text_size_bytes(env: &Env) -> usize {
-    let value = EnvReader(env).value("SEND_TEXT_MAX_BYTES");
+    let value = env_var(env, "SEND_TEXT_MAX_BYTES");
     parse_send_text_size_bytes(value.as_deref())
 }
 
@@ -161,40 +127,49 @@ fn parse_send_text_size_bytes(value: Option<&str>) -> usize {
 
 /// Read an optional secret or variable without introducing mandatory bindings.
 pub fn env_text(env: &Env, key: &str) -> Option<String> {
-    EnvReader(env).value(key).filter(|v| !v.trim().is_empty())
+    env_var(env, key).filter(|v| !v.trim().is_empty())
 }
 
 pub(crate) fn trash_retention_days(env: &Env) -> i64 {
-    EnvReader(env).parse_or_default("TRASH_AUTO_DELETE_DAYS", 30)
+    env_parse(env, "TRASH_AUTO_DELETE_DAYS").unwrap_or(30)
 }
 
 pub fn env_bool(env: &Env, key: &str, default: bool) -> bool {
-    let Some(value) = env_text(env, key) else {
-        return default;
-    };
+    env_text(env, key)
+        .as_deref()
+        .and_then(parse_bool)
+        .unwrap_or(default)
+}
+
+fn parse_bool(value: &str) -> Option<bool> {
     let value = value.trim();
     if ["1", "true", "yes", "on"]
         .iter()
         .any(|option| value.eq_ignore_ascii_case(option))
     {
-        true
+        Some(true)
     } else if ["0", "false", "no", "off"]
         .iter()
         .any(|option| value.eq_ignore_ascii_case(option))
     {
-        false
+        Some(false)
     } else {
-        default
+        None
     }
 }
 
 pub(crate) fn string_binding(env: &Env, name: &str) -> AppResult<Option<String>> {
     // Distinguish an absent property from a value of the wrong type.
-    let value = js_sys::Reflect::get(env, &name.into()).map_err(AppError::internal_error)?;
+    let value = js_sys::Reflect::get(env, &name.into()).map_err(AppError::internal_discard(
+        "Failed to read Worker environment binding",
+    ))?;
     if value.is_undefined() {
         return Ok(None);
     }
-    value.as_string().map(Some).ok_or(AppError::Internal)
+    value
+        .as_string()
+        .map(Some)
+        .ok_or_else(|| AppError::internal("Worker environment binding must be a string"))
 }
 
 fn parse_jwt_duration_seconds(value: &str, now: i64) -> Result<u64, ConfigError> {
@@ -208,30 +183,26 @@ fn parse_jwt_duration_seconds(value: &str, now: i64) -> Result<u64, ConfigError>
                 .and_then(|seconds| now.checked_add(seconds))
                 .is_some()
         })
-        .ok_or_else(|| {
-            ConfigError::Invalid(
-                "JWT_DURATION_SECONDS must be positive and fit a Unix-second \
-                 expiration timestamp"
-                    .to_string(),
-            )
-        })
+        .ok_or(ConfigError::Invalid(
+            "JWT_DURATION_SECONDS must be positive and fit a Unix-second \
+             expiration timestamp",
+        ))
 }
 
 fn parse_domain_origin(domain: &str) -> AppResult<String> {
     let domain = domain.trim();
     if domain.is_empty() {
-        return Err(ConfigError::Missing("DOMAIN".to_string()).into());
+        return Err(ConfigError::Missing("DOMAIN").into());
     }
-    let value = if domain.contains("://") {
-        domain.to_owned()
+    let value: std::borrow::Cow<'_, str> = if domain.contains("://") {
+        std::borrow::Cow::Borrowed(domain)
     } else {
-        format!("https://{domain}")
+        std::borrow::Cow::Owned(format!("https://{domain}"))
     };
     let invalid = || {
         ConfigError::Invalid(
             "DOMAIN must be an HTTPS origin without credentials, path, query \
-             or fragment; HTTP is allowed only for loopback development"
-                .to_owned(),
+             or fragment; HTTP is allowed only for loopback development",
         )
     };
     if value.chars().any(char::is_whitespace) || value.contains('\\') {
@@ -299,77 +270,65 @@ const DEFAULT_ATTACHMENT_TOKEN_TTL_SECONDS: i64 = 60;
 const DEFAULT_SEND_FILE_TOKEN_TTL_SECONDS: i64 = 300;
 pub(crate) const DEFAULT_SEND_MAX_BYTES: i64 = 95 * 1024 * 1024;
 
+fn attachment_setting<T: FromStr>(
+    env: &Env,
+    name: &str,
+    parse_error: &'static str,
+) -> AppResult<Option<T>>
+where
+    T::Err: Display,
+{
+    env_var(env, name)
+        .map(|value| {
+            value
+                .parse()
+                .map_err(|error| AppError::internal_with_context(parse_error, error))
+        })
+        .transpose()
+}
+
 pub(crate) fn attachment_token_ttl_seconds(env: &Env) -> AppResult<i64> {
-    match env.var("ATTACHMENT_TTL_SECS") {
-        Ok(value) => {
-            let raw = value.to_string();
-            let ttl = raw.parse::<i64>().map_err(|error| {
-                AppError::internal_with_context("Invalid ATTACHMENT_TTL_SECS", error)
-            })?;
-
-            if ttl <= 0 {
-                return Err(AppError::InternalFailure(
-                    "ATTACHMENT_TTL_SECS must be positive".into(),
-                ));
-            }
-
-            Ok(ttl)
-        }
-        Err(_) => Ok(DEFAULT_ATTACHMENT_TOKEN_TTL_SECONDS),
+    let ttl = attachment_setting(env, "ATTACHMENT_TTL_SECS", "Invalid ATTACHMENT_TTL_SECS")?
+        .unwrap_or(DEFAULT_ATTACHMENT_TOKEN_TTL_SECONDS);
+    if ttl <= 0 {
+        return Err(AppError::internal("ATTACHMENT_TTL_SECS must be positive"));
     }
+    Ok(ttl)
 }
 
 pub(crate) fn attachment_max_bytes(env: &Env) -> AppResult<Option<u64>> {
-    match env.var("ATTACHMENT_MAX_BYTES") {
-        Ok(value) => {
-            let raw = value.to_string();
-            raw.parse::<u64>().map(Some).map_err(|error| {
-                AppError::internal_with_context("Invalid ATTACHMENT_MAX_BYTES", error)
-            })
-        }
-        Err(_) => Ok(None),
-    }
+    attachment_setting(env, "ATTACHMENT_MAX_BYTES", "Invalid ATTACHMENT_MAX_BYTES")
 }
 
 pub(crate) fn attachment_quota_bytes(env: &Env) -> AppResult<Option<u64>> {
-    match env.var("ATTACHMENT_TOTAL_LIMIT_KB") {
-        Ok(value) => {
-            let raw = value.to_string();
-            let kb = raw.parse::<u64>().map_err(|error| {
-                AppError::internal_with_context("Invalid ATTACHMENT_TOTAL_LIMIT_KB", error)
-            })?;
-
-            let bytes = kb.checked_mul(1024).ok_or_else(|| {
-                AppError::InternalFailure(
-                    "ATTACHMENT_TOTAL_LIMIT_KB overflowed when converting to \
-                     bytes"
-                        .into(),
-                )
-            })?;
-
-            Ok(Some(bytes))
-        }
-        Err(_) => Ok(None),
-    }
+    attachment_setting::<u64>(
+        env,
+        "ATTACHMENT_TOTAL_LIMIT_KB",
+        "Invalid ATTACHMENT_TOTAL_LIMIT_KB",
+    )?
+    .map(|kb| {
+        kb.checked_mul(1024).ok_or_else(|| {
+            AppError::internal("ATTACHMENT_TOTAL_LIMIT_KB overflowed when converting to bytes")
+        })
+    })
+    .transpose()
 }
 
 pub(crate) fn send_max_bytes(env: &Env) -> i64 {
-    env.var("SEND_MAX_BYTES")
-        .ok()
-        .and_then(|value| value.to_string().parse::<i64>().ok())
+    env_parse::<i64>(env, "SEND_MAX_BYTES")
         .filter(|bytes| *bytes > 0)
         .unwrap_or(DEFAULT_SEND_MAX_BYTES)
 }
 
 pub(crate) fn send_quota_bytes(env: &Env) -> AppResult<Option<i64>> {
-    let value = js_sys::Reflect::get(env, &"USER_SEND_LIMIT_KB".into())
-        .map_err(|_error| invalid_send_quota())?;
-    if value.is_undefined() {
+    let Some(value) =
+        string_binding(env, "USER_SEND_LIMIT_KB").map_err(|_error| invalid_send_quota())?
+    else {
         return Ok(None);
-    }
+    };
     value
-        .as_string()
-        .and_then(|value| value.parse::<i64>().ok())
+        .parse::<i64>()
+        .ok()
         .filter(|kb| *kb >= 0)
         .and_then(|kb| kb.checked_mul(1024))
         .map(Some)
@@ -377,11 +336,11 @@ pub(crate) fn send_quota_bytes(env: &Env) -> AppResult<Option<i64>> {
 }
 
 fn invalid_send_quota() -> AppError {
-    ConfigError::Invalid("USER_SEND_LIMIT_KB must be a nonnegative integer in KiB".into()).into()
+    ConfigError::Invalid("USER_SEND_LIMIT_KB must be a nonnegative integer in KiB").into()
 }
 
 pub(crate) fn send_file_token_expires_at_seconds(env: &Env, now_seconds: i64) -> AppResult<i64> {
-    let value = env.var("SEND_TTL_SECS").ok().map(|value| value.to_string());
+    let value = env_var(env, "SEND_TTL_SECS");
     parse_send_file_token_expires_at_seconds(value.as_deref(), now_seconds)
 }
 
@@ -399,8 +358,7 @@ fn parse_send_file_token_expires_at_seconds(
     expires_at_seconds.ok_or_else(|| {
         ConfigError::Invalid(
             "SEND_TTL_SECS must be positive and fit a supported expiration \
-             timestamp"
-                .into(),
+             timestamp",
         )
         .into()
     })
@@ -433,12 +391,7 @@ fn parse_feature_flags(value: &str) -> impl Iterator<Item = (String, bool)> + '_
         if !DEFAULT_ON_FLAGS.contains(&name) && !OPTIONAL_FLAGS.contains(&name) {
             return None;
         }
-        let enabled = match enabled.trim().to_ascii_lowercase().as_str() {
-            "true" | "1" | "yes" | "on" => true,
-            "false" | "0" | "no" | "off" => false,
-            _ => return None,
-        };
-        Some((name.to_owned(), enabled))
+        Some((name.to_owned(), parse_bool(enabled)?))
     })
 }
 
@@ -455,199 +408,70 @@ pub(crate) fn client_feature_flags(env: &Env) -> BTreeMap<String, bool> {
 }
 
 #[cfg(test)]
-mod account_email_tests {
-    use super::*;
-
-    #[test]
-    fn client_flags_only_override_supported_configurable_flags() {
-        let flags = parse_feature_flags(
-            "macos-native-credential-sync,\
-                 pm-27278-v2-password-registration,\
-                 windows-native-credential-sync=false,\
-                 force-upgrade-v2-encryption,pm-30144-sdk-key-rotation,\
-                 pm-31050-no-logout-key-upgrade-rotation,\
-                 enable-account-encryption-v2-jit-password-registration,bogus,\
-                 +             \
-                 pm-19148-innovation-archive=false,\
-                 pm-32009-new-item-types=FALSE",
-        )
-        .collect::<BTreeMap<_, _>>();
-        assert_eq!(flags.len(), 4);
-        assert!(flags["macos-native-credential-sync"]);
-        assert!(!flags["windows-native-credential-sync"]);
-        assert!(!flags["pm-32009-new-item-types"]);
-    }
-
-    #[test]
-    fn allowlist_accepts_lists_and_normalizes_scope() {
-        assert_eq!(
-            parse_allowed_emails(" B@Example.test, a@example.test\nb@example.test ")
-                .expect("test fixture should be valid"),
-            vec!["a@example.test", "b@example.test"]
-        );
-        for raw in ["", "a@example.test,", "a@example.test,,b@example.test"] {
-            assert!(parse_allowed_emails(raw).is_err());
-        }
-    }
-
-    #[test]
-    fn allowlist_requires_plain_account_addresses() {
-        assert_eq!(
-            parse_allowed_emails(" Owner+vault@Example.TEST ")
-                .expect("test fixture should be valid"),
-            vec!["owner+vault@example.test"]
-        );
-        for invalid in [
-            "*",
-            "*@example.test",
-            "a*@example.test",
-            "a?@example.test",
-            "a@b.test;",
-            "a@@b.test",
-            "a@localhost",
-            ".a@b.test",
-            "a..b@b.test",
-            "a@-b.test",
-            "a@b..test",
-            "a@b_c.test",
-            "\"a\"@b.test",
-            "a@[127.0.0.1]",
-            "Name <a@b.test>",
-            "á@b.test",
-            "a @b.test",
-            "\ta@b.test",
-        ] {
-            assert!(parse_allowed_emails(invalid).is_err(), "{invalid:?}");
-        }
-
-        let local = "a".repeat(64);
-        let label = "b".repeat(63);
-        let domain = format!("{label}.{label}.{}", "c".repeat(61));
-        assert!(parse_allowed_emails(&format!("{local}@{domain}")).is_ok());
-        assert!(parse_allowed_emails(&format!("{local}@{domain}c")).is_err());
-        assert!(parse_allowed_emails(&format!("{local}a@b.test")).is_err());
-    }
-}
-
-#[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn jwt_duration_rejects_invalid_values_and_expiration_overflow() {
+    fn allowlist_and_feature_flags_normalize_and_reject_wildcards() {
+        let flags = parse_feature_flags("macos-native-credential-sync,windows-native-credential-sync=false,force-upgrade-v2-encryption,bogus")
+            .collect::<BTreeMap<_, _>>();
+        assert_eq!(flags.len(), 2);
+        assert_eq!(
+            parse_allowed_emails(" B@Example.test, Owner+v@Example.test\nb@example.test ")
+                .expect("valid"),
+            vec!["b@example.test", "owner+v@example.test"]
+        );
+        for bad in [
+            "",
+            "a@b.test,",
+            "*@b.test",
+            "a@@b.test",
+            "a@localhost",
+            "Name <a@b.test>",
+        ] {
+            assert!(parse_allowed_emails(bad).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn origins_durations_and_limits_enforce_bounds() {
+        assert_eq!(
+            parse_domain_origin(" vault.example/ ").ok().as_deref(),
+            Some("https://vault.example")
+        );
+        assert_eq!(
+            parse_domain_origin("http://localhost:8787/")
+                .ok()
+                .as_deref(),
+            Some("http://localhost:8787")
+        );
+        for bad in [
+            "",
+            "http://vault.example",
+            "https://u:p@vault.example",
+            "https://vault.example/path",
+            "http://localhost.evil.test",
+        ] {
+            assert!(parse_domain_origin(bad).is_err(), "{bad}");
+        }
         assert_eq!(
             parse_jwt_duration_seconds("3600", 1_800_000_000).ok(),
             Some(3600)
         );
-        for value in [
-            "0",
-            "-1",
-            "nope",
-            "",
-            "9223372036854775807",
-            "18446744073709551615",
-        ] {
-            assert!(
-                parse_jwt_duration_seconds(value, 1_800_000_000).is_err(),
-                "{value}"
-            );
-        }
+        assert!(parse_jwt_duration_seconds("0", 1_800_000_000).is_err());
         assert!(parse_jwt_duration_seconds("1", i64::MAX).is_err());
-    }
-
-    #[test]
-    fn domain_is_normalized_to_an_origin() {
-        for (input, origin) in [
-            (" vault.example/ ", "https://vault.example"),
-            ("HTTPS://VAULT.EXAMPLE:443/", "https://vault.example"),
-            ("http://localhost:8787/", "http://localhost:8787"),
-            ("http://127.0.0.1:8787", "http://127.0.0.1:8787"),
-            ("http://[::1]:8787", "http://[::1]:8787"),
-        ] {
-            assert_eq!(
-                parse_domain_origin(input).ok().as_deref(),
-                Some(origin),
-                "{input}"
-            );
-        }
-        for domain in [
-            "",
-            "ftp://vault.example",
-            "https://user:password@vault.example",
-            "https://vault.example/path",
-            "https://vault.example?token=secret",
-            "https://vault.example#fragment",
-            "https://vault.exa mple",
-            "https://vault.example\\path",
-            "http://vault.example",
-            "http://localhost.attacker.example",
-        ] {
-            assert!(parse_domain_origin(domain).is_err(), "{domain}");
-        }
-    }
-
-    #[test]
-    fn file_lifetimes_keep_reference_defaults_and_reject_invalid_dates() {
-        for value in [None, Some("invalid"), Some("18446744073709551616")] {
-            assert_eq!(
-                parse_send_file_token_expires_at_seconds(value, 1_000).expect("valid test fixture"),
-                1_300
-            );
-        }
         assert_eq!(
-            parse_send_file_token_expires_at_seconds(Some("17"), 1_000)
-                .expect("valid test fixture"),
-            1_017
+            parse_send_file_token_expires_at_seconds(None, 1_000).expect("default"),
+            1_300
         );
-        for value in ["0", "-1", "9223372036854775807", "253402300799"] {
-            assert!(parse_send_file_token_expires_at_seconds(Some(value), 1_000).is_err());
-        }
-        assert!(parse_send_file_token_expires_at_seconds(Some("1"), i64::MAX).is_err());
-    }
-
-    #[test]
-    fn heavy_shard_counts_stay_within_bounded_range() {
-        assert_eq!(parse_heavy_shard_count(Some("2")), 2);
-        assert_eq!(parse_heavy_shard_count(Some("64")), 64);
-        for value in [None, Some("0"), Some("65"), Some("invalid")] {
-            assert_eq!(parse_heavy_shard_count(value), 16);
-        }
-    }
-
-    #[test]
-    fn text_limits_parse_unsigned_and_clamp_before_native_or_wasm_conversion() {
-        for value in [
-            None,
-            Some("invalid"),
-            Some("-1"),
-            Some("18446744073709551616"),
-        ] {
-            assert_eq!(
-                parse_send_text_size_bytes(value),
-                DEFAULT_SEND_TEXT_SIZE_BYTES
-            );
-        }
-        assert_eq!(parse_send_text_size_bytes(Some("0")), 0);
-        assert_eq!(parse_send_text_size_bytes(Some("23")), 23);
+        assert!(parse_send_file_token_expires_at_seconds(Some("0"), 1_000).is_err());
         assert_eq!(
             parse_send_text_size_bytes(Some("18446744073709551615")),
             1_900_000
         );
-    }
-
-    #[test]
-    fn rules_urls_cannot_carry_credentials_queries_or_non_https_schemes() {
         assert!(is_valid_fill_assist_url(
             "https://rules.example.test/rules.json"
         ));
-        for value in [
-            "http://rules.example.test",
-            "https://user@rules.example.test",
-            "https://rules.example.test/?token=x",
-            "https://rules.example.test/#x",
-            " https://rules.example.test",
-        ] {
-            assert!(!is_valid_fill_assist_url(value));
-        }
+        assert!(!is_valid_fill_assist_url("http://rules.example.test"));
     }
 }

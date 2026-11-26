@@ -3,11 +3,8 @@ use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 
 use crate::{
     errors::{AppResult, CryptoError},
-    infra::crypto::pbkdf2_sha256,
     utils::constant_time_eq,
 };
-
-const DERIVED_KEY_BITS: u32 = 256;
 
 pub(super) async fn hash_password_for_storage(
     password: &str,
@@ -19,15 +16,12 @@ pub(super) async fn hash_password_for_storage(
     }
     let salt_bytes = BASE64
         .decode(salt)
-        .map_err(|_error| CryptoError::RandomGenerationFailed("decode persisted salt"))?;
+        .map_err(|_error| CryptoError::Pbkdf2Failed("decode persisted salt"))?;
 
-    let derived = pbkdf2_sha256(
-        password.as_bytes(),
-        &salt_bytes,
-        iterations,
-        DERIVED_KEY_BITS,
-    )
-    .await?;
+    // Use one implementation for all persisted account and Send costs. Workers'
+    // Web Crypto PBKDF2 ceiling does not apply to RustCrypto.
+    let derived =
+        pbkdf2::pbkdf2_hmac_array::<sha2::Sha256, 32>(password.as_bytes(), &salt_bytes, iterations);
 
     Ok(BASE64.encode(derived))
 }

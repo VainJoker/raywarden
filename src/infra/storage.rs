@@ -1,89 +1,71 @@
-//! R2 and bounded KV object storage, including native streaming reads.
+//! R2 object storage with multipart uploads and native streaming reads.
 use std::ops::RangeInclusive;
 
 use bytes::Bytes;
 use futures_util::{Stream, StreamExt};
-use serde_json::json;
 use wasm_bindgen::JsValue;
-use worker::{
-    Bucket, Env, EnvBinding, HttpMetadata, MultipartUpload, Range, UploadedPart, kv::KvStore,
-};
+use worker::{Bucket, Env, EnvBinding, HttpMetadata, MultipartUpload, Range, UploadedPart};
 
 use crate::errors::{AppError, AppResult, ConfigError};
 
-pub const KV_MAX_BYTES: usize = 25 * 1024 * 1024;
 const MULTIPART_PART_BYTES: usize = 8 * 1024 * 1024;
 const MAX_MULTIPART_PARTS: u16 = 10_000;
 const R2_BINDING: &str = "ATTACHMENTS_BUCKET";
-const KV_BINDING: &str = "ATTACHMENTS_KV";
 
 #[derive(Debug)]
 pub struct ObjectMetadata {
     pub size_bytes: u64,
-    pub http_etag: Option<String>,
+    pub http_etag: String,
 }
 
-/// An opened object: R2 holds a lazy content source, KV holds its bounded read.
+/// An opened R2 object holding metadata and a lazy content handle.
 pub struct OpenedObject {
     pub metadata: ObjectMetadata,
-    source: ObjectSource,
-}
-
-enum ObjectSource {
-    R2 { bucket: Bucket, key: String },
-    Kv(Bytes),
-}
-
-pub enum ObjectBody {
-    Stream(web_sys::ReadableStream),
-    Bytes(Bytes),
+    bucket: Bucket,
+    key: String,
 }
 
 impl OpenedObject {
     /// Read a selected inclusive byte interval, or the full object. A missing
     /// R2 object can disappear after opening; callers decide its HTTP meaning.
-    pub async fn read(self, range: Option<RangeInclusive<u64>>) -> AppResult<Option<ObjectBody>> {
+    pub async fn read(
+        self,
+        range: Option<RangeInclusive<u64>>,
+    ) -> AppResult<Option<web_sys::ReadableStream>> {
         if let Some(range) = &range
             && (range.is_empty() || *range.end() >= self.metadata.size_bytes)
         {
-            return Err(AppError::Internal);
+            return Err(AppError::internal(
+                "Invalid byte range for object storage read",
+            ));
         }
-        match self.source {
-            ObjectSource::R2 { bucket, key } => {
-                let get = bucket.get(&key);
-                let get = if let Some(range) = range {
-                    get.range(Range::OffsetWithLength {
-                        offset: *range.start(),
-                        length: *range.end() - *range.start() + 1,
-                    })
-                } else {
-                    get
-                };
-                let Some(object) = get.execute().await? else {
-                    return Ok(None);
-                };
-                let worker::ResponseBody::Stream(stream) =
-                    object.body().ok_or(AppError::Internal)?.response_body()?
-                else {
-                    return Err(AppError::Internal);
-                };
-                Ok(Some(ObjectBody::Stream(stream)))
-            }
-            ObjectSource::Kv(bytes) => Ok(Some(ObjectBody::Bytes(if let Some(range) = range {
-                bytes.slice(*range.start() as usize..=*range.end() as usize)
-            } else {
-                bytes
-            }))),
-        }
+        let get = self.bucket.get(&self.key);
+        let get = if let Some(range) = range {
+            get.range(Range::OffsetWithLength {
+                offset: *range.start(),
+                length: *range.end() - *range.start() + 1,
+            })
+        } else {
+            get
+        };
+        let Some(object) = get.execute().await.map_err(AppError::r2_error)? else {
+            return Ok(None);
+        };
+        let worker::ResponseBody::Stream(stream) = object
+            .body()
+            .ok_or_else(|| AppError::internal("Object storage returned no readable body stream"))?
+            .response_body()
+            .map_err(AppError::r2_error)?
+        else {
+            return Err(AppError::internal(
+                "Object storage returned a non-streaming body",
+            ));
+        };
+        Ok(Some(stream))
     }
 }
 
-/// R2 streams are preferred. KV keeps the existing raw-byte object format and
-/// is buffered only within its 25 MiB backend limit.
-pub enum Storage {
-    R2(Bucket),
-    Kv(KvStore),
-}
+pub struct Storage(Bucket);
 
 pub(crate) enum StorageWriteError {
     Incomplete(AppError),
@@ -114,7 +96,8 @@ impl<'a> R2MultipartUpload<'a> {
             .create_multipart_upload(key)
             .http_metadata(metadata(content_type))
             .execute()
-            .await?;
+            .await
+            .map_err(AppError::r2_error)?;
         Ok(Self {
             bucket,
             key,
@@ -128,8 +111,12 @@ impl<'a> R2MultipartUpload<'a> {
             .ok()
             .filter(|&number| number <= MAX_MULTIPART_PARTS)
             .ok_or_else(|| AppError::bad_request("Too many upload parts"))?;
-        self.parts
-            .push(self.upload.upload_part(number, bytes).await?);
+        self.parts.push(
+            self.upload
+                .upload_part(number, bytes)
+                .await
+                .map_err(AppError::r2_error)?,
+        );
         Ok(())
     }
 
@@ -141,10 +128,10 @@ impl<'a> R2MultipartUpload<'a> {
         let id = self.upload.upload_id().await;
         self.bucket
             .resume_multipart_upload(self.key, &id)
-            .map_err(AppError::from)?
+            .map_err(AppError::r2_error)?
             .complete(std::mem::take(&mut self.parts))
             .await
-            .map_err(|error| StorageWriteError::Unconfirmed(error.into()))?;
+            .map_err(|error| StorageWriteError::Unconfirmed(AppError::r2_error(error)))?;
         Ok(())
     }
 
@@ -168,19 +155,30 @@ struct PartAccumulator {
 }
 
 impl PartAccumulator {
-    fn new() -> Self {
-        Self {
-            bytes: Vec::with_capacity(MULTIPART_PART_BYTES),
-        }
+    const fn new() -> Self {
+        Self { bytes: Vec::new() }
     }
 
     fn append(&mut self, remaining: &mut &[u8]) -> Option<Vec<u8>> {
         let take = remaining.len().min(MULTIPART_PART_BYTES - self.bytes.len());
         let (prefix, rest) = remaining.split_at(take);
+        let needed = self.bytes.len() + prefix.len();
+        if needed > self.bytes.capacity() {
+            let target = if self.bytes.is_empty() && rest.is_empty() {
+                needed
+            } else {
+                self.bytes
+                    .capacity()
+                    .max(64 * 1024)
+                    .saturating_mul(2)
+                    .max(needed)
+                    .min(MULTIPART_PART_BYTES)
+            };
+            self.bytes.reserve_exact(target - self.bytes.len());
+        }
         self.bytes.extend_from_slice(prefix);
         *remaining = rest;
-        (self.bytes.len() == MULTIPART_PART_BYTES)
-            .then(|| std::mem::replace(&mut self.bytes, Vec::with_capacity(MULTIPART_PART_BYTES)))
+        (self.bytes.len() == MULTIPART_PART_BYTES).then(|| std::mem::take(&mut self.bytes))
     }
 }
 
@@ -202,44 +200,24 @@ impl Storage {
     }
 
     fn binding(env: &Env) -> AppResult<Option<Self>> {
-        let r2 = binding_value(env, R2_BINDING)?;
-        if !r2.is_undefined() {
-            let constructor = js_sys::Reflect::get(&r2, &"constructor".into())
-                .map_err(|_error| invalid_storage_binding(R2_BINDING))?;
-            if !constructor.is_function() {
-                return Err(invalid_storage_binding(R2_BINDING));
-            }
-            return <Bucket as EnvBinding>::get(r2)
-                .map(|bucket| Some(Self::R2(bucket)))
-                .map_err(|_error| invalid_storage_binding(R2_BINDING));
-        }
-
-        let kv = binding_value(env, KV_BINDING)?;
-        if kv.is_undefined() {
+        let r2: JsValue =
+            js_sys::Reflect::get(env, &R2_BINDING.into()).map_err(|_error| invalid_binding())?;
+        if r2.is_undefined() {
             return Ok(None);
         }
-        // The SDK wraps these properties without checking that they are
-        // callable.
-        for method in ["get", "getWithMetadata", "put", "list", "delete"] {
-            if !js_sys::Reflect::get(&kv, &method.into()).is_ok_and(|value| value.is_function()) {
-                return Err(invalid_storage_binding(KV_BINDING));
-            }
+        let constructor =
+            js_sys::Reflect::get(&r2, &"constructor".into()).map_err(|_error| invalid_binding())?;
+        if !constructor.is_function() {
+            return Err(invalid_binding());
         }
-        env.kv(KV_BINDING)
-            .map(|store| Some(Self::Kv(store)))
-            .map_err(|_error| invalid_storage_binding(KV_BINDING))
-    }
-
-    pub const fn max_bytes(&self) -> Option<usize> {
-        match self {
-            Self::R2(_) => None,
-            Self::Kv(_) => Some(KV_MAX_BYTES),
-        }
+        <Bucket as EnvBinding>::get(r2)
+            .map(|bucket| Some(Self(bucket)))
+            .map_err(|_error| invalid_binding())
     }
 
     /// Accept borrowed multipart fields as well as request bodies. No full-file
-    /// collection occurs for R2: only the current incoming chunk and an 8 MiB
-    /// part are retained. Errors abort an unfinished multipart upload.
+    /// collection occurs: only the current incoming chunk and an 8 MiB part are
+    /// retained. Errors abort an unfinished multipart upload.
     pub(crate) async fn put_stream<S>(
         &self,
         key: &str,
@@ -250,12 +228,7 @@ impl Storage {
     where
         S: Stream<Item = AppResult<Bytes>>,
     {
-        let bucket = match self {
-            Self::R2(bucket) => bucket,
-            Self::Kv(kv) => {
-                return Self::put_kv_stream(kv, key, stream, max_bytes, content_type).await;
-            }
-        };
+        let bucket = &self.0;
         futures_util::pin_mut!(stream);
 
         let mut multipart = None;
@@ -285,7 +258,7 @@ impl Storage {
                     .http_metadata(metadata(content_type))
                     .execute()
                     .await
-                    .map_err(|error| StorageWriteError::Unconfirmed(error.into()))?;
+                    .map_err(|error| StorageWriteError::Unconfirmed(AppError::r2_error(error)))?;
             }
             Ok(size)
         }
@@ -298,95 +271,33 @@ impl Storage {
         result
     }
 
-    async fn put_kv_stream<S>(
-        kv: &KvStore,
-        key: &str,
-        stream: S,
-        max_bytes: u64,
-        content_type: Option<&str>,
-    ) -> Result<u64, StorageWriteError>
-    where
-        S: Stream<Item = AppResult<Bytes>>,
-    {
-        futures_util::pin_mut!(stream);
-        let maximum = max_bytes.min(KV_MAX_BYTES as u64);
-        let mut data = Vec::new();
-        let mut size = 0;
-        while let Some(chunk) = stream.next().await {
-            let chunk = chunk?;
-            size = checked_upload_size_bytes(size, chunk.len(), maximum)?;
-            data.extend_from_slice(&chunk);
-        }
-        kv.put_bytes(key, &data)
-            .map_err(AppError::kv_error)?
-            .metadata(json!({
-                "size": size,
-                "httpMetadata": { "contentType": content_type },
-            }))
-            .map_err(AppError::kv_error)?
-            .execute()
-            .await
-            .map_err(|error| StorageWriteError::Unconfirmed(AppError::kv_error(error)))?;
-        Ok(size)
-    }
-
-    /// Open an object without consuming its R2 body. KV keeps the bytes from
-    /// this one bounded read so callers can inspect metadata before reading.
+    /// Open an object without consuming its R2 body.
     pub async fn open(&self, key: &str) -> AppResult<Option<OpenedObject>> {
-        match self {
-            Self::R2(bucket) => Ok(bucket.head(key).await?.map(|object| OpenedObject {
+        let bucket = &self.0;
+        Ok(bucket
+            .head(key)
+            .await
+            .map_err(AppError::r2_error)?
+            .map(|object| OpenedObject {
                 metadata: ObjectMetadata {
                     size_bytes: object.size(),
-                    http_etag: Some(object.http_etag()),
+                    http_etag: object.http_etag(),
                 },
-                source: ObjectSource::R2 {
-                    bucket: bucket.clone(),
-                    key: key.to_owned(),
-                },
-            })),
-            Self::Kv(kv) => {
-                let bytes = kv.get(key).bytes().await.map_err(AppError::kv_error)?;
-                Ok(bytes.map(|bytes| OpenedObject {
-                    metadata: ObjectMetadata {
-                        size_bytes: bytes.len() as u64,
-                        http_etag: None,
-                    },
-                    source: ObjectSource::Kv(Bytes::from(bytes)),
-                }))
-            }
-        }
+                bucket: bucket.clone(),
+                key: key.to_owned(),
+            }))
     }
 
-    pub async fn delete_many(&self, keys: &[&str]) -> (usize, Option<AppError>) {
-        let mut completed = 0usize;
-        match self {
-            Self::R2(bucket) => {
-                for batch in keys.chunks(1000) {
-                    if let Err(error) = bucket.delete_multiple(batch.to_vec()).await {
-                        return (completed, Some(error.into()));
-                    }
-                    completed += batch.len();
-                }
-            }
-            Self::Kv(kv) => {
-                for key in keys {
-                    if let Err(error) = kv.delete(key).await.map_err(AppError::kv_error) {
-                        return (completed, Some(error));
-                    }
-                    completed += 1;
-                }
-            }
-        }
-        (completed, None)
+    pub async fn delete_batch(&self, keys: Vec<&str>) -> AppResult<()> {
+        self.0
+            .delete_multiple(keys)
+            .await
+            .map_err(AppError::r2_error)
     }
 }
 
-fn binding_value(env: &Env, name: &str) -> AppResult<JsValue> {
-    js_sys::Reflect::get(env, &name.into()).map_err(|_error| invalid_storage_binding(name))
-}
-
-fn invalid_storage_binding(name: &str) -> AppError {
-    ConfigError::Invalid(format!("File storage binding {name}")).into()
+fn invalid_binding() -> AppError {
+    ConfigError::Invalid("File storage binding ATTACHMENTS_BUCKET is invalid").into()
 }
 
 #[cfg(test)]

@@ -1,6 +1,6 @@
 # Raywarden
 
-Raywarden is a lightweight, Bitwarden-compatible password manager server built for **Cloudflare Workers**. Written in Rust and compiled to WebAssembly, it pairs a pinned Bitwarden Web Vault with Cloudflare D1, R2 (or KV), and Durable Objects.
+Raywarden is a lightweight, Bitwarden-compatible password manager server built for **Cloudflare Workers**. Written in Rust and compiled to WebAssembly, it pairs a pinned Bitwarden Web Vault with Cloudflare D1, R2, and Durable Objects.
 
 All vault data is encrypted and decrypted locally by official Bitwarden clients. The server stores only ciphertext, authentication verifiers, and file metadata.
 
@@ -23,7 +23,7 @@ All vault data is encrypted and decrypted locally by official Bitwarden clients.
   - `notifydo`: Manages SignalR WebSocket connections and broadcasts real-time sync events.
   - `heavydo`: Offloads CPU-intensive authentication requests and streaming file uploads.
 - **Database (`src/models/`, `sql/migrations/`)**: Uses Cloudflare D1 (SQLite) with atomic batch transactions and optimistic concurrency guards.
-- **Object Storage (`src/infra/storage.rs`)**: Stores encrypted attachments and File Sends in Cloudflare R2 (with optional Workers KV fallback).
+- **Object Storage (`src/infra/storage.rs`)**: Stores encrypted attachments and File Sends in Cloudflare R2.
 
 ## Quick Start (Local Development)
 
@@ -87,7 +87,7 @@ Runtime configuration is defined in [wrangler.jsonc](wrangler.jsonc). Sensitive 
 | `TRASH_AUTO_DELETE_DAYS` | `30` | Days before soft-deleted items are permanently purged (`<= 0` disables) |
 | `ATTACHMENT_MAX_BYTES` | Unlimited | Maximum size in bytes for a single attachment |
 | `ATTACHMENT_TOTAL_LIMIT_KB` | Unlimited | Per-user attachment storage quota in KiB |
-| `SEND_MAX_BYTES` | `99614720` (95 MiB) | Maximum size in bytes for a File Send (KV fallback max is 25 MiB) |
+| `SEND_MAX_BYTES` | `99614720` (95 MiB) | Maximum size in bytes for a File Send |
 | `USER_SEND_LIMIT_KB` | Unlimited | Per-user File Send storage quota in KiB |
 | `CORS_ALLOWED_ORIGINS` | `*` | Comma-separated list of allowed CORS origins |
 | `WEBAUTHN_ALLOWED_ORIGINS` | `DOMAIN` | Additional allowed origins for browser extension or mobile WebAuthn |

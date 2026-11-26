@@ -5,12 +5,14 @@ use serde_json::Value;
 use wasm_bindgen::JsValue;
 use worker::{D1Database, D1PreparedStatement};
 
+#[cfg(test)]
+use super::json_batch::JSON_BATCH_BYTES;
+use super::json_batch::{BatchPush, JsonBatch};
 use crate::{
     errors::{AppError, AppResult},
-    infra::db::IntoD1Param,
+    infra::db::{self, IntoD1Param},
 };
 
-const JSON_BIND_BYTES: usize = 1_900_000;
 const D1_STRING_BYTES: usize = 2_000_000;
 
 enum ImportChunk {
@@ -19,10 +21,6 @@ enum ImportChunk {
 }
 
 impl ImportChunk {
-    fn json(rows: &[String]) -> Self {
-        Self::Json(format!("[{}]", rows.join(",")))
-    }
-
     fn statement(
         self,
         db: &D1Database,
@@ -43,10 +41,11 @@ impl ImportChunk {
 // a second time. Fall back to ordinary column binds for that individual row.
 fn import_chunks(rows: Vec<Value>, maximum_rows: usize) -> AppResult<Vec<ImportChunk>> {
     let mut chunks = Vec::new();
-    let mut batch = Vec::new();
-    let mut bytes = 2;
+    let mut batch = JsonBatch::new(maximum_rows);
     for row in rows {
-        let columns = row.as_array().ok_or(AppError::Internal)?;
+        let columns = row
+            .as_array()
+            .ok_or_else(|| AppError::internal("Encoded import row must be a JSON array"))?;
         if columns.iter().any(|value| {
             value
                 .as_str()
@@ -56,34 +55,25 @@ fn import_chunks(rows: Vec<Value>, maximum_rows: usize) -> AppResult<Vec<ImportC
                 message: "Imported field exceeds the D1 size limit".into(),
             });
         }
-        let encoded = serde_json::to_string(&row).map_err(AppError::internal_error)?;
-        if !batch.is_empty()
-            && (batch.len() >= maximum_rows || bytes + encoded.len() + 1 > JSON_BIND_BYTES)
-        {
-            chunks.push(ImportChunk::json(&batch));
-            batch.clear();
-            bytes = 2;
-        }
-        if encoded.len() + 2 > JSON_BIND_BYTES {
-            let columns = columns
-                .iter()
-                .map(|value| match value {
-                    Value::Null => Ok(JsValue::NULL),
-                    Value::String(v) => Ok(v.to_d1_param()),
-                    Value::Bool(v) => Ok(i32::from(*v).into()),
-                    Value::Number(v) => v.as_f64().map(JsValue::from_f64).ok_or(AppError::Internal),
-                    _ => Err(AppError::Internal),
-                })
-                .collect::<AppResult<Vec<_>>>()?;
-            chunks.push(ImportChunk::Columns(columns));
-        } else {
-            bytes += encoded.len() + 1;
-            batch.push(encoded);
+        let encoded = serde_json::to_string(&row)
+            .map_err(AppError::internal_json("Failed to serialize import row"))?;
+        match batch.push(&encoded) {
+            BatchPush::Queued(completed) => {
+                chunks.extend(completed.map(ImportChunk::Json));
+            }
+            BatchPush::Oversized => {
+                chunks.extend(batch.take().map(ImportChunk::Json));
+                let columns = columns
+                    .iter()
+                    .map(|value| {
+                        db::json_scalar_param(value, "Expected scalar import column value")
+                    })
+                    .collect::<AppResult<Vec<_>>>()?;
+                chunks.push(ImportChunk::Columns(columns));
+            }
         }
     }
-    if !batch.is_empty() {
-        chunks.push(ImportChunk::json(&batch));
-    }
+    chunks.extend(batch.take().map(ImportChunk::Json));
     Ok(chunks)
 }
 fn collect_writes(
@@ -112,7 +102,9 @@ pub(crate) fn required_folder_guard(
          EXISTS(SELECT 1 FROM folders WHERE id=required.value AND user_id=?2))",
         &[
             serde_json::to_string(&required)
-                .map_err(AppError::internal_error)?
+                .map_err(AppError::internal_json(
+                    "Failed to serialize required import folders",
+                ))?
                 .into(),
             user_id.into(),
         ],
@@ -176,7 +168,7 @@ mod tests {
             .len();
         // The chunk budget reserves one byte after each row, including the
         // last.
-        let remaining = JSON_BIND_BYTES - first_bytes - r#"[""]"#.len() - 4;
+        let remaining = JSON_BATCH_BYTES - first_bytes - r#"[""]"#.len() - 4;
         for (extra, expected_chunks) in [(0, 1), (1, 2)] {
             let rows = vec![first.clone(), json!(["x".repeat(remaining + extra)])];
             let chunks = import_chunks(rows.clone(), 200).expect("valid import rows");

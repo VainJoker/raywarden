@@ -35,7 +35,6 @@ pub(super) fn router() -> Router<Arc<AppState>> {
 fn accounts() -> Router<Arc<AppState>> {
     Router::new()
         .route("/api/hibp/breach", get(accounts::hibp_breach))
-        .route("/api/d1/usage", get(accounts::usage))
         .route("/api/accounts/prelogin", post(accounts::prelogin))
         .route("/api/accounts/prelogin/password", post(accounts::prelogin))
         .route("/api/accounts/register", post(accounts::register))
@@ -79,7 +78,6 @@ fn accounts() -> Router<Arc<AppState>> {
             post(accounts::change_password)
                 .layer(DefaultBodyLimit::max(ACCOUNT_ROTATION_MAX_BYTES)),
         )
-        .route("/api/accounts/set-password", post(accounts::set_password))
 }
 
 fn token() -> Router<Arc<AppState>> {
@@ -91,10 +89,7 @@ fn token() -> Router<Arc<AppState>> {
 
 fn account_keys() -> Router<Arc<AppState>> {
     Router::new()
-        .route(
-            "/api/accounts/keys",
-            get(account_keys::get_key_pair).post(account_keys::update_key_pair),
-        )
+        .route("/api/accounts/keys", get(account_keys::get_key_pair))
         .route(
             "/api/users/{user_id}/public-key",
             get(account_keys::get_public_key),
@@ -297,7 +292,6 @@ fn webauthn() -> Router<Arc<AppState>> {
             "/api/webauthn/attestation-options",
             post(webauthn::attestation_options),
         )
-        .route("/api/webauthn/prf-probe", post(webauthn::prf_probe))
         .route(
             "/api/webauthn/assertion-options",
             post(webauthn::assertion_options),

@@ -5,11 +5,10 @@ use worker::Env;
 
 use crate::errors::{AppError, AppResult};
 
-const LOGIN_RATE_LIMITER: &str = "LOGIN_RATE_LIMITER";
-const SEND_ACCESS_RATE_LIMITER: &str = "SEND_ACCESS_RATE_LIMITER";
 const FAILURE_WARNING_INTERVAL_SECONDS: i64 = 60;
 
 #[derive(Clone, Copy, Debug)]
+#[repr(usize)]
 enum Limiter {
     Login,
     SendAccess,
@@ -18,33 +17,20 @@ enum Limiter {
 impl Limiter {
     const fn binding(self) -> &'static str {
         match self {
-            Self::Login => LOGIN_RATE_LIMITER,
-            Self::SendAccess => SEND_ACCESS_RATE_LIMITER,
-        }
-    }
-
-    const fn slot(self) -> usize {
-        match self {
-            Self::Login => 0,
-            Self::SendAccess => 1,
+            Self::Login => "LOGIN_RATE_LIMITER",
+            Self::SendAccess => "SEND_ACCESS_RATE_LIMITER",
         }
     }
 }
 
 #[derive(Clone, Copy, Debug)]
+#[repr(usize)]
 enum LimiterFailure {
     BindingUnavailable,
     RequestFailed,
 }
 
 impl LimiterFailure {
-    const fn slot(self) -> usize {
-        match self {
-            Self::BindingUnavailable => 0,
-            Self::RequestFailed => 1,
-        }
-    }
-
     const fn description(self) -> &'static str {
         match self {
             Self::BindingUnavailable => "binding unavailable",
@@ -61,7 +47,7 @@ struct FailureWarningThrottle {
 impl FailureWarningThrottle {
     const fn should_report(&mut self, limiter: Limiter, failure: LimiterFailure, now: i64) -> bool {
         let last_reported_at_seconds =
-            &mut self.last_reported_at_seconds[limiter.slot()][failure.slot()];
+            &mut self.last_reported_at_seconds[limiter as usize][failure as usize];
         if let Some(previous) = *last_reported_at_seconds
             && now >= previous
             && now.saturating_sub(previous) < FAILURE_WARNING_INTERVAL_SECONDS
@@ -99,7 +85,9 @@ fn rate_limit_result(outcome: Result<bool, LimiterFailure>) -> AppResult<()> {
         }),
         // Missing protection is not permission to make unlimited password or
         // OTP guesses. Unrelated reads and health checks do not use this gate.
-        Err(_) => Err(AppError::ServiceUnavailable),
+        Err(_) => Err(AppError::service_unavailable(
+            "Rate limiting service is unavailable",
+        )),
     }
 }
 
@@ -154,7 +142,7 @@ mod tests {
         ] {
             assert!(matches!(
                 rate_limit_result(Err(failure)),
-                Err(AppError::ServiceUnavailable)
+                Err(AppError::ServiceUnavailable { .. })
             ));
         }
     }

@@ -41,47 +41,19 @@
   "secrets": {
     "required": ["DOMAIN", "ALLOWED_EMAILS", "KEY_ENCRYPTION_KEY"]
   },
-  // Optional settings and credentials: docs/runtime-config.md.
+  // Optional settings are documented in README.md and DEPLOYMENT.md.
   "vars": {
     "DISABLE_USER_REGISTRATION": "true",
-    "HEAVY_DO_SHARDS": "1",
     // Global application log level: off, error, warn, info, debug, or trace.
-    "LOG_LEVEL": "info",
-    // Optional overrides: uncomment to manage these in this file.
-    // Examples stay commented to preserve existing Dashboard values with keep_vars.
-    // Suppress the client's welcome, extension and advanced-feature onboarding.
+    "LOG_LEVEL": "info"
+    // Optional overrides:
     // "CLIENT_SUPPRESS_ONBOARDING": "false",
-    // Dynamic CSS presentation switches; API capabilities and authorization are separate.
     // "VW_CSS_SIGNUP_DISABLED": "true",
     // "VW_CSS_SENDS_ALLOWED": "true",
     // "VW_CSS_PASSWORD_HINTS_ALLOWED": "true",
-    // "VW_CSS_SSO_ENABLED": "false",
-    // "VW_CSS_SSO_ONLY": "false",
-    // "VW_CSS_PASSKEY_2FA_SUPPORTED": "true",
-    // "VW_CSS_PASSKEY_LOGIN_ENABLED": "true",
     // "VW_CSS_REMEMBER_2FA_DISABLED": "false",
-    // "VW_CSS_MAIL_2FA_ENABLED": "true",
-    // Omit MAIL_ENABLED to follow MAIL_WEBHOOK_URL availability automatically.
-    // "VW_CSS_MAIL_ENABLED": "false",
-    // "VW_CSS_YUBICO_ENABLED": "false",
-    // "VW_CSS_DUO_ENABLED": "false",
-    // "VW_CSS_EMERGENCY_ACCESS_ALLOWED": "false",
-    // "VW_CSS_LOAD_USER_CSS": "true",
-    // "VW_CSS_USER": "",
-    // Minimum level: info, warning (or warn), error. Unset defaults to info.
     // "NOTIFY_LEVEL": "warning",
-    // none | all | comma-separated event names. Channels use Worker Secrets:
-    // WEWORK_WEBHOOK_URL, or TELEGRAM_BOT_TOKEN + TELEGRAM_CHAT_ID.
-    // Events: login,login_failed,password_hint,password,email,kdf,cipher_create,cipher_update,
-    // cipher_delete,import,send_create,send_delete,2fa_enable,2fa_disable,2fa_recovery_code_view,
-    // 2fa_recover,token_refresh,sync,auth_request,auth_response,webauthn_credential_create,
-    // webauthn_credential_delete,webauthn_credential_update,webauthn_login.
-    // Unset/none disables administrative notifications; previous Ray event names remain accepted.
     // "NOTIFY_EVENTS": "all",
-    // Opt-in self-test page; its operations still require normal API authorization.
-    // "DEMO_PAGE_ENABLED": "false",
-    // Comma-separated origins. Empty/* allows all without cookie credentials.
-    // Invalid restrictive lists deny cross-origin access.
     // "CORS_ALLOWED_ORIGINS": "",
   },
   // Daily 03:00 UTC: cleanup and global-domain cache refresh.
@@ -143,8 +115,6 @@
       "/api/*",
       "/setup",
       "/setup/*",
-      "/demo.html",
-      "/demo.html/*",
       "/identity/*",
       "/accounts/*",
       "/attachments/*",
@@ -188,7 +158,6 @@
         // Public development-only key (bytes 0..31). Never use it in production.
         "KEY_ENCRYPTION_KEY": "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8",
         "DISABLE_USER_REGISTRATION": "true",
-        "HEAVY_DO_SHARDS": "1",
         // Global application log level.
         "LOG_LEVEL": "info",
         // Client onboarding is independent of registration permissions.
@@ -197,26 +166,12 @@
         "VW_CSS_SIGNUP_DISABLED": "true",
         "VW_CSS_SENDS_ALLOWED": "true",
         "VW_CSS_PASSWORD_HINTS_ALLOWED": "true",
-        "VW_CSS_SSO_ENABLED": "false",
-        "VW_CSS_SSO_ONLY": "false",
-        "VW_CSS_PASSKEY_2FA_SUPPORTED": "true",
-        "VW_CSS_PASSKEY_LOGIN_ENABLED": "true",
         "VW_CSS_REMEMBER_2FA_DISABLED": "false",
-        "VW_CSS_MAIL_2FA_ENABLED": "true",
-        // MAIL_ENABLED is automatic unless explicitly overridden; local mail is not configured by default.
-        // "VW_CSS_MAIL_ENABLED": "false",
-        "VW_CSS_YUBICO_ENABLED": "false",
-        "VW_CSS_DUO_ENABLED": "false",
-        "VW_CSS_EMERGENCY_ACCESS_ALLOWED": "false",
-        "VW_CSS_LOAD_USER_CSS": "true",
-        "VW_CSS_USER": "",
         // Minimum severity: info, warning (warn), error.
         "NOTIFY_LEVEL": "warning",
         // none | all | comma-separated event names. Channels use local .dev.vars:
         // WEWORK_WEBHOOK_URL, or TELEGRAM_BOT_TOKEN + TELEGRAM_CHAT_ID.
-        // Standard events and legacy aliases: docs/runtime-config.md. No external messages by default.
         "NOTIFY_EVENTS": "none",
-        "DEMO_PAGE_ENABLED": "false",
         // Comma-separated origins; empty/* allows all without cookie credentials.
         "CORS_ALLOWED_ORIGINS": ""
       },

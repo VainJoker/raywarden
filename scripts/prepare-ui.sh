@@ -67,8 +67,6 @@ ui_prepared="$ui_stage/web-vault"
 [[ -z "$(find "$ui_prepared" ! -type f ! -type d -print -quit)" ]] || fail "Web Vault must contain only regular files and directories"
 node "$ui_patch" "$ui_root" "$ui_prepared"
 find "$ui_prepared" -type f -name '*.map' -delete
-# The opt-in demo is served by Rust, never by the unguarded assets binding.
-rm -f -- "$ui_prepared/demo.html"
 mkdir -p "$ui_prepared/css" "$ui_prepared/js"
 cp -- "$ui_root/static/overrides/vaultwarden.css" "$ui_prepared/css/vaultwarden.css"
 cp -- "$ui_root/static/overrides/raywarden.js" "$ui_prepared/js/raywarden.js"

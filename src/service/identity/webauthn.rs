@@ -3,7 +3,7 @@ mod protocol;
 mod registration;
 
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
-use serde::{Deserialize, Serialize, Serializer};
+use serde::Serialize;
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 use worker::{D1Database, Env};
@@ -22,12 +22,11 @@ pub use self::{
 };
 use crate::{
     errors::{AppError, AppResult},
-    infra::jwt,
     models::identity::{
         account_keys::AccountSnapshot,
         webauthn::{WebauthnChallengeRow, WebauthnCredentialRow},
     },
-    service::identity::{session::Claims, user::AccountVerificationRequest},
+    service::identity::{session::Claims, two_factor, user::AccountVerificationRequest},
 };
 
 pub async fn verify_two_factor_authorization(
@@ -49,19 +48,6 @@ pub async fn verify_two_factor_authorization(
         .await
 }
 
-#[derive(Serialize, Deserialize)]
-struct VerificationClaims {
-    sub: String,
-    exp: i64,
-    nbf: i64,
-    iat: i64,
-    aud: String,
-    purpose: String,
-    device: String,
-    session: String,
-    stamp: String,
-    credential_state: String,
-}
 async fn credential_state(db: &D1Database, user: &str) -> AppResult<String> {
     let keys = WebauthnCredentialRow::list(db, user, "2fa").await?;
     let mut bytes = serde_json::to_vec(
@@ -70,63 +56,47 @@ async fn credential_state(db: &D1Database, user: &str) -> AppResult<String> {
             .map(|k| (&k.id, &k.credential_id))
             .collect::<Vec<_>>(),
     )
-    .map_err(AppError::internal_error)?;
+    .map_err(AppError::internal_json(
+        "Failed to serialize WebAuthn digest input",
+    ))?;
     bytes.extend_from_slice(AccountSnapshot::load(db, user).await?.to_json()?.as_bytes());
     Ok(hex::encode(Sha256::digest(bytes)))
 }
+
 pub async fn mint_user_verification_token(
     db: &D1Database,
     access_secret: &str,
     claims: &Claims,
 ) -> AppResult<String> {
-    let now = crate::utils::time::now_seconds();
-    let token = VerificationClaims {
-        sub: claims.sub.clone(),
-        exp: now + 300,
-        nbf: now,
-        iat: now,
-        aud: "raywarden.webauthn".into(),
-        purpose: "manage-2fa".into(),
-        device: claims.device().unwrap_or_default().into(),
-        session: claims.session_token.clone(),
-        stamp: claims.sstamp.clone(),
-        credential_state: credential_state(db, &claims.sub).await?,
-    };
-    jwt::encode(&token, access_secret.as_bytes())
+    two_factor::mint_factor_proof(
+        access_secret,
+        claims,
+        "webauthn-2fa",
+        credential_state(db, &claims.sub).await?,
+        None,
+    )
 }
+
 pub async fn verify_user_verification_token(
     db: &D1Database,
     access_secret: &str,
     claims: &Claims,
     token: &str,
 ) -> AppResult<()> {
-    let value = jwt::decode::<VerificationClaims>(
+    two_factor::verify_factor_proof(
+        access_secret,
+        claims,
         token,
-        access_secret.as_bytes(),
-        &jwt::ValidationOptions {
-            leeway_seconds: 0,
-            ..Default::default()
-        },
-    )?;
-    if value.aud != "raywarden.webauthn"
-        || value.purpose != "manage-2fa"
-        || value.sub != claims.sub
-        || value.stamp != claims.sstamp
-        || value.session != claims.session_token
-        || Some(value.device.as_str()) != claims.device()
-        || value.credential_state != credential_state(db, &claims.sub).await?
-    {
-        return Err(AppError::invalid_credentials(
-            "Invalid WebAuthn user verification token",
-        ));
-    }
-    Ok(())
+        "webauthn-2fa",
+        &credential_state(db, &claims.sub).await?,
+        None,
+    )
 }
 
 fn random_challenge() -> String {
-    let mut bytes = Vec::with_capacity(32);
-    bytes.extend_from_slice(Uuid::new_v4().as_bytes());
-    bytes.extend_from_slice(Uuid::new_v4().as_bytes());
+    let mut bytes = [0_u8; 32];
+    bytes[..16].copy_from_slice(Uuid::new_v4().as_bytes());
+    bytes[16..].copy_from_slice(Uuid::new_v4().as_bytes());
     URL_SAFE_NO_PAD.encode(bytes)
 }
 fn verify_client(
@@ -172,12 +142,23 @@ impl ChallengePurpose {
 
 fn new_challenge(domain: &str, purpose: ChallengePurpose) -> AppResult<WebauthnChallengeRow> {
     let (rp, origin) = wire::relying_party(domain)?;
-    Ok(new_challenge_record(
-        random_challenge(),
-        purpose.as_str(),
-        rp,
+    Ok(WebauthnChallengeRow {
+        id: Uuid::new_v4().to_string(),
+        challenge: random_challenge(),
+        purpose: purpose.as_str().into(),
+        user_id: None,
+        security_stamp: None,
+        device_id: None,
+        session_token: None,
+        account_snapshot: None,
+        rp_id: rp,
         origin,
-    ))
+        expires_at: crate::utils::time::format_millis(
+            crate::utils::time::now()
+                .checked_add(jiff::SignedDuration::from_mins(5))
+                .unwrap_or(jiff::Timestamp::MAX),
+        ),
+    })
 }
 
 fn bind_session(challenge: &mut WebauthnChallengeRow, claims: &Claims) {
@@ -225,7 +206,7 @@ pub(crate) enum CredentialUse {
 }
 
 impl CredentialUse {
-    const fn as_str(self) -> &'static str {
+    pub(crate) const fn as_str(self) -> &'static str {
         match self {
             Self::Login => "login",
             Self::TwoFactor => "2fa",
@@ -241,6 +222,20 @@ impl CredentialUse {
 
     const fn requires_user_verification(self) -> bool {
         matches!(self, Self::Login)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(i32)]
+pub(crate) enum PrfStatus {
+    Enabled = 0,
+    NeedsEncryption = 1,
+    Unsupported = 2,
+}
+
+impl From<PrfStatus> for i32 {
+    fn from(status: PrfStatus) -> Self {
+        status as Self
     }
 }
 
@@ -268,8 +263,10 @@ struct CredentialExtensions {
 #[derive(Default, Serialize)]
 struct PrfExtension {}
 
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
 pub(crate) struct CredentialResponse {
-    slot: i32,
+    id: i32,
     name: String,
     prf_status: i32,
     encrypted_public_key: Option<String>,
@@ -277,113 +274,15 @@ pub(crate) struct CredentialResponse {
     encrypted_private_key: Option<String>,
 }
 
-#[derive(Clone, Copy, Serialize)]
-#[serde(rename_all = "camelCase")]
-struct EncryptedString<'a> {
-    encrypted_string: &'a str,
-}
-
-impl<'a> EncryptedString<'a> {
-    const fn new(encrypted_string: &'a str) -> Self {
-        Self { encrypted_string }
-    }
-}
-
-impl Serialize for CredentialResponse {
-    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        #[derive(Serialize)]
-        #[serde(rename_all = "camelCase")]
-        struct CredentialWire<'a> {
-            id: i32,
-            #[serde(rename = "Id")]
-            legacy_id: i32,
-            name: &'a str,
-            #[serde(rename = "Name")]
-            legacy_name: &'a str,
-            prf_status: i32,
-            #[serde(rename = "PrfStatus")]
-            legacy_prf_status: i32,
-            encrypted_public_key: Option<&'a str>,
-            #[serde(rename = "EncryptedPublicKey")]
-            legacy_encrypted_public_key: Option<&'a str>,
-            encrypted_public_key_object: Option<EncryptedString<'a>>,
-            #[serde(rename = "EncryptedPublicKeyObj")]
-            legacy_encrypted_public_key_object: Option<EncryptedString<'a>>,
-            encrypted_user_key: Option<&'a str>,
-            #[serde(rename = "EncryptedUserKey")]
-            legacy_encrypted_user_key: Option<&'a str>,
-            encrypted_user_key_object: Option<EncryptedString<'a>>,
-            #[serde(rename = "EncryptedUserKeyObj")]
-            legacy_encrypted_user_key_object: Option<EncryptedString<'a>>,
-            encrypted_private_key: Option<&'a str>,
-            #[serde(rename = "EncryptedPrivateKey")]
-            legacy_encrypted_private_key: Option<&'a str>,
-            encrypted_private_key_object: Option<EncryptedString<'a>>,
-            #[serde(rename = "EncryptedPrivateKeyObj")]
-            legacy_encrypted_private_key_object: Option<EncryptedString<'a>>,
-        }
-
-        let public = self.encrypted_public_key.as_deref();
-        let user = self.encrypted_user_key.as_deref();
-        let private = self.encrypted_private_key.as_deref();
-        CredentialWire {
-            id: self.slot,
-            legacy_id: self.slot,
-            name: &self.name,
-            legacy_name: &self.name,
-            prf_status: self.prf_status,
-            legacy_prf_status: self.prf_status,
-            encrypted_public_key: public,
-            legacy_encrypted_public_key: public,
-            encrypted_public_key_object: public.map(EncryptedString::new),
-            legacy_encrypted_public_key_object: public.map(EncryptedString::new),
-            encrypted_user_key: user,
-            legacy_encrypted_user_key: user,
-            encrypted_user_key_object: user.map(EncryptedString::new),
-            legacy_encrypted_user_key_object: user.map(EncryptedString::new),
-            encrypted_private_key: private,
-            legacy_encrypted_private_key: private,
-            encrypted_private_key_object: private.map(EncryptedString::new),
-            legacy_encrypted_private_key_object: private.map(EncryptedString::new),
-        }
-        .serialize(serializer)
-    }
-}
-
 impl From<WebauthnCredentialRow> for CredentialResponse {
     fn from(row: WebauthnCredentialRow) -> Self {
         Self {
-            slot: row.slot,
+            id: row.slot,
             name: row.name,
             prf_status: row.prf_status,
             encrypted_public_key: row.encrypted_public_key,
             encrypted_user_key: row.encrypted_user_key,
             encrypted_private_key: row.encrypted_private_key,
         }
-    }
-}
-
-fn new_challenge_record(
-    challenge: String,
-    purpose: &str,
-    rp: String,
-    origin: String,
-) -> WebauthnChallengeRow {
-    WebauthnChallengeRow {
-        id: Uuid::new_v4().to_string(),
-        challenge,
-        purpose: purpose.into(),
-        user_id: None,
-        security_stamp: None,
-        device_id: None,
-        session_token: None,
-        account_snapshot: None,
-        rp_id: rp,
-        origin,
-        expires_at: crate::utils::time::format_millis(
-            crate::utils::time::now()
-                .checked_add(jiff::SignedDuration::from_mins(5))
-                .unwrap_or(jiff::Timestamp::MAX),
-        ),
     }
 }

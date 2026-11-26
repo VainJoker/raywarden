@@ -55,9 +55,13 @@ impl FolderRow {
             user_id
         )
         .map_err(|e| DatabaseError::query("Failed to bind query for getting folder", &e))?;
-        db::query_first(query, None, "Failed to execute query for getting folder")
-            .await?
-            .ok_or_else(DatabaseError::invalid_folder)
+        db::query_first(
+            Ok(query),
+            None,
+            "Failed to execute query for getting folder",
+        )
+        .await?
+        .ok_or_else(DatabaseError::invalid_folder)
     }
 
     pub async fn ensure_for_user(db: &D1Database, folder_id: &str, user_id: &str) -> AppResult<()> {
@@ -66,7 +70,7 @@ impl FolderRow {
             .bind(&db::d1_params![folder_id, user_id])
             .map_err(|e| DatabaseError::query("Failed to bind folder ownership query", &e))?;
         let exists: Option<Value> =
-            db::query_first(query, None, "Failed to execute folder ownership query").await?;
+            db::query_first(Ok(query), None, "Failed to execute folder ownership query").await?;
 
         if exists.is_none() {
             return Err(DatabaseError::invalid_folder());

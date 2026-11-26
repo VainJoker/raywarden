@@ -4,8 +4,9 @@ use uuid::Uuid;
 use worker::{D1Database, Env};
 
 use super::{
-    ChallengePurpose, CredentialDescriptor, CredentialExtensions, CredentialUse, new_challenge,
-    protocol as wire, user_handle, validate_binding, validate_encrypted_keys, verify_client,
+    ChallengePurpose, CredentialDescriptor, CredentialExtensions, CredentialUse, PrfStatus,
+    new_challenge, protocol as wire, user_handle, validate_binding, validate_encrypted_keys,
+    verify_client,
 };
 use crate::{
     errors::{AppError, AppResult, AuthError},
@@ -203,10 +204,12 @@ impl RegistrationCeremony<'_> {
             self.usage.requires_user_verification(),
         )?;
         let sign_count = parsed.sign_count;
-        let id = parsed.credential_id.ok_or(AppError::Internal)?;
+        let id = parsed
+            .credential_id
+            .ok_or_else(|| AppError::bad_request("Attested credential ID is missing"))?;
         let key = parsed
             .credential_public_key_cose
-            .ok_or(AppError::Internal)?;
+            .ok_or_else(|| AppError::bad_request("Attested credential public key is missing"))?;
         wire::parse_webauthn_public_key(&key)?;
         validate_encrypted_keys(
             payload.encrypted_public_key.as_deref(),
@@ -243,17 +246,12 @@ impl RegistrationCeremony<'_> {
         let current =
             WebauthnCredentialRow::list(self.db, &self.claims.sub, self.usage.as_str()).await?;
         let max = self.usage.credential_limit();
-        let slot = payload.id.unwrap_or_else(|| {
-            (1..=max)
-                .find(|slot| !current.iter().any(|k| k.slot == *slot))
-                .unwrap_or(0)
-        });
-        if !(1..=max).contains(&slot) || current.iter().any(|k| k.slot == slot) {
-            return Err(AppError::bad_request(
-                "WebAuthn key slot is already used or invalid",
-            ));
-        }
-        let prf_status = registration_prf_status(&payload)?;
+        let slot = payload
+            .id
+            .or_else(|| (1..=max).find(|slot| !current.iter().any(|k| k.slot == *slot)))
+            .filter(|slot| (1..=max).contains(slot) && !current.iter().any(|k| k.slot == *slot))
+            .ok_or_else(|| AppError::bad_request("WebAuthn key slot is already used or invalid"))?;
+        let prf_status = i32::from(registration_prf_status(&payload)?);
         let now = crate::utils::time::now_rfc3339();
         let key = WebauthnCredentialRow {
             id: Uuid::new_v4().to_string(),
@@ -305,22 +303,23 @@ pub(crate) async fn register(
     ceremony.persist(payload, verified).await
 }
 
-fn registration_prf_status(payload: &RegisterWebauthnCredentialRequest) -> AppResult<i32> {
-    let prf_status = if payload.supports_prf.unwrap_or(false) {
-        i32::from(
-            !(payload.encrypted_user_key.is_some()
-                && payload.encrypted_private_key.is_some()
-                && payload.encrypted_public_key.is_some()),
-        )
-    } else {
-        2
-    };
-    if prf_status == 2
-        && (payload.encrypted_user_key.is_some() || payload.encrypted_private_key.is_some())
-    {
-        return Err(AppError::bad_request(
+fn registration_prf_status(payload: &RegisterWebauthnCredentialRequest) -> AppResult<PrfStatus> {
+    let has_all_keys = payload.encrypted_user_key.is_some()
+        && payload.encrypted_private_key.is_some()
+        && payload.encrypted_public_key.is_some();
+    let has_any_vault_key =
+        payload.encrypted_user_key.is_some() || payload.encrypted_private_key.is_some();
+    if payload.supports_prf.unwrap_or(false) {
+        Ok(if has_all_keys {
+            PrfStatus::Enabled
+        } else {
+            PrfStatus::NeedsEncryption
+        })
+    } else if has_any_vault_key {
+        Err(AppError::bad_request(
             "Encrypted PRF keys require PRF support",
-        ));
+        ))
+    } else {
+        Ok(PrfStatus::Unsupported)
     }
-    Ok(prf_status)
 }

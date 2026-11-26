@@ -20,7 +20,7 @@ use crate::{
     },
     service::{
         identity::{
-            email::{self, EmailPurpose, EmailVerifier, IssuePolicy, OtpFormat, ReservationMode},
+            email::{self, EmailPurpose, EmailVerifier, VerificationTarget},
             kdf::{KdfKind, ValidatedKdfParams},
             session::Claims,
             two_factor,
@@ -68,19 +68,11 @@ pub(in crate::api) async fn request_protected_action_otp(
     let user = email::fetch_user(state.database(), &claims).await?;
     state
         .email_verifier()
-        .issue_code(
-            email::VerificationTarget {
-                user: Some(&user),
-                purpose: EmailPurpose::ProtectedAction,
-                recipient: &user.email,
-                context: "",
-                session: &claims.session_token,
-            },
-            IssuePolicy {
-                format: OtpFormat::SixDigit,
-                reservation: ReservationMode::Fresh,
-            },
-        )
+        .issue_code(VerificationTarget::account(
+            &user,
+            EmailPurpose::ProtectedAction,
+            &claims.session_token,
+        ))
         .await?;
     Ok(ApiResponse(EmptyObject {}))
 }
@@ -92,22 +84,18 @@ pub(in crate::api) async fn verify_protected_action_otp(
     Json(payload): Json<VerifyProtectedActionOtpRequest>,
 ) -> AppResult<ApiResponse<EmptyObject>> {
     let user = email::fetch_user(state.database(), &claims).await?;
-    // This is the final authorization step for client-side vault export.
-    // Consume its proof here rather than leaving it for a later server action.
-    email::verify_code(
-        state.database(),
-        &state.jwt_keys.access_secret,
-        email::VerificationTarget {
-            user: Some(&user),
-            purpose: EmailPurpose::ProtectedAction,
-            recipient: &user.email,
-            context: "",
-            session: &claims.session_token,
-        },
-        &payload.otp,
-        true,
-    )
-    .await?;
+    state
+        .email_verifier()
+        .verify_code(
+            VerificationTarget::account(
+                &user,
+                EmailPurpose::ProtectedAction,
+                &claims.session_token,
+            ),
+            &payload.otp,
+            true,
+        )
+        .await?;
     Ok(ApiResponse(EmptyObject {}))
 }
 
@@ -179,19 +167,12 @@ pub(in crate::api) async fn send_email_factor_code(
     let recipient = email::normalize_new_recipient(&payload.email)?;
     state
         .email_verifier()
-        .issue_code(
-            email::VerificationTarget {
-                user: Some(&user),
-                purpose: EmailPurpose::Setup,
-                recipient: &recipient,
-                context: "",
-                session: &claims.session_token,
-            },
-            IssuePolicy {
-                format: OtpFormat::SixDigit,
-                reservation: ReservationMode::Fresh,
-            },
-        )
+        .issue_code(VerificationTarget::for_recipient(
+            &user,
+            EmailPurpose::Setup,
+            &recipient,
+            &claims.session_token,
+        ))
         .await?;
     Ok(ApiResponse(EmptyObject {}))
 }
@@ -225,19 +206,18 @@ pub(in crate::api) async fn verify_email_factor(
     )
     .await?
     .ok_or_else(|| AppError::bad_request("No email setup is pending"))?;
-    let verification = email::prepare_code(
-        db,
-        access_secret,
-        email::VerificationTarget {
-            user: Some(&user),
-            purpose: EmailPurpose::Setup,
-            recipient: &recipient,
-            context: "",
-            session: &claims.session_token,
-        },
-        &payload.token,
-    )
-    .await?;
+    let verification = state
+        .email_verifier()
+        .prepare_code(
+            VerificationTarget::for_recipient(
+                &user,
+                EmailPurpose::Setup,
+                &recipient,
+                &claims.session_token,
+            ),
+            &payload.token,
+        )
+        .await?;
     email::set_email_provider(
         db,
         &state.env,
@@ -312,12 +292,7 @@ pub(in crate::api) async fn send_login_code(
             || AuthError::InvalidPassword.into(),
         )
         .await?;
-        if !crate::service::identity::user::verify_master_password(&user, hash)
-            .await?
-            .is_valid()
-        {
-            return Err(AuthError::InvalidPassword.into());
-        }
+        crate::service::identity::user::require_master_password(&user, hash).await?;
         user
     } else if let (Some(id), Some(code), Some(device)) = (
         payload.auth_request_id.as_deref(),
@@ -400,7 +375,6 @@ pub(in crate::api) async fn password_hint(
         Err(AppError::NotFound { .. }) => {}
         Err(error) => return Err(error),
     }
-    // Identical response for known and unknown addresses.
     Ok(ApiResponse(EmptyObject {}))
 }
 
@@ -412,19 +386,11 @@ pub(in crate::api) async fn send_email_verification_code(
     let user = email::fetch_user(state.database(), &claims).await?;
     state
         .email_verifier()
-        .issue_code(
-            email::VerificationTarget {
-                user: Some(&user),
-                purpose: EmailPurpose::VerifyEmail,
-                recipient: &user.email,
-                context: "",
-                session: "",
-            },
-            IssuePolicy {
-                format: OtpFormat::LongToken,
-                reservation: ReservationMode::Fresh,
-            },
-        )
+        .issue_code(VerificationTarget::account(
+            &user,
+            EmailPurpose::VerifyEmail,
+            "",
+        ))
         .await?;
     Ok(ApiResponse(EmptyObject {}))
 }
@@ -451,19 +417,13 @@ pub(in crate::api) async fn verify_email_token(
         || AppError::not_found("User"),
     )
     .await?;
-    let verification = email::prepare_code(
-        db,
-        &state.jwt_keys.access_secret,
-        email::VerificationTarget {
-            user: Some(&user),
-            purpose: EmailPurpose::VerifyEmail,
-            recipient: &user.email,
-            context: "",
-            session: "",
-        },
-        &payload.token,
-    )
-    .await?;
+    let verification = state
+        .email_verifier()
+        .prepare_code(
+            VerificationTarget::account(&user, EmailPurpose::VerifyEmail, ""),
+            &payload.token,
+        )
+        .await?;
     email_model::update_verified(
         db,
         &user.id,
@@ -509,19 +469,12 @@ pub(in crate::api) async fn request_email_change(
     }
     state
         .email_verifier()
-        .issue_code(
-            email::VerificationTarget {
-                user: Some(&user),
-                purpose: EmailPurpose::ChangeEmail,
-                recipient: &address,
-                context: "",
-                session: &claims.session_token,
-            },
-            IssuePolicy {
-                format: OtpFormat::SixDigit,
-                reservation: ReservationMode::Fresh,
-            },
-        )
+        .issue_code(VerificationTarget::for_recipient(
+            &user,
+            EmailPurpose::ChangeEmail,
+            &address,
+            &claims.session_token,
+        ))
         .await?;
     Ok(ApiResponse(EmptyObject {}))
 }
@@ -562,12 +515,8 @@ pub(in crate::api) async fn change_email(
     Json(payload): Json<ChangeEmailRequest>,
 ) -> AppResult<ApiResponse<EmptyObject>> {
     let user = email::fetch_user(state.database(), &claims).await?;
-    if !crate::service::identity::user::verify_master_password(&user, &payload.master_password_hash)
-        .await?
-        .is_valid()
-    {
-        return Err(AuthError::InvalidPassword.into());
-    }
+    crate::service::identity::user::require_master_password(&user, &payload.master_password_hash)
+        .await?;
     let address = email::normalize_email(&payload.new_email)?;
     if payload.user_symmetric_key.is_empty() || payload.new_master_password_hash.is_empty() {
         return Err(AppError::bad_request(
@@ -600,19 +549,18 @@ pub(in crate::api) async fn change_email(
         memory,
         parallelism,
     })?);
-    let verification = email::prepare_code(
-        state.database(),
-        &state.jwt_keys.access_secret,
-        email::VerificationTarget {
-            user: Some(&user),
-            purpose: EmailPurpose::ChangeEmail,
-            recipient: &address,
-            context: "",
-            session: &claims.session_token,
-        },
-        &payload.token,
-    )
-    .await?;
+    let verification = state
+        .email_verifier()
+        .prepare_code(
+            VerificationTarget::for_recipient(
+                &user,
+                EmailPurpose::ChangeEmail,
+                &address,
+                &claims.session_token,
+            ),
+            &payload.token,
+        )
+        .await?;
     let password = crate::service::identity::user::stored_password_for_user(
         &payload.new_master_password_hash,
         &user,
@@ -654,28 +602,12 @@ pub(in crate::api) async fn request_registration_verification(
         .authorize_registration(&headers, &payload.email)
         .await?;
     if !email::registration_verification_required(&state.env) {
-        // Registration remains possible for private deployments that do not
-        // enable email verification. This marker is never accepted as proof
-        // when REQUIRE_EMAIL_VERIFICATION is enabled.
         return Ok(ApiResponse("email-verification-not-required".into()));
     }
     state
         .email_verifier()
-        .issue_code(
-            email::VerificationTarget {
-                user: None,
-                purpose: EmailPurpose::Registration,
-                recipient: &address,
-                context: "",
-                session: "",
-            },
-            IssuePolicy {
-                format: OtpFormat::LongToken,
-                reservation: ReservationMode::Fresh,
-            },
-        )
+        .issue_code(VerificationTarget::registration(&address))
         .await?;
-    // This is an acknowledgement, never the emailed proof itself.
     Ok(ApiResponse("verification-email-sent".into()))
 }
 
@@ -693,20 +625,14 @@ pub(in crate::api) async fn verify_registration_email(
     Json(payload): Json<VerifyRegistrationEmailRequest>,
 ) -> AppResult<ApiResponse<EmptyObject>> {
     email::rate_unauthenticated(&state.env, &ip, "registration-check").await?;
-    email::verify_code(
-        state.database(),
-        &state.jwt_keys.access_secret,
-        email::VerificationTarget {
-            user: None,
-            purpose: EmailPurpose::Registration,
-            recipient: &payload.email,
-            context: "",
-            session: "",
-        },
-        &payload.email_verification_token,
-        false,
-    )
-    .await?;
+    state
+        .email_verifier()
+        .verify_code(
+            VerificationTarget::registration(&payload.email),
+            &payload.email_verification_token,
+            false,
+        )
+        .await?;
     Ok(ApiResponse(EmptyObject {}))
 }
 
@@ -732,19 +658,11 @@ pub(in crate::api) async fn request_account_deletion_recovery(
         Ok(user) => {
             if state
                 .email_verifier()
-                .issue_code(
-                    email::VerificationTarget {
-                        user: Some(&user),
-                        purpose: EmailPurpose::DeleteRecover,
-                        recipient: &user.email,
-                        context: "",
-                        session: "",
-                    },
-                    IssuePolicy {
-                        format: OtpFormat::LongToken,
-                        reservation: ReservationMode::ReuseActive,
-                    },
-                )
+                .issue_code(VerificationTarget::account(
+                    &user,
+                    EmailPurpose::DeleteRecover,
+                    "",
+                ))
                 .await
                 .is_err()
             {
@@ -772,19 +690,13 @@ pub(in crate::api) async fn delete_account_with_recovery_token(
         || AppError::not_found("User"),
     )
     .await?;
-    let verification = email::prepare_code(
-        db,
-        &state.jwt_keys.access_secret,
-        email::VerificationTarget {
-            user: Some(&user),
-            purpose: EmailPurpose::DeleteRecover,
-            recipient: &user.email,
-            context: "",
-            session: "",
-        },
-        &payload.token,
-    )
-    .await?;
+    let verification = state
+        .email_verifier()
+        .prepare_code(
+            VerificationTarget::account(&user, EmailPurpose::DeleteRecover, ""),
+            &payload.token,
+        )
+        .await?;
     crate::service::identity::user::delete_account_with_email(db, &state.env, &user, &verification)
         .await?;
     Ok(ApiResponse(EmptyObject {}))

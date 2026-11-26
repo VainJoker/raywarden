@@ -1,15 +1,50 @@
 use std::{convert::Infallible, future::ready};
 
 use axum::{
-    extract::{FromRequestParts, OptionalFromRequestParts},
+    extract::{FromRequestParts, OptionalFromRequestParts, Path as AxumPath, Query as AxumQuery},
     http::{HeaderMap, request::Parts},
 };
+use serde::de::DeserializeOwned;
 
 use crate::{
     errors::AppError,
     service::rate_limit::client_ip,
     utils::version::{ParsedVersion, parse},
 };
+
+pub(in crate::api) struct Query<T>(pub T);
+
+impl<T, S> FromRequestParts<S> for Query<T>
+where
+    T: DeserializeOwned + Send,
+    S: Send + Sync,
+{
+    type Rejection = AppError;
+
+    async fn from_request_parts(parts: &mut Parts, state: &S) -> Result<Self, Self::Rejection> {
+        AxumQuery::<T>::from_request_parts(parts, state)
+            .await
+            .map(|AxumQuery(value)| Self(value))
+            .map_err(|_error| AppError::Params("Malformed query string".into()))
+    }
+}
+
+pub(in crate::api) struct Path<T>(pub T);
+
+impl<T, S> FromRequestParts<S> for Path<T>
+where
+    T: DeserializeOwned + Send,
+    S: Send + Sync,
+{
+    type Rejection = AppError;
+
+    async fn from_request_parts(parts: &mut Parts, state: &S) -> Result<Self, Self::Rejection> {
+        <AxumPath<T> as FromRequestParts<S>>::from_request_parts(parts, state)
+            .await
+            .map(|AxumPath(value)| Self(value))
+            .map_err(|_error| AppError::bad_request("Malformed URL path parameter"))
+    }
+}
 
 pub(in crate::api) struct ClientIp(pub String);
 

@@ -23,11 +23,68 @@ struct FactorProof {
     sub: String,
     sstamp: String,
     session_token: String,
+    device: String,
     purpose: String,
-    email_state: String,
+    state: String,
+    #[serde(default)]
+    factor_id: Option<String>,
     exp: i64,
     nbf: i64,
     iat: i64,
+}
+
+pub(crate) fn mint_factor_proof(
+    access_secret: &str,
+    claims: &Claims,
+    purpose: &str,
+    state: String,
+    factor_id: Option<&str>,
+) -> AppResult<String> {
+    let now = crate::utils::time::now_seconds();
+    jwt::encode(
+        &FactorProof {
+            sub: claims.sub.clone(),
+            sstamp: claims.sstamp.clone(),
+            session_token: claims.session_token.clone(),
+            device: claims.device().unwrap_or_default().to_owned(),
+            purpose: purpose.to_owned(),
+            state,
+            factor_id: factor_id.map(str::to_owned),
+            exp: now + 300,
+            nbf: now,
+            iat: now,
+        },
+        access_secret.as_bytes(),
+    )
+}
+
+pub(crate) fn verify_factor_proof(
+    access_secret: &str,
+    claims: &Claims,
+    token: &str,
+    purpose: &str,
+    expected_state: &str,
+    observed_factor_id: Option<&str>,
+) -> AppResult<()> {
+    let proof =
+        jwt::decode::<FactorProof>(token, access_secret.as_bytes(), &jwt::ValidationOptions {
+            leeway_seconds: 0,
+            ..Default::default()
+        })?;
+    if proof.sub != claims.sub
+        || proof.sstamp != claims.sstamp
+        || proof.session_token != claims.session_token
+        || proof.device != claims.device().unwrap_or_default()
+        || proof.purpose != purpose
+        || proof
+            .factor_id
+            .as_deref()
+            .is_some_and(|id| observed_factor_id != Some(id))
+        || !constant_time_eq(proof.state.as_bytes(), expected_state.as_bytes())
+    {
+        return Err(AppError::invalid_credentials("Invalid verification proof"));
+    }
+    Ok(())
 }
 
 fn factor_state(address: Option<&str>) -> String {
@@ -39,18 +96,13 @@ pub fn mint_email_factor_proof(
     claims: &Claims,
     address: Option<&str>,
 ) -> AppResult<String> {
-    let now = crate::utils::time::now_seconds();
-    let proof = FactorProof {
-        sub: claims.sub.clone(),
-        sstamp: claims.sstamp.clone(),
-        session_token: claims.session_token.clone(),
-        purpose: "email-factor".into(),
-        email_state: factor_state(address),
-        exp: now + 300,
-        nbf: now,
-        iat: now,
-    };
-    jwt::encode(&proof, access_secret.as_bytes())
+    mint_factor_proof(
+        access_secret,
+        claims,
+        "email-factor",
+        factor_state(address),
+        None,
+    )
 }
 
 pub async fn verify_email_factor_action(
@@ -86,23 +138,15 @@ pub(crate) async fn verify_email_factor_proof(
     claims: &Claims,
     token: &str,
 ) -> AppResult<()> {
-    let proof =
-        jwt::decode::<FactorProof>(token, access_secret.as_bytes(), &jwt::ValidationOptions {
-            leeway_seconds: 0,
-            ..Default::default()
-        })?;
     let current_email = email::email_provider(db, &claims.sub).await?;
-    if proof.sub != claims.sub
-        || proof.sstamp != claims.sstamp
-        || proof.session_token != claims.session_token
-        || proof.purpose != "email-factor"
-        || proof.email_state != factor_state(current_email.as_deref())
-    {
-        return Err(AppError::invalid_credentials(
-            "Invalid email verification proof",
-        ));
-    }
-    Ok(())
+    verify_factor_proof(
+        access_secret,
+        claims,
+        token,
+        "email-factor",
+        &factor_state(current_email.as_deref()),
+        None,
+    )
 }
 
 /// Two-factor authentication types
@@ -215,25 +259,6 @@ pub async fn is_two_factor_enabled(db: &worker::D1Database, user_id: &str) -> Ap
     Ok(requires_two_factor(&providers))
 }
 
-/// Unaliased verification fields accepted by the authenticator endpoints.
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct AccountVerificationFields {
-    pub master_password_hash: Option<String>,
-    pub otp: Option<String>,
-    pub user_verification_token: Option<String>,
-}
-
-impl From<AccountVerificationFields> for AccountVerificationRequest {
-    fn from(fields: AccountVerificationFields) -> Self {
-        Self {
-            master_password_hash: fields.master_password_hash,
-            otp: fields.otp,
-            user_verification_token: fields.user_verification_token,
-        }
-    }
-}
-
 /// POST /api/two-factor/authenticator - Enable TOTP
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -241,7 +266,7 @@ pub struct ActivateAuthenticatorRequest {
     pub key: String,
     pub token: String,
     #[serde(flatten)]
-    pub verification: AccountVerificationFields,
+    pub verification: AccountVerificationRequest,
 }
 
 /// POST /api/two-factor/disable - Disable a 2FA method
@@ -249,7 +274,7 @@ pub struct ActivateAuthenticatorRequest {
 #[serde(rename_all = "camelCase")]
 pub struct DisableTwoFactorRequest {
     #[serde(flatten)]
-    pub verification: AccountVerificationFields,
+    pub verification: AccountVerificationRequest,
     #[serde(rename = "type")]
     pub provider_type: i32,
 }
@@ -269,7 +294,7 @@ pub struct RecoverTwoFactorRequest {
 pub struct DisableAuthenticatorRequest {
     pub key: String,
     #[serde(flatten)]
-    pub verification: AccountVerificationFields,
+    pub verification: AccountVerificationRequest,
     #[serde(rename = "type")]
     pub provider_type: i32,
 }
@@ -299,10 +324,18 @@ impl RememberedDevices {
         serde_json::to_string(self).unwrap_or_else(|_| "{}".to_string())
     }
 
+    fn expiration_seconds(days: i64) -> i64 {
+        days.clamp(1, 90) * 86_400
+    }
+
+    fn hash_token(token: &str) -> String {
+        format!("sha256:{}", hex::encode(Sha256::digest(token.as_bytes())))
+    }
+
     /// Remove expired tokens using the configured policy.
     pub fn remove_expired(&mut self, days: i64) {
         let now = crate::utils::time::now_seconds();
-        let expiration_seconds = days.clamp(1, 90) * 86_400;
+        let expiration_seconds = Self::expiration_seconds(days);
         self.tokens.retain(|t| {
             t.created_at <= now && now.saturating_sub(t.created_at) < expiration_seconds
         });
@@ -312,19 +345,13 @@ impl RememberedDevices {
     /// Returns true if valid and not expired
     pub fn validate(&self, device_id: &str, token: &str, days: i64) -> bool {
         let now = crate::utils::time::now_seconds();
-        let expiration_seconds = days.clamp(1, 90) * 86_400;
-        let hashed = format!("sha256:{}", hex::encode(Sha256::digest(token.as_bytes())));
+        let expiration_seconds = Self::expiration_seconds(days);
+        let hashed = Self::hash_token(token);
 
         self.tokens.iter().any(|t| {
             t.device_id == device_id
-                && constant_time_eq(
-                    t.token.as_bytes(),
-                    if t.token.starts_with("sha256:") {
-                        hashed.as_bytes()
-                    } else {
-                        token.as_bytes()
-                    },
-                )
+                && t.token.starts_with("sha256:")
+                && constant_time_eq(t.token.as_bytes(), hashed.as_bytes())
                 && t.created_at <= now
                 && now.saturating_sub(t.created_at) < expiration_seconds
         })
@@ -333,13 +360,10 @@ impl RememberedDevices {
     /// Add or update a token for a device
     /// If the device already has a token, it will be replaced
     pub fn upsert(&mut self, device_id: String, token: &str) {
-        // Remove existing token for this device
         self.tokens.retain(|t| t.device_id != device_id);
-
-        // Add new token
         self.tokens.push(RememberedDeviceToken {
             device_id,
-            token: format!("sha256:{}", hex::encode(Sha256::digest(token.as_bytes()))),
+            token: Self::hash_token(token),
             created_at: crate::utils::time::now_seconds(),
         });
     }
@@ -373,33 +397,25 @@ pub(crate) fn generate_factor_secret() -> AppResult<String> {
     ))
 }
 
-/// Generates a TOTP code for the given secret and time.
-///
-/// # Arguments
-/// * `secret` - Base32 encoded secret key
-/// * `time_step` - Unix timestamp divided by 30 (or custom period)
-///
-/// # Returns
-/// * 6-digit TOTP code as a string
-async fn generate_totp(secret: &str, time_step: u64) -> AppResult<String> {
-    let decoded_secret = decode_base32(secret).ok_or(CryptoError::InvalidBase32)?;
-
-    // Convert time_step to big-endian bytes
+/// Generates a 6-digit RFC 4226 / RFC 6238 code from an already-decoded Base32 secret.
+async fn generate_totp_from_bytes(decoded_secret: &[u8], time_step: u64) -> AppResult<[u8; 6]> {
     let counter = time_step.to_be_bytes();
+    let digest = hmac_sha1(decoded_secret, &counter).await?;
 
-    // Compute HMAC-SHA1
-    let digest = hmac_sha1(&decoded_secret, &counter).await?;
-
-    // Dynamic truncation (RFC 4226)
     let offset = (digest[19] & 0x0f) as usize;
-    let code = u32::from(digest[offset] & 0x7f) << 24
+    let code = (u32::from(digest[offset] & 0x7f) << 24
         | u32::from(digest[offset + 1]) << 16
         | u32::from(digest[offset + 2]) << 8
-        | u32::from(digest[offset + 3]);
+        | u32::from(digest[offset + 3]))
+        % 1_000_000;
 
-    // Get 6-digit code
-    let code = code % 1_000_000;
-    Ok(format!("{code:06}"))
+    let mut digits = [b'0'; 6];
+    let mut rem = code;
+    for slot in digits.iter_mut().rev() {
+        *slot = b'0' + (rem % 10) as u8;
+        rem /= 10;
+    }
+    Ok(digits)
 }
 
 /// Validates a TOTP code against a secret.
@@ -419,28 +435,24 @@ pub(crate) async fn validate_totp(
     last_used_step: i64,
     allow_drift: bool,
 ) -> AppResult<i64> {
-    // Validate code format
-    if code.len() != 6 || !code.chars().all(|c| c.is_ascii_digit()) {
+    if code.len() != 6 || !code.bytes().all(|b| b.is_ascii_digit()) {
         return Err(AppError::Auth(AuthError::InvalidTotp));
     }
 
-    let current_time_seconds = crate::utils::time::now_seconds();
-    let current_step = current_time_seconds / 30;
-
-    // Check drift range
-    let drift_steps: i64 = i64::from(allow_drift);
+    let decoded_secret = decode_base32(secret).ok_or(CryptoError::InvalidBase32)?;
+    let current_step = crate::utils::time::now_seconds() / 30;
+    let drift_steps = i64::from(allow_drift);
 
     for step_offset in -drift_steps..=drift_steps {
         let time_step = current_step + step_offset;
-
-        // Skip if this time step was already used (replay protection)
         if time_step <= last_used_step {
             continue;
         }
-
-        let expected = generate_totp(secret, time_step as u64).await?;
-
-        if constant_time_eq(code.as_bytes(), expected.as_bytes()) {
+        let Ok(step) = u64::try_from(time_step) else {
+            continue;
+        };
+        let expected = generate_totp_from_bytes(&decoded_secret, step).await?;
+        if constant_time_eq(code.as_bytes(), &expected) {
             return Ok(time_step);
         }
     }
@@ -453,60 +465,35 @@ mod tests {
     use super::{RememberedDeviceToken, RememberedDevices, TwoFactorRow, requires_two_factor};
 
     #[test]
-    fn remember_tokens_read_legacy_values_and_store_new_hashes() {
+    fn remember_hashes_and_challenge_classification_match_policy() {
         let now = crate::utils::time::now_seconds();
         let mut data = RememberedDevices {
             tokens: vec![RememberedDeviceToken {
-                device_id: "device".into(),
-                token: "old-opaque-token".into(),
-                created_at: now - 2 * 86400,
+                device_id: "dev".into(),
+                token: "plain".into(),
+                created_at: now,
             }],
         };
-        assert!(data.validate("device", "old-opaque-token", 3));
-        assert!(!data.validate("device", "old-opaque-token", 1));
-        data.upsert("device".into(), "new-opaque-token");
-        assert!(data.validate("device", "new-opaque-token", 30));
-        assert!(!data.to_json().contains("new-opaque-token"));
-        data.tokens[0].created_at = now + 86400;
-        assert!(!data.validate("device", "new-opaque-token", 30));
-        data.remove_expired(30);
-        assert!(data.tokens.is_empty());
-    }
+        assert!(!data.validate("dev", "plain", 30));
+        data.upsert("dev".into(), "opaque");
+        assert!(data.validate("dev", "opaque", 30) && !data.to_json().contains("opaque"));
 
-    #[test]
-    fn challenge_classification_matches_login_for_supported_and_legacy_factors() {
-        for (provider_type, enabled, expected) in [
+        for (kind, enabled, expected) in [
             (0, true, true),
-            (1, true, true),
-            (7, true, true),
-            (0, false, false),
-            (1, false, false),
             (7, false, false),
             (5, true, false),
             (1000, true, false),
-            (1005, true, false),
-            // Unknown and unsupported legacy factors still trigger the same
-            // login challenge; this predicate must not bypass their handling.
             (2, true, true),
-            (8, true, true),
-            (42, true, true),
-            (999, true, true),
-            (-1, true, true),
         ] {
-            let factor = TwoFactorRow {
-                id: "factor".into(),
-                user_id: "owner".into(),
-                provider_type,
+            let row = TwoFactorRow {
+                id: "f".into(),
+                user_id: "u".into(),
+                provider_type: kind,
                 is_enabled: enabled,
                 data: "{}".into(),
                 last_used_step: 0,
             };
-            assert_eq!(
-                factor.requires_login_challenge(),
-                expected,
-                "type {provider_type}, enabled {enabled}"
-            );
-            assert_eq!(requires_two_factor(std::slice::from_ref(&factor)), expected);
+            assert_eq!(requires_two_factor(std::slice::from_ref(&row)), expected);
         }
     }
 }

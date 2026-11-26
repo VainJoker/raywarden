@@ -1,5 +1,5 @@
 //! Commit sensitive account actions against the authorization that verified them.
-use worker::{D1Database, D1PreparedStatement, D1Result};
+use worker::{D1Database, D1PreparedStatement};
 
 use super::{
     device::{DeviceRow, SessionSnapshot},
@@ -34,16 +34,17 @@ impl<'a> VerifiedAccountAction<'a> {
         &self,
         db: &D1Database,
         mut writes: Vec<D1PreparedStatement>,
-        context: &str,
-    ) -> AppResult<Vec<D1Result>> {
-        let mut guards = vec![
+        context: &'static str,
+    ) -> AppResult<()> {
+        writes.splice(..0, [
             session_guard(db, &self.session)?,
             DeviceRow::guard_current_login_account(db, &self.user)?,
-        ];
-        let guard_count = guards.len();
-        guards.append(&mut writes);
-        let results = VerifiedCode::batch_with_proofs(db, &self.otp, guards, |error| {
-            match DatabaseError::find_sentinel(&error, &[
+        ]);
+        VerifiedCode::commit(
+            db,
+            &self.otp,
+            writes,
+            |error| match DatabaseError::find_sentinel(&error, &[
                 DbSentinel::VaultWriteConflict,
                 DbSentinel::TotpWriteConflict,
             ]) {
@@ -52,10 +53,9 @@ impl<'a> VerifiedAccountAction<'a> {
                     AppError::conflict("Authenticator configuration changed; retry")
                 }
                 _ => DatabaseError::query(context, &error),
-            }
-        })
-        .await?;
-        Ok(results.into_iter().skip(guard_count).collect())
+            },
+        )
+        .await
     }
 }
 
@@ -63,7 +63,15 @@ pub(crate) fn session_guard(
     db: &D1Database,
     session: &SessionSnapshot<'_>,
 ) -> AppResult<D1PreparedStatement> {
-    mutation::guard(
+    session_guard_with_sentinel(db, session, DbSentinel::VaultWriteConflict)
+}
+
+pub(crate) fn session_guard_with_sentinel(
+    db: &D1Database,
+    session: &SessionSnapshot<'_>,
+    sentinel: DbSentinel,
+) -> AppResult<D1PreparedStatement> {
+    mutation::guard_with_sentinel(
         db,
         "EXISTS(SELECT 1 FROM users u JOIN devices d ON d.user_id=u.id WHERE \
          u.id=?1 AND u.security_stamp=?2 AND d.device_id=?3 AND d.session_token=?4)",
@@ -73,10 +81,11 @@ pub(crate) fn session_guard(
             session.device_id,
             session.session_token
         ],
+        sentinel,
     )
 }
 
-pub(crate) fn map_session_write_error(context: &str, error: &worker::Error) -> AppError {
+pub(crate) fn map_session_write_error(context: &'static str, error: &worker::Error) -> AppError {
     match DatabaseError::find_sentinel(error, &[DbSentinel::VaultWriteConflict]) {
         Some(DbSentinel::VaultWriteConflict) => action_conflict(),
         _ => DatabaseError::query(context, error),

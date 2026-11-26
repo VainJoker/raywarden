@@ -33,6 +33,24 @@ export function bearerJsonHeaders(token) {
   return { Authorization: `Bearer ${token}`, "Content-Type": "application/json" };
 }
 
+export function requestJson(fixture, path, body, { method = "POST", headers } = {}) {
+  return fixture.fetch(path, {
+    method,
+    headers: { "Content-Type": "application/json", ...headers },
+    body: JSON.stringify(body),
+  });
+}
+
+export async function withFetchMock(fetch, run) {
+  const previous = globalThis.fetch;
+  globalThis.fetch = fetch;
+  try {
+    return await run();
+  } finally {
+    globalThis.fetch = previous;
+  }
+}
+
 export function assertDownloadSecurityHeaders(response, disposition = "attachment") {
   for (const [name, expected] of [
     ["content-type", "application/octet-stream"],
@@ -60,25 +78,29 @@ const encoder = new TextEncoder();
 const jwtFields = ["access_secret", "refresh_secret"];
 export const fromBase64Url = value => Uint8Array.from(atob(value.replaceAll("-", "+").replaceAll("_", "/")), byte => byte.charCodeAt(0));
 export const toBase64Url = value => btoa(String.fromCharCode(...value)).replaceAll("+", "-").replaceAll("/", "_").replace(/=+$/, "");
+export const jwtClaims = token => JSON.parse(new TextDecoder().decode(fromBase64Url(token.split(".")[1])));
+
+export async function signJwt(claims, secret) {
+  const now = Math.floor(Date.now() / 1000);
+  const header = toBase64Url(encoder.encode('{"alg":"HS256","typ":"JWT"}'));
+  const body = toBase64Url(encoder.encode(JSON.stringify({ iat: now, nbf: now - 1, exp: now + 300, ...claims })));
+  const signed = `${header}.${body}`;
+  const key = await crypto.subtle.importKey("raw", encoder.encode(secret), { name: "HMAC", hash: "SHA-256" }, false, ["sign"]);
+  const signature = await crypto.subtle.sign("HMAC", key, encoder.encode(signed));
+  return `${signed}.${toBase64Url(new Uint8Array(signature))}`;
+}
+
 const fixtureContext = field => encoder.encode(`raywarden/jwt-key-encryption/v1/global/${field}`);
 async function fixtureRootKey(rootSecret) {
   const raw = fromBase64Url(rootSecret);
   if (raw.length !== 32 || toBase64Url(raw) !== rootSecret) throw new Error("Invalid fixture KEY_ENCRYPTION_KEY");
   return crypto.subtle.importKey("raw", raw, "AES-GCM", false, ["encrypt", "decrypt"]);
 }
-function fixtureIsWrapped(keys) {
-  for (const field of jwtFields) if (typeof keys[field] !== "string" || !keys[field].trim()) throw new Error(`Invalid fixture ${field}`);
-  const wrapped = jwtFields.map(field => keys[field].startsWith("v1."));
-  if (wrapped[0] !== wrapped[1]) throw new Error("Mixed fixture JWT envelope formats");
-  if (!wrapped[0] && jwtFields.some(field => /^v\d+\./.test(keys[field]))) throw new Error("Unsupported fixture JWT envelope version");
-  return wrapped[0];
-}
-
-/** Independently decode production AES-GCM envelopes, or a fresh legacy fixture. */
+/** Independently decode production AES-GCM envelopes. */
 export async function openFixtureJwtKeys(keys, rootSecret) {
-  if (!fixtureIsWrapped(keys)) return { access_secret: keys.access_secret, refresh_secret: keys.refresh_secret };
   const result = {}, key = await fixtureRootKey(rootSecret);
   for (const field of jwtFields) {
+    if (typeof keys[field] !== "string" || !keys[field].startsWith("v1.")) throw new Error(`Expected v1 envelope for ${field}`);
     const encoded = keys[field].slice(3), packed = fromBase64Url(encoded);
     if (packed.length < 29 || toBase64Url(packed) !== encoded) throw new Error(`${field} envelope is malformed`);
     const plaintext = await crypto.subtle.decrypt({ name: "AES-GCM", iv: packed.subarray(0, 12), additionalData: fixtureContext(field) }, key, packed.subarray(12));
@@ -90,7 +112,6 @@ export async function openFixtureJwtKeys(keys, rootSecret) {
 
 /** Produce test-controlled envelopes using WebCrypto, independently of Rust. */
 export async function wrapFixtureJwtKeys(keys, rootSecret) {
-  if (fixtureIsWrapped(keys)) throw new Error("Fixture JWT keys are already wrapped");
   const result = {}, key = await fixtureRootKey(rootSecret);
   for (const field of jwtFields) {
     const nonce = crypto.getRandomValues(new Uint8Array(12));
@@ -106,8 +127,8 @@ export async function fixtureAccessSecret(sql, rootSecret) {
   return (await openFixtureJwtKeys(keys, rootSecret)).access_secret;
 }
 
-export async function emailCodeHash(secret, { owner, purpose, recipient, context, code }) {
-  const parts = [owner, purpose, recipient, context, code].map(part => encoder.encode(part));
+export async function emailCodeHash(secret, { owner, purpose, recipient, code }) {
+  const parts = [owner, purpose, recipient, code].map(part => encoder.encode(part));
   const message = new Uint8Array(parts.reduce((total, bytes) => total + 8 + bytes.length, 0));
   const lengths = new DataView(message.buffer);
   let offset = 0;

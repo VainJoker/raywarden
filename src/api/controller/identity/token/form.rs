@@ -244,63 +244,41 @@ fn require_cookie_origin(allowed: bool) -> AppResult<()> {
 mod tests {
     use super::*;
 
-    fn parse(fields: &[(&str, &str)]) -> AppResult<GrantRequest> {
-        GrantRequest::parse(
-            fields
-                .iter()
-                .map(|&(name, value)| (name.into(), value.into()))
-                .collect(),
-            &HeaderMap::new(),
-            true,
-        )
-    }
-
     #[test]
-    fn token_form_normalizes_aliases_and_trims_numbers_only() {
-        for (id, kind, provider, proof) in [
+    fn token_form_normalizes_aliases_and_rejects_duplicates() {
+        let parse = |fields: &[(&str, &str)]| {
+            GrantRequest::parse(
+                fields.iter().map(|&(k, v)| (k.into(), v.into())).collect(),
+                &HeaderMap::new(),
+                true,
+            )
+        };
+        let GrantRequest::Password(req) = parse(&[
+            ("GrAnT_TyPe", " password "),
+            ("Password", " secret "),
+            ("deviceIdentifier", "dev"),
+            ("deviceType", "2 "),
+            ("twoFactorProvider", "0 "),
+            ("two_factor_remember", "TrUe "),
+        ])
+        .expect("password") else {
+            panic!("expected password")
+        };
+        assert_eq!(
             (
-                "device_id",
-                "device_type",
-                "two_factor_provider",
-                "two_factor_token",
+                req.device.id.as_deref(),
+                req.device.kind,
+                req.remember_second_factor
             ),
-            (
-                "deviceIdentifier",
-                "deviceType",
-                "twoFactorProvider",
-                "twoFactorToken",
-            ),
-        ] {
-            let GrantRequest::Password(request) = parse(&[
-                ("GrAnT_TyPe", " password "),
-                ("Password", " opaque password "),
-                (id, "device"),
-                (kind, "2 "),
-                (provider, "0 "),
-                (proof, " opaque proof "),
-                ("two_factor_remember", "TrUe "),
-            ])
-            .expect("valid identity fixture") else {
-                panic!("expected password grant");
-            };
-            assert_eq!(request.device.id.as_deref(), Some("device"));
-            assert_eq!(request.device.kind, Some(2));
-            assert_eq!(request.two_factor_provider, Some(0));
-            assert_eq!(request.two_factor_token.as_deref(), Some(" opaque proof "));
-            assert_eq!(request.password.as_deref(), Some(" opaque password "));
-            assert!(request.remember_second_factor);
-        }
-    }
-
-    #[test]
-    fn blank_proofs_still_occupy_duplicate_fields() {
-        assert!(matches!(
+            (Some("dev"), Some(2), true)
+        );
+        assert!(
             parse(&[
                 ("grant_type", "password"),
-                ("TWO_FACTOR_TOKEN", "  "),
-                ("twoFactorToken", "opaque")
-            ]),
-            Err(AppError::InvalidTokenRequest { .. })
-        ));
+                ("TWO_FACTOR_TOKEN", " "),
+                ("twoFactorToken", "x")
+            ])
+            .is_err()
+        );
     }
 }

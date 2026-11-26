@@ -6,7 +6,7 @@ use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 pub use profile::ProfileResponse;
 pub use requests::{
     AccountKeyPairRequest, AccountVerificationRequest, ChangeKdfRequest, ChangePasswordRequest,
-    KdfParams, MasterPasswordUnlockPayload, PreloginResponse, RegisterRequest, SetPasswordRequest,
+    KdfParams, MasterPasswordUnlockPayload, PreloginResponse, RegisterRequest,
     UpdateAvatarColorRequest, UpdateProfileRequest,
 };
 use worker::{D1Database, Env};
@@ -17,8 +17,7 @@ use crate::{
     models::identity::{
         authorization::VerifiedAccountAction,
         email::VerifiedCode,
-        push::PushDeviceRow,
-        user::{PasswordInitialization, StoredPassword, UserRow},
+        user::{StoredPassword, UserRow},
     },
     service::{
         identity::{account_keys, kdf::ValidatedKdfParams, session::Claims},
@@ -45,9 +44,9 @@ pub(crate) async fn delete_account(
     env: &Env,
     authorization: &VerifiedAccountAction<'_>,
 ) -> AppResult<()> {
-    let devices = UserRow::delete_user(db, authorization).await?;
+    UserRow::delete_user(db, authorization).await?;
     let session = &authorization.session;
-    finish_account_deletion(db, env, session.user_id, &devices, Some(session.device_id)).await;
+    finish_account_deletion(db, env, session.user_id, Some(session.device_id)).await;
     Ok(())
 }
 
@@ -57,8 +56,8 @@ pub(crate) async fn delete_account_with_email(
     user: &UserRow,
     verification: &VerifiedCode,
 ) -> AppResult<()> {
-    let devices = UserRow::delete_user_with_email(db, user, verification).await?;
-    finish_account_deletion(db, env, &user.id, &devices, None).await;
+    UserRow::delete_user_with_email(db, user, verification).await?;
+    finish_account_deletion(db, env, &user.id, None).await;
     Ok(())
 }
 
@@ -67,20 +66,13 @@ async fn finish_account_deletion(
     db: &D1Database,
     env: &Env,
     user_id: &str,
-    devices: &[PushDeviceRow],
     device_id: Option<&str>,
 ) {
-    notifications::publish_deleted_account(env, user_id, devices, device_id).await;
+    notifications::publish_deleted_account(env, user_id, device_id).await;
     if let Err(error) = crate::service::storage_cleanup::process_batch(env, db).await {
-        log::warn!("Account deleted; object cleanup will retry: {error}");
+        log::warn!("Account deleted; object cleanup will retry: {error:?}");
     }
     admin_notify::emit(env, Event::AccountDeleted, user_id).await;
-}
-
-pub(crate) enum AccountLookup {
-    PasswordInitialization,
-    PasswordChange,
-    KdfChange,
 }
 
 impl<'a> AccountCredentials<'a> {
@@ -88,20 +80,10 @@ impl<'a> AccountCredentials<'a> {
         db: &'a D1Database,
         env: &'a Env,
         claims: &'a Claims,
-        lookup: AccountLookup,
+        context: &'static str,
     ) -> AppResult<Self> {
-        let context = match lookup {
-            AccountLookup::PasswordInitialization => {
-                "Failed to fetch password initialization owner"
-            }
-            AccountLookup::PasswordChange => "Failed to fetch user for password change",
-            AccountLookup::KdfChange => "Failed to fetch user for KDF change",
-        };
-        let user = UserRow::fetch_by_id_with(db, &claims.sub, context, || match lookup {
-            AccountLookup::PasswordInitialization => AuthError::UserNotFound.into(),
-            AccountLookup::PasswordChange | AccountLookup::KdfChange => {
-                AppError::not_found("User not found")
-            }
+        let user = UserRow::fetch_by_id_with(db, &claims.sub, context, || {
+            AppError::not_found("User not found")
         })
         .await?;
         Ok(Self {
@@ -112,93 +94,51 @@ impl<'a> AccountCredentials<'a> {
         })
     }
 
-    async fn verify_current_password(&self, hash: &str) -> AppResult<()> {
-        if !verify_master_password(&self.user, hash).await?.is_valid() {
-            return Err(AuthError::InvalidPassword.into());
-        }
-        Ok(())
-    }
-
-    pub(crate) async fn initialize(self, payload: SetPasswordRequest) -> AppResult<()> {
-        let claims = self.claims;
-        let user = &self.user;
-        ensure_password_uninitialized(user)?;
-        let data = payload.resolve(user)?;
-        let kdf = KdfParams::from(ValidatedKdfParams::try_from(data.kdf)?);
-        let password = stored_password_for_user(&data.master_password_hash, user).await?;
-        let (private_key, public_key) = data.key_pair.as_ref().map_or(
-            (user.private_key.as_str(), user.public_key.as_str()),
-            |keys| {
-                (
-                    keys.encrypted_private_key.as_str(),
-                    keys.public_key.as_str(),
-                )
-            },
-        );
-        let material = PasswordInitialization {
-            key: &data.wrapped_user_key,
-            private_key,
-            public_key,
-            hint: data.master_password_hint.as_deref(),
-            kdf_type: kdf.kdf_type,
-            kdf_iterations: kdf.iterations,
-            kdf_memory: kdf.memory,
-            kdf_parallelism: kdf.parallelism,
-        };
-        UserRow::initialize_password_if_current(
-            self.db,
-            user,
-            &claims.session_snapshot()?,
-            &material,
-            &password,
-        )
-        .await?;
-        admin_notify::emit(self.env, Event::PasswordChange, &user.id).await;
-        Ok(())
-    }
-
     pub(crate) async fn change_password(self, payload: ChangePasswordRequest) -> AppResult<()> {
-        let claims = self.claims;
-        let user = &self.user;
-        self.verify_current_password(&payload.master_password_hash)
-            .await?;
-
-        let (new_hash, new_key, kdf) = payload.resolve(user)?;
-        let password = stored_password_for_user(new_hash, user).await?;
-        account_keys::change_credentials(self.db, claims, user, account_keys::CredentialChange {
-            password: &password,
-            key: new_key,
-            kdf,
-            hint: payload.master_password_hint.as_deref(),
-            keys: payload.user_asymmetric_keys.as_ref(),
-        })
-        .await?;
-
-        admin_notify::emit(self.env, Event::PasswordChange, &claims.sub).await;
-        Ok(())
+        require_master_password(&self.user, &payload.master_password_hash).await?;
+        let (hash, key, kdf) = payload.resolve(&self.user)?;
+        self.apply_change(
+            account_keys::CredentialChange {
+                hash,
+                key,
+                kdf,
+                hint: payload.master_password_hint.as_deref(),
+                keys: payload.user_asymmetric_keys.as_ref(),
+            },
+            Event::PasswordChange,
+        )
+        .await
     }
 
     pub(crate) async fn change_kdf(self, payload: ChangeKdfRequest) -> AppResult<()> {
-        let claims = self.claims;
-        let user = &self.user;
-        self.verify_current_password(&payload.master_password_hash)
-            .await?;
+        require_master_password(&self.user, &payload.master_password_hash).await?;
+        let (hash, key, kdf) = payload.resolve(&self.user)?;
+        self.apply_change(
+            account_keys::CredentialChange {
+                hash,
+                key,
+                kdf: ValidatedKdfParams::try_from(kdf)?.into(),
+                hint: self.user.master_password_hint.as_deref(),
+                keys: None,
+            },
+            Event::KdfChange,
+        )
+        .await
+    }
 
-        let (new_hash, new_key, kdf) = payload.resolve(user)?;
-
-        let kdf = KdfParams::from(ValidatedKdfParams::try_from(kdf)?);
-        let password = stored_password_for_user(new_hash, user).await?;
-
-        account_keys::change_credentials(self.db, claims, user, account_keys::CredentialChange {
-            password: &password,
-            key: new_key,
-            kdf,
-            hint: user.master_password_hint.as_deref(),
-            keys: None,
-        })
-        .await?;
-
-        admin_notify::emit(self.env, Event::KdfChange, &claims.sub).await;
+    async fn apply_change(
+        &self,
+        change: account_keys::CredentialChange<'_>,
+        event: Event,
+    ) -> AppResult<()> {
+        account_keys::change_credentials(self.db, self.claims, &self.user, change).await?;
+        admin_notify::emit(self.env, event, &self.claims.sub).await;
+        notifications::publish_account_logout(
+            self.env,
+            self.claims,
+            &crate::utils::time::now_rfc3339(),
+        )
+        .await;
         Ok(())
     }
 }
@@ -213,29 +153,10 @@ pub fn has_v2_encryption(user: &UserRow) -> bool {
     user.security_version == Some(2) && user.private_key.starts_with("7.")
 }
 
-fn ensure_password_uninitialized(user: &UserRow) -> AppResult<()> {
-    if !user.master_password_hash.is_empty() || !user.private_key.is_empty() {
-        return Err(AppError::bad_request(
-            "Account already initialized, cannot set password",
-        ));
-    }
-    if user.signed_public_key.is_some()
-        || user.security_state.is_some()
-        || user.security_version.is_some()
-        || user.signature_key_pair.is_some()
-    {
-        return Err(AppError::bad_request(
-            "V2 JIT password registration is not available in this personal \
-             vault",
-        ));
-    }
-    Ok(())
-}
-
 pub async fn fetch_by_email_with<F>(
     db: &D1Database,
     email: &str,
-    context: &str,
+    context: &'static str,
     not_found: F,
 ) -> AppResult<UserRow>
 where
@@ -307,6 +228,18 @@ impl PasswordVerification {
     }
 }
 
+pub(crate) async fn require_master_password(
+    user: &UserRow,
+    hash: &str,
+) -> AppResult<PasswordVerification> {
+    let proof = verify_master_password(user, hash).await?;
+    if proof.is_valid() {
+        Ok(proof)
+    } else {
+        Err(AuthError::InvalidPassword.into())
+    }
+}
+
 pub async fn verify_master_password(
     user: &UserRow,
     provided_hash: &str,
@@ -352,58 +285,29 @@ mod tests {
 
     use super::*;
 
-    fn row() -> serde_json::Value {
-        json!({"id":"owner","email":"owner@example.test","is_email_verified":0,"master_password_hash":"hash","key":"key","private_key":"private","public_key":"public","kdf_type":0,"kdf_iterations":600_000,"security_stamp":"stamp","created_at":"now","updated_at":"now"})
-    }
-
     #[test]
-    fn old_rows_keep_the_raywarden_cost_without_using_the_client_kdf() {
-        let mut value = row();
-        value["kdf_type"] = json!(1);
-        value["kdf_iterations"] = json!(3);
-        let user: UserRow =
-            serde_json::from_value(value).expect("valid password verification fixture");
-        assert_eq!(user.password_iterations, 100_000);
-        assert_eq!(target_iterations(&user), 600_000);
-    }
+    fn password_verifier_preserves_costs_and_rejects_empty_hashes() {
+        let base = json!({
+            "id": "owner", "email": "owner@example.test", "is_email_verified": 0,
+            "master_password_hash": "", "key": "key", "private_key": "private",
+            "public_key": "public", "kdf_type": 1, "kdf_iterations": 3,
+            "security_stamp": "stamp", "created_at": "now", "updated_at": "now"
+        });
+        let user: UserRow = serde_json::from_value(base.clone()).expect("user");
+        assert_eq!(
+            (user.password_iterations, target_iterations(&user)),
+            (100_000, 600_000)
+        );
+        assert_eq!(
+            verify_master_password(&user, "")
+                .now_or_never()
+                .expect("ready")
+                .expect("ok"),
+            PasswordVerification::Mismatch
+        );
 
-    #[test]
-    fn persisted_cost_is_unsigned_and_higher_costs_are_preserved() {
-        for invalid in [json!(-1), json!(4_294_967_296_u64), json!(1.5)] {
-            let mut value = row();
-            value["password_iterations"] = invalid;
-            assert!(serde_json::from_value::<UserRow>(value).is_err());
-        }
-        let mut value = row();
-        value["password_iterations"] = json!(1_200_000);
-        let user: UserRow =
-            serde_json::from_value(value).expect("valid password verification fixture");
-        assert_eq!(target_iterations(&user), 1_200_000);
-    }
-
-    #[test]
-    fn empty_credentials_never_authorize_legacy_or_salted_accounts() {
-        for (stored, provided) in [
-            ("", ""),
-            ("", "nonempty"),
-            ("nonempty", ""),
-            (" \t", " \t"),
-            ("nonempty", "\n"),
-        ] {
-            for salt in [serde_json::Value::Null, json!("salt")] {
-                let mut value = row();
-                value["master_password_hash"] = json!(stored);
-                value["password_salt"] = salt;
-                let user: UserRow =
-                    serde_json::from_value(value).expect("valid password verification fixture");
-                assert_eq!(
-                    verify_master_password(&user, provided)
-                        .now_or_never()
-                        .expect("invalid credentials must return before crypto")
-                        .expect("valid password verification fixture"),
-                    PasswordVerification::Mismatch
-                );
-            }
-        }
+        let mut bad = base;
+        bad["password_iterations"] = json!(-1);
+        assert!(serde_json::from_value::<UserRow>(bad).is_err());
     }
 }

@@ -13,7 +13,7 @@ Before deploying, set up the following resources in a single **Cloudflare accoun
    - **Using `workers.dev`**: Ensure your account has a `workers.dev` subdomain enabled under **Workers & Pages**.
    - **Using a Custom Domain**: Ensure the domain is active on Cloudflare DNS in the same account.
 3. **D1 Database**: Create an empty D1 database (e.g., `warden-db`) and record its **Database Name** and **Database ID** (UUID).
-   - Leave the database empty. Database tables and indexes are created automatically by migrations during deployment—do **not** manually import `sql/schema.sql`.
+   - Leave the database empty. Deployment applies the D1 migrations to create tables and indexes.
 4. **R2 Bucket**: Enable R2 on your account and create a private bucket (e.g., `warden-attachments`).
    - Keep public access disabled. Raywarden accesses the bucket privately through its Worker binding.
 
@@ -181,7 +181,9 @@ Push new changes to `main` and publish a new `vX.Y.Z` tag (either manually or by
 
 ### Optional Secrets (Email, Push & Admin Notifications)
 
-The GitHub Actions workflow uploads `ALLOWED_EMAILS`, `KEY_ENCRYPTION_KEY`, `OWNER_SETUP_TOKEN`, and `DOMAIN`. If you enable optional integrations such as email delivery (`MAIL_WEBHOOK_URL`, `MAIL_WEBHOOK_TOKEN`), admin notifications (`WEWORK_WEBHOOK_URL`, `TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID`), Turnstile (`TURNSTILE_SITE_KEY`, `TURNSTILE_SECRET_KEY`), or HIBP (`HIBP_API_KEY`), configure those secrets directly in the Cloudflare Dashboard under **Worker → Settings → Variables and Secrets** (or via `wrangler secret put`). Because `keep_vars` and existing secrets are preserved across deployments, subsequent releases will retain them.
+The GitHub Actions workflow uploads `ALLOWED_EMAILS`, `KEY_ENCRYPTION_KEY`, `OWNER_SETUP_TOKEN`, and `DOMAIN`. If you enable optional integrations such as an email webhook (`MAIL_WEBHOOK_URL`, `MAIL_WEBHOOK_TOKEN`), admin notifications (`WEWORK_WEBHOOK_URL`, `TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID`), Turnstile (`TURNSTILE_SITE_KEY`, `TURNSTILE_SECRET_KEY`), or HIBP (`HIBP_API_KEY`), configure those secrets directly in the Cloudflare Dashboard under **Worker → Settings → Variables and Secrets** (or via `wrangler secret put`). Because `keep_vars` and existing secrets are preserved across deployments, subsequent releases will retain them.
+
+Email delivery requires a sending service. `ALLOWED_EMAILS` controls enrollment and cannot provide a sender identity. A `workers.dev` address does not supply a sending domain: [Cloudflare native email requires a domain configured for Email Service](https://developers.cloudflare.com/email-service/configuration/send-bindings/). No native email binding or additional sender variable is enabled in this project.
 
 ### Backups & Recovery
 
@@ -199,9 +201,10 @@ To restore a Raywarden instance completely, back up and retain these three items
 | **Pushing to `main` did not deploy** | Deployments run on `v*` tags. Push a new `vX.Y.Z` tag or merge the Release-plz PR. |
 | **`First deployment requires supplied Secrets`** | Ensure `ALLOWED_EMAILS` and `KEY_ENCRYPTION_KEY` are set in the GitHub `production` environment secrets. |
 | **`Invalid KEY_ENCRYPTION_KEY`** | Must be a 43-character unpadded `base64url` string (32 random bytes). Use the Node command in [Section 3](#2-key_encryption_key). |
-| **`PBKDF2 key derivation failed: await bit derivation` during registration or login** | Update to a release with the RustCrypto PBKDF2 implementation for server verifiers above Workers' 100,000-iteration Web Crypto limit. Existing verifier hashes and iteration counts remain compatible; no database reset or client KDF change is needed. |
+| **`PBKDF2 key derivation failed: await bit derivation` during registration or login** | Update to a release using RustCrypto for all server password verifiers, avoiding Workers' Web Crypto iteration limit. Existing verifier hashes and iteration counts remain compatible; no database reset or client KDF change is needed. |
+| **`Email delivery is not configured`** | Configure a working `MAIL_WEBHOOK_URL` to enable account email delivery. `ALLOWED_EMAILS` authorizes registration; it does not provide an email sending service. |
 | **D1 ID or name mismatch** | Verify that `database_id` and `database_name` in `wrangler.jsonc` match the D1 database in your target Cloudflare account. |
 | **`workers.dev` subdomain lookup fails** | Enable a `workers.dev` subdomain in **Workers & Pages**, or configure a `custom_domain` route in `wrangler.jsonc`. |
-| **Migration fails due to existing tables** | Do not manually import `sql/schema.sql` before deploying; start with an empty D1 database so Wrangler manages migrations. |
+| **Migration fails due to existing tables** | Start with an empty D1 database and let Wrangler apply the migrations. |
 | **`/setup` returns `401` or `409`** | Check that `OWNER_SETUP_TOKEN` matches, at least one email in `ALLOWED_EMAILS` is not yet registered, and you are accessing the canonical HTTPS origin. |
 | **`Release-plz` fails due to missing token** | Add `RELEASE_PLZ_TOKEN` as a **Repository secret** (not an Environment secret) with Contents and Pull requests read/write access. |

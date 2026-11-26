@@ -1,17 +1,15 @@
 use std::sync::Arc;
 
-use axum::{
-    extract::{Path, State},
-    http::HeaderMap,
-};
-use serde::{Deserialize, Serialize, Serializer};
+use axum::{extract::State, http::HeaderMap};
+use serde::{Deserialize, Serialize};
 
 use crate::{
     api::{
         AppState,
         common::{
+            extract::Path,
             json::Json,
-            response::{ApiResponse, EmptyObject},
+            response::{ApiResponse, EmptyObject, ListResponse},
         },
     },
     errors::{AppError, AppResult},
@@ -24,67 +22,16 @@ use crate::{
             user::AccountVerificationRequest,
             webauthn,
             webauthn::{
-                AssertionOptionsResponse, CredentialResponse, RegisterWebauthnCredentialRequest,
-                RegistrationOptions, UpdateWebauthnCredentialRequest,
+                AssertionOptionsResponse, CredentialResponse, CredentialUse,
+                RegisterWebauthnCredentialRequest, RegistrationOptions,
+                UpdateWebauthnCredentialRequest,
             },
         },
         notifications::{admin as admin_notify, admin::Event},
     },
 };
 
-pub(in crate::api) struct CredentialListResponse {
-    data: Vec<CredentialResponse>,
-}
-
-impl Serialize for CredentialListResponse {
-    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        #[derive(Serialize)]
-        #[serde(rename_all = "camelCase")]
-        struct CredentialListWire<'a> {
-            data: &'a [CredentialResponse],
-            #[serde(rename = "Data")]
-            legacy_data: &'a [CredentialResponse],
-            object: &'static str,
-            #[serde(rename = "Object")]
-            legacy_object: &'static str,
-            continuation_token: Option<&'a str>,
-        }
-
-        CredentialListWire {
-            data: &self.data,
-            legacy_data: &self.data,
-            object: "list",
-            legacy_object: "list",
-            continuation_token: None,
-        }
-        .serialize(serializer)
-    }
-}
-
 #[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-pub(in crate::api) struct SavedCredentialResponse {
-    #[serde(flatten)]
-    credentials: CredentialListResponse,
-    id: String,
-    name: String,
-    success: bool,
-    prf_status: i32,
-    can_use_passkey_unlock: bool,
-    requires_password_login: bool,
-    encrypted_user_key: Option<String>,
-    encrypted_public_key: Option<String>,
-    message: &'static str,
-}
-
-#[derive(Serialize)]
-pub(in crate::api) struct UpdatedCredentialResponse {
-    #[serde(flatten)]
-    credentials: CredentialListResponse,
-    success: bool,
-}
-
-#[derive(Clone, Serialize)]
 struct WebauthnTwoFactorKey {
     id: i32,
     name: String,
@@ -92,27 +39,32 @@ struct WebauthnTwoFactorKey {
 }
 
 #[derive(Serialize)]
-struct WebauthnTwoFactorDetails {
+struct WebauthnTwoFactorDetailsRef<'a> {
     enabled: bool,
-    keys: Vec<WebauthnTwoFactorKey>,
+    keys: &'a [WebauthnTwoFactorKey],
 }
 
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
 pub(in crate::api) struct WebauthnTwoFactorResponse {
     enabled: bool,
     keys: Vec<WebauthnTwoFactorKey>,
-    object: &'static str,
-    web_authn: WebauthnTwoFactorDetails,
     user_verification_token: String,
 }
 
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-struct PrfProbeDetails {
-    required_for_unlock: bool,
-    fallback: &'static str,
-    endpoint: &'static str,
+impl Serialize for WebauthnTwoFactorResponse {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeStruct as _;
+
+        let mut state = serializer.serialize_struct("WebauthnTwoFactorResponse", 5)?;
+        state.serialize_field("enabled", &self.enabled)?;
+        state.serialize_field("keys", &self.keys)?;
+        state.serialize_field("object", &"twoFactorWebAuthn")?;
+        state.serialize_field("webAuthn", &WebauthnTwoFactorDetailsRef {
+            enabled: self.enabled,
+            keys: &self.keys,
+        })?;
+        state.serialize_field("userVerificationToken", &self.user_verification_token)?;
+        state.end()
+    }
 }
 
 #[derive(Serialize)]
@@ -120,43 +72,37 @@ struct PrfProbeDetails {
 pub(in crate::api) struct AttestationOptionsResponse {
     token: String,
     options: RegistrationOptions,
-    prf_probe: PrfProbeDetails,
 }
 
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-#[allow(clippy::struct_excessive_bools)] // Independent protocol fields.
-pub(in crate::api) struct PrfProbeResponse {
-    supports_prf: bool,
-    can_use_passkey_unlock: bool,
-    requires_password_login: bool,
-    required_for_unlock: bool,
-    fallback: &'static str,
-    message: &'static str,
-}
-
-async fn list_response(state: &AppState, user: &str) -> AppResult<CredentialListResponse> {
-    let data = WebauthnCredentialRow::list(state.database(), user, "login")
+async fn list_response(
+    state: &AppState,
+    user: &str,
+) -> AppResult<ListResponse<CredentialResponse>> {
+    let data = WebauthnCredentialRow::list(state.database(), user, CredentialUse::Login.as_str())
         .await?
         .into_iter()
         .map(CredentialResponse::from)
-        .collect();
-    Ok(CredentialListResponse { data })
+        .collect::<Vec<_>>();
+    Ok(data.into())
 }
 
 async fn two_factor_response(
     state: &AppState,
     claims: &Claims,
 ) -> AppResult<WebauthnTwoFactorResponse> {
-    let keys = WebauthnCredentialRow::list(state.database(), &claims.sub, "2fa")
-        .await?
-        .into_iter()
-        .map(|key| WebauthnTwoFactorKey {
-            id: key.slot,
-            name: key.name,
-            migrated: false,
-        })
-        .collect::<Vec<_>>();
+    let keys = WebauthnCredentialRow::list(
+        state.database(),
+        &claims.sub,
+        CredentialUse::TwoFactor.as_str(),
+    )
+    .await?
+    .into_iter()
+    .map(|key| WebauthnTwoFactorKey {
+        id: key.slot,
+        name: key.name,
+        migrated: false,
+    })
+    .collect::<Vec<_>>();
     let enabled = !keys.is_empty();
     let token = webauthn::mint_user_verification_token(
         state.database(),
@@ -166,12 +112,7 @@ async fn two_factor_response(
     .await?;
     Ok(WebauthnTwoFactorResponse {
         enabled,
-        web_authn: WebauthnTwoFactorDetails {
-            enabled,
-            keys: keys.clone(),
-        },
         keys,
-        object: "twoFactorWebAuthn",
         user_verification_token: token,
     })
 }
@@ -180,7 +121,7 @@ async fn two_factor_response(
 pub(in crate::api) async fn list_credentials(
     claims: Claims,
     State(state): State<Arc<AppState>>,
-) -> AppResult<ApiResponse<CredentialListResponse>> {
+) -> AppResult<ApiResponse<ListResponse<CredentialResponse>>> {
     Ok(ApiResponse(list_response(&state, &claims.sub).await?))
 }
 
@@ -204,11 +145,6 @@ pub(in crate::api) async fn attestation_options(
     Ok(ApiResponse(AttestationOptionsResponse {
         token: options.challenge.clone(),
         options,
-        prf_probe: PrfProbeDetails {
-            required_for_unlock: true,
-            fallback: "master_password",
-            endpoint: "/api/webauthn/prf-probe",
-        },
     }))
 }
 
@@ -217,8 +153,8 @@ pub(in crate::api) async fn create_credential(
     claims: Claims,
     State(state): State<Arc<AppState>>,
     Json(data): Json<RegisterWebauthnCredentialRequest>,
-) -> AppResult<ApiResponse<SavedCredentialResponse>> {
-    let saved = webauthn::register(
+) -> AppResult<ApiResponse<ListResponse<CredentialResponse>>> {
+    webauthn::register(
         state.database(),
         &state.env,
         &claims,
@@ -226,24 +162,7 @@ pub(in crate::api) async fn create_credential(
         webauthn::CredentialUse::Login,
     )
     .await?;
-    let credentials = list_response(&state, &claims.sub).await?;
-    let can_use_passkey_unlock = saved.prf_status == 0;
-    Ok(ApiResponse(SavedCredentialResponse {
-        credentials,
-        id: saved.slot.to_string(),
-        name: saved.name,
-        success: true,
-        prf_status: saved.prf_status,
-        can_use_passkey_unlock,
-        requires_password_login: !can_use_passkey_unlock,
-        encrypted_user_key: saved.encrypted_user_key,
-        encrypted_public_key: saved.encrypted_public_key,
-        message: if can_use_passkey_unlock {
-            "Passkey saved with PRF unlock enabled."
-        } else {
-            "Passkey saved. Vault unlock will fall back to the master password."
-        },
-    }))
+    Ok(ApiResponse(list_response(&state, &claims.sub).await?))
 }
 
 #[worker::send]
@@ -268,7 +187,7 @@ pub(in crate::api) async fn update_credential(
     claims: Claims,
     State(state): State<Arc<AppState>>,
     Json(data): Json<UpdateWebauthnCredentialRequest>,
-) -> AppResult<ApiResponse<UpdatedCredentialResponse>> {
+) -> AppResult<ApiResponse<ListResponse<CredentialResponse>>> {
     let id = data.credential_id()?;
     update_credential_with_id(&state, claims, &id, data).await
 }
@@ -279,7 +198,7 @@ pub(in crate::api) async fn update_credential_by_id(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
     Json(data): Json<UpdateWebauthnCredentialRequest>,
-) -> AppResult<ApiResponse<UpdatedCredentialResponse>> {
+) -> AppResult<ApiResponse<ListResponse<CredentialResponse>>> {
     update_credential_with_id(&state, claims, &id, data).await
 }
 
@@ -288,12 +207,9 @@ async fn update_credential_with_id(
     claims: Claims,
     id: &str,
     data: UpdateWebauthnCredentialRequest,
-) -> AppResult<ApiResponse<UpdatedCredentialResponse>> {
+) -> AppResult<ApiResponse<ListResponse<CredentialResponse>>> {
     webauthn::update_credential(state.database(), &state.env, &claims, id, data).await?;
-    Ok(ApiResponse(UpdatedCredentialResponse {
-        credentials: list_response(state, &claims.sub).await?,
-        success: true,
-    }))
+    Ok(ApiResponse(list_response(state, &claims.sub).await?))
 }
 
 #[worker::send]
@@ -312,33 +228,6 @@ pub(in crate::api) async fn delete_credential(
     target?.delete(db, &authorization, None).await?;
     admin_notify::emit(&state.env, Event::WebauthnCredentialDelete, &claims.sub).await;
     Ok(ApiResponse(EmptyObject {}))
-}
-
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub(in crate::api) struct PrfProbe {
-    supports_prf: Option<bool>,
-}
-
-#[worker::send]
-pub(in crate::api) async fn prf_probe(
-    _claims: Claims,
-    Json(probe): Json<PrfProbe>,
-) -> ApiResponse<PrfProbeResponse> {
-    let supported = probe.supports_prf.unwrap_or(false);
-    ApiResponse(PrfProbeResponse {
-        supports_prf: supported,
-        can_use_passkey_unlock: supported,
-        requires_password_login: !supported,
-        required_for_unlock: true,
-        fallback: "master_password",
-        message: if supported {
-            "PRF is available. You can continue passkey unlock setup."
-        } else {
-            "PRF is unavailable. Vault unlock will fall back to the master \
-             password."
-        },
-    })
 }
 
 #[worker::send]

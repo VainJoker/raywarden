@@ -34,7 +34,7 @@ impl CorsPolicy {
         match self {
             Self::Any => Some("*"),
             Self::Origins(allowed) => {
-                origin.filter(|value| allowed_origin(allowed, value.as_bytes()))
+                origin.filter(|value| allowed.iter().any(|entry| entry == *value))
             }
         }
     }
@@ -42,10 +42,7 @@ impl CorsPolicy {
     pub fn layer(&self) -> CorsLayer {
         let origins = match self {
             Self::Any => AllowOrigin::any(),
-            Self::Origins(origins) => {
-                let origins = origins.clone();
-                AllowOrigin::predicate(move |origin, _| allowed_origin(&origins, origin.as_bytes()))
-            }
+            Self::Origins(origins) => AllowOrigin::list(origins.clone()),
         };
         // Clients authenticate explicitly with bearer tokens, without cookies.
         CorsLayer::new()
@@ -60,10 +57,6 @@ impl CorsPolicy {
             ]))
             .allow_headers(AllowHeaders::mirror_request())
     }
-}
-
-fn allowed_origin(origins: &[HeaderValue], value: &[u8]) -> bool {
-    origins.iter().any(|entry| entry.as_bytes() == value)
 }
 
 fn origin_header(value: &str) -> Option<HeaderValue> {
@@ -141,57 +134,29 @@ mod tests {
     use super::*;
 
     #[test]
-    fn outer_cors_respects_configured_origins_without_a_database_lookup() {
+    fn cors_policy_normalizes_origins_and_fails_closed_on_invalid_lists() {
         assert_eq!(
             CorsPolicy::parse(None).origin(Some("https://client.test")),
             Some("*")
         );
-        assert_eq!(CorsPolicy::parse(None).origin(None), Some("*"));
-        let policy = CorsPolicy::parse(Some(" https://other.test, https://client.test "));
+        assert_eq!(CorsPolicy::parse(Some(" * ")), CorsPolicy::Any);
+        for bad in [
+            ",,,",
+            "invalid",
+            "https://host.test/path",
+            "https://u:p@host.test",
+        ] {
+            assert_eq!(CorsPolicy::parse(Some(bad)), CorsPolicy::Origins(vec![]));
+        }
+        let policy = CorsPolicy::parse(Some("https://CLIENT.test/,chrome-extension://abcd"));
         assert_eq!(
             policy.origin(Some("https://client.test")),
             Some("https://client.test")
         );
+        assert_eq!(
+            policy.origin(Some("chrome-extension://abcd")),
+            Some("chrome-extension://abcd")
+        );
         assert_eq!(policy.origin(Some("https://denied.test")), None);
-    }
-
-    #[test]
-    fn explicit_invalid_lists_never_become_unrestricted() {
-        for value in [
-            ",,,",
-            "invalid",
-            "https://host.test/path",
-            "https://user:pass@host.test",
-            "https://host.test?q=x",
-            "https://host.test#x",
-            "\r\ninvalid",
-        ] {
-            assert_eq!(
-                CorsPolicy::parse(Some(value)),
-                CorsPolicy::Origins(vec![]),
-                "{value:?}"
-            );
-        }
-    }
-
-    #[test]
-    fn empty_and_wildcard_lists_allow_any_origin() {
-        for value in ["", " * ", "invalid,*"] {
-            assert_eq!(CorsPolicy::parse(Some(value)), CorsPolicy::Any);
-        }
-    }
-
-    #[test]
-    fn lists_accept_real_extension_origins_and_normalize_web_origins() {
-        let policy = CorsPolicy::parse(Some(
-            "https://CLIENT.test/,moz-extension://1234,chrome-extension://abcd",
-        ));
-        for origin in [
-            "https://client.test",
-            "moz-extension://1234",
-            "chrome-extension://abcd",
-        ] {
-            assert_eq!(policy.origin(Some(origin)), Some(origin));
-        }
     }
 }

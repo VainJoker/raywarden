@@ -2,6 +2,7 @@
 use serde::{Deserialize, Serialize};
 use worker::{D1Database, D1PreparedStatement, query};
 
+use super::json_batch::{BatchPush, JsonBatch};
 use crate::{
     errors::{AppError, AppResult, DatabaseError},
     infra::db::{self, IntoD1Param},
@@ -58,27 +59,15 @@ impl CipherRow {
         newest_first: bool,
         after: Option<&PageCursor>,
     ) -> AppResult<Page<Self>> {
-        PageQuery {
-            table: "ciphers",
-            filter: "user_id=? AND (?=1 OR cipher_type!=5)",
-            text_columns: &[
-                "id",
-                "user_id",
-                "organization_id",
-                "data",
-                "folder_id",
-                "deleted_at",
-                "archived_at",
-                "created_at",
-                "updated_at",
-            ],
-            order: if newest_first {
+        Self::page_query(
+            "user_id=? AND (?=1 OR cipher_type!=5)",
+            if newest_first {
                 PageOrder::NewestFirst
             } else {
                 PageOrder::RowId
             },
-            related_bytes: include_attachments.then_some(ATTACHMENT_METADATA_BYTES),
-        }
+            include_attachments.then_some(ATTACHMENT_METADATA_BYTES),
+        )
         .fetch(
             db,
             &db::d1_params![user_id, i32::from(include_ssh_keys)],
@@ -92,9 +81,23 @@ impl CipherRow {
         user_id: &str,
         ids_json: &str,
     ) -> AppResult<Vec<Self>> {
+        Self::page_query(
+            "user_id=? AND id IN (SELECT value FROM json_each(?))",
+            PageOrder::RowId,
+            None,
+        )
+        .fetch_all(db, &db::d1_params![user_id, ids_json])
+        .await
+    }
+
+    const fn page_query(
+        filter: &'static str,
+        order: PageOrder,
+        related_bytes: Option<&'static str>,
+    ) -> PageQuery {
         PageQuery {
             table: "ciphers",
-            filter: "user_id=? AND id IN (SELECT value FROM json_each(?))",
+            filter,
             text_columns: &[
                 "id",
                 "user_id",
@@ -106,11 +109,9 @@ impl CipherRow {
                 "created_at",
                 "updated_at",
             ],
-            order: PageOrder::RowId,
-            related_bytes: None,
+            order,
+            related_bytes,
         }
-        .fetch_all(db, &db::d1_params![user_id, ids_json])
-        .await
     }
 
     pub(crate) fn save_statement(
@@ -118,42 +119,23 @@ impl CipherRow {
         row: &Self,
         update: bool,
     ) -> AppResult<D1PreparedStatement> {
-        if update {
-            Ok(db
-                .prepare(
-                    "UPDATE ciphers SET \
-                     cipher_type=?1,data=?2,is_favorite=?3,folder_id=?4,\
-                     archived_at=?5,updated_at=?6 WHERE id=?7 AND user_id=?8",
-                )
-                .bind(&db::d1_params![
-                    row.cipher_type,
-                    row.data,
-                    row.is_favorite,
-                    row.folder_id,
-                    row.archived_at,
-                    row.updated_at,
-                    row.id,
-                    row.user_id,
-                ])?)
+        let sql = if update {
+            "UPDATE ciphers SET cipher_type=?3,data=?4,is_favorite=?5,folder_id=?6,
+             archived_at=?7,updated_at=?8 WHERE id=?1 AND user_id=?2"
         } else {
-            Ok(db
-                .prepare(
-                    "INSERT INTO \
-                     ciphers(id,user_id,organization_id,cipher_type,data,\
-                     is_favorite,folder_id,archived_at,created_at,updated_at) \
-                     VALUES(?1,?2,NULL,?3,?4,?5,?6,?7,?8,?8)",
-                )
-                .bind(&db::d1_params![
-                    row.id,
-                    row.user_id,
-                    row.cipher_type,
-                    row.data,
-                    row.is_favorite,
-                    row.folder_id,
-                    row.archived_at,
-                    row.updated_at,
-                ])?)
-        }
+            "INSERT INTO ciphers(id,user_id,organization_id,cipher_type,data,is_favorite,
+             folder_id,archived_at,created_at,updated_at) VALUES(?1,?2,NULL,?3,?4,?5,?6,?7,?8,?8)"
+        };
+        Ok(db.prepare(sql).bind(&db::d1_params![
+            row.id,
+            row.user_id,
+            row.cipher_type,
+            row.data,
+            row.is_favorite,
+            row.folder_id,
+            row.archived_at,
+            row.updated_at,
+        ])?)
     }
 
     pub(crate) fn partial_statement(
@@ -187,7 +169,7 @@ impl CipherRow {
             .bind(&db::d1_params![user_id])?
             .first(Some("updated_at"))
             .await?
-            .ok_or(AppError::Internal)?;
+            .ok_or_else(|| AppError::internal("Vault owner account is missing"))?;
         let snapshot = guard(
             db,
             "EXISTS(SELECT 1 FROM users WHERE id=?1 AND updated_at IS ?2)",
@@ -232,7 +214,7 @@ impl CipherRow {
     }
 }
 
-#[derive(PartialEq)]
+#[derive(Clone, PartialEq)]
 pub(crate) enum CipherMutation {
     SoftDelete,
     Restore,
@@ -242,45 +224,9 @@ pub(crate) enum CipherMutation {
     Unarchive,
 }
 
-const SNAPSHOT_GROUP_BYTES: usize = 1_900_000;
-const SNAPSHOT_GROUP_ROWS: usize = 200;
-
-struct SnapshotGroup {
-    json: String,
-    rows: usize,
-}
-
-impl SnapshotGroup {
-    fn new() -> Self {
-        Self {
-            json: String::from("["),
-            rows: 0,
-        }
-    }
-
-    fn push(&mut self, row: &str) -> Option<String> {
-        // Reserve the closing bracket and one separator for the incoming row.
-        let completed = if self.rows >= SNAPSHOT_GROUP_ROWS
-            || self.json.len() + row.len() + 2 > SNAPSHOT_GROUP_BYTES
-        {
-            self.take()
-        } else {
-            None
-        };
-        self.json.push_str(row);
-        self.json.push(',');
-        self.rows += 1;
-        completed
-    }
-
-    fn take(&mut self) -> Option<String> {
-        if self.rows == 0 {
-            return None;
-        }
-        self.rows = 0;
-        self.json.pop();
-        self.json.push(']');
-        Some(std::mem::replace(&mut self.json, String::from("[")))
+impl CipherMutation {
+    pub(crate) const fn returns_rows(&self) -> bool {
+        matches!(self, Self::Restore | Self::Archive | Self::Unarchive)
     }
 }
 
@@ -290,7 +236,7 @@ pub(crate) fn selected_snapshot_guards(
     rows: &[CipherRow],
 ) -> AppResult<Vec<D1PreparedStatement>> {
     let mut guards = Vec::new();
-    let mut group = SnapshotGroup::new();
+    let mut group = JsonBatch::new(200);
     let group_guard = |encoded: &str| {
         guard(
             db,
@@ -309,13 +255,18 @@ pub(crate) fn selected_snapshot_guards(
         )
     };
     for row in rows {
-        let encoded = serde_json::to_string(row).map_err(AppError::internal_error)?;
-        if encoded.len() > SNAPSHOT_GROUP_BYTES {
-            guards.push(cipher_snapshot_guard(db, row)?);
-            continue;
-        }
-        if let Some(completed) = group.push(&encoded) {
-            guards.push(group_guard(&completed)?);
+        let encoded = serde_json::to_string(row).map_err(AppError::internal_json(
+            "Failed to serialize cipher snapshot",
+        ))?;
+        match group.push(&encoded) {
+            BatchPush::Queued(completed) => {
+                if let Some(completed) = completed {
+                    guards.push(group_guard(&completed)?);
+                }
+            }
+            BatchPush::Oversized => {
+                guards.push(cipher_snapshot_guard(db, row)?);
+            }
         }
     }
     if let Some(last) = group.take() {
@@ -332,25 +283,14 @@ pub(crate) fn selected_mutation(
     now: &str,
 ) -> AppResult<D1PreparedStatement> {
     let suffix = " WHERE user_id=?1 AND id IN(SELECT value FROM json_each(?2))";
+    let update = |change: &str| format!("UPDATE ciphers SET {change},updated_at=?3{suffix}");
     let query = match kind {
-        CipherMutation::SoftDelete => {
-            format!("UPDATE ciphers SET deleted_at=?3,updated_at=?3{suffix}")
-        }
-        CipherMutation::Restore => {
-            format!("UPDATE ciphers SET deleted_at=NULL,updated_at=?3{suffix}")
-        }
-        CipherMutation::Archive => {
-            format!("UPDATE ciphers SET archived_at=?3,updated_at=?3{suffix}")
-        }
-        CipherMutation::Unarchive => {
-            format!("UPDATE ciphers SET archived_at=NULL,updated_at=?3{suffix}")
-        }
-        CipherMutation::Move { .. } => {
-            format!("UPDATE ciphers SET folder_id=?4,updated_at=?3{suffix}")
-        }
-        CipherMutation::HardDelete => {
-            format!("DELETE FROM ciphers{suffix}")
-        }
+        CipherMutation::SoftDelete => update("deleted_at=?3"),
+        CipherMutation::Restore => update("deleted_at=NULL"),
+        CipherMutation::Archive => update("archived_at=?3"),
+        CipherMutation::Unarchive => update("archived_at=NULL"),
+        CipherMutation::Move { .. } => update("folder_id=?4"),
+        CipherMutation::HardDelete => format!("DELETE FROM ciphers{suffix}"),
     };
     let mut values = vec![user_id.into(), ids_json.into()];
     if kind != &CipherMutation::HardDelete {
@@ -360,27 +300,4 @@ pub(crate) fn selected_mutation(
         values.push(folder_id.to_d1_param());
     }
     Ok(db.prepare(query).bind(&values)?)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn snapshot_groups_respect_row_and_byte_limits() {
-        let mut group = SnapshotGroup::new();
-        for _ in 0..SNAPSHOT_GROUP_ROWS {
-            assert!(group.push("0").is_none());
-        }
-        let group_json = group.push("1").expect("full row group");
-        let group_rows: Vec<i32> = serde_json::from_str(&group_json).expect("valid snapshot array");
-        assert_eq!(group_rows, vec![0; SNAPSHOT_GROUP_ROWS]);
-        assert_eq!(group.take().as_deref(), Some("[1]"));
-
-        let row = format!("\"{}\"", "x".repeat(SNAPSHOT_GROUP_BYTES - 7));
-        assert!(group.push(&row).is_none());
-        assert!(group.push("0").is_none());
-        assert!(group.push("1").is_some());
-        assert_eq!(group.take().as_deref(), Some("[1]"));
-    }
 }

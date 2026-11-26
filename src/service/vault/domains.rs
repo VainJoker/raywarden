@@ -1,7 +1,6 @@
 //! Equivalent-domain request data and shared upstream cache refresh.
 use std::collections::HashSet;
 
-use futures_util::StreamExt;
 use log::warn;
 use serde::{Deserialize, Serialize};
 use serde_json::value::RawValue;
@@ -31,24 +30,28 @@ struct GlobalDomain {
 }
 
 fn validated_global_domains(raw: &str) -> AppResult<String> {
-    let groups: Vec<GlobalDomain> = serde_json::from_str(raw).map_err(AppError::upstream_error)?;
+    let groups: Vec<GlobalDomain> = serde_json::from_str(raw).map_err(|error| {
+        AppError::upstream_with_context("Global domains dataset is malformed", error)
+    })?;
     if groups.is_empty() {
-        return Err(AppError::upstream_error("Global domains dataset is empty"));
+        return Err(AppError::upstream("Global domains dataset is empty"));
     }
     let mut types = HashSet::with_capacity(groups.len());
     for group in &groups {
         if group.type_id < 0 || !types.insert(group.type_id) {
-            return Err(AppError::upstream_error(
+            return Err(AppError::upstream(
                 "Invalid or duplicate global domain type",
             ));
         }
         if group.domains.is_empty() || group.domains.iter().any(|domain| domain.trim().is_empty()) {
-            return Err(AppError::upstream_error(
+            return Err(AppError::upstream(
                 "Global domain group contains no usable domains",
             ));
         }
     }
-    serde_json::to_string(&groups).map_err(AppError::upstream_error)
+    serde_json::to_string(&groups).map_err(|error| {
+        AppError::upstream_with_context("Failed to encode global domains dataset", error)
+    })
 }
 
 #[derive(Debug, Deserialize)]
@@ -70,10 +73,10 @@ pub(crate) async fn refresh_global_domains(db: &D1Database) -> AppResult<()> {
     let signal = AbortSignal::from(web_sys::AbortSignal::timeout_with_u32(5_000));
     let mut response = Fetch::Request(request).send_with_signal(&signal).await?;
     if !(200..300).contains(&response.status_code()) {
-        return Err(AppError::upstream_error(format_args!(
-            "Global domains upstream returned HTTP {}",
-            response.status_code()
-        )));
+        return Err(AppError::upstream_with_context(
+            "Global domains upstream returned a non-success HTTP status",
+            format_args!("HTTP {}", response.status_code()),
+        ));
     }
     let raw = read_bounded_upstream_text(&mut response, MAX_GLOBAL_DOMAINS_BYTES).await?;
     let groups = validated_global_domains(&raw)?;
@@ -90,28 +93,24 @@ async fn read_bounded_upstream_text(
     response: &mut worker::Response,
     max_bytes: usize,
 ) -> AppResult<String> {
+    let oversized = || AppError::upstream("Global domains upstream response exceeds size limit");
     if response
         .headers()
         .get("content-length")?
         .and_then(|value| value.trim().parse::<usize>().ok())
         .is_some_and(|length| length > max_bytes)
     {
-        return Err(AppError::upstream_error(
-            "Global domains upstream response exceeds size limit",
-        ));
+        return Err(oversized());
     }
-    let mut stream = response.stream()?;
-    let mut bytes = Vec::new();
-    while let Some(chunk) = stream.next().await {
-        let chunk = chunk?;
-        if chunk.len() > max_bytes - bytes.len() {
-            return Err(AppError::upstream_error(
-                "Global domains upstream response exceeds size limit",
-            ));
-        }
-        bytes.extend_from_slice(&chunk);
-    }
-    String::from_utf8(bytes).map_err(AppError::upstream_error)
+    let bytes = crate::utils::collect_bounded(response.stream()?, max_bytes)
+        .await?
+        .ok_or_else(oversized)?;
+    String::from_utf8(bytes).map_err(|error| {
+        AppError::upstream_with_context(
+            "Global domains upstream response is not valid UTF-8",
+            error,
+        )
+    })
 }
 
 async fn global_equivalent_domains_json(
@@ -218,11 +217,14 @@ pub async fn update_settings(
     let equivalent_domains = payload.equivalent_domains.unwrap_or_default();
 
     let excluded_globals_json = serde_json::to_string(&excluded_globals).map_err(|err| {
-        log::warn!("Failed to serialize excluded globals: {err}");
+        log::warn!("Failed to serialize excluded globals: {:?}", err.classify());
         AppError::Params("Invalid excluded globals".into())
     })?;
     let equivalent_domains_json = serde_json::to_string(&equivalent_domains).map_err(|err| {
-        log::warn!("Failed to serialize equivalent domains: {err}");
+        log::warn!(
+            "Failed to serialize equivalent domains: {:?}",
+            err.classify()
+        );
         AppError::Params("Invalid equivalent domains".into())
     })?;
 

@@ -1,9 +1,9 @@
 //! File-deletion retries shared by vault, Send and account workflows.
 use bytes::Bytes;
 use futures_util::Stream;
-use worker::{D1Database, Env};
+use worker::{D1Database, D1PreparedStatement, Env};
 
-pub(crate) use crate::models::storage::{expire_stages, remove_stage, stage_guard};
+pub(crate) use crate::models::storage::expire_stages;
 use crate::{
     errors::{AppError, AppResult},
     infra::storage::{Storage, StorageWriteError},
@@ -43,12 +43,13 @@ impl<'a> StagedObject<'a> {
     }
 
     pub(crate) fn size(&self) -> AppResult<u64> {
-        self.written_bytes.ok_or(AppError::Internal)
+        self.written_bytes
+            .ok_or_else(|| AppError::internal("Staged object size read before upload completed"))
     }
 
     pub(crate) const fn ensure_unwritten(&self) -> AppResult<()> {
         if self.written_bytes.is_some() {
-            return Err(AppError::Internal);
+            return Err(AppError::internal("Staged object has already been written"));
         }
         Ok(())
     }
@@ -80,10 +81,30 @@ impl<'a> StagedObject<'a> {
         }
     }
 
-    pub(crate) async fn discard_written(&self) {
-        if self.written_bytes.is_some() {
+    /// Publish the object and remove its stage in one transaction. On failure
+    /// the cleanup outbox preserves referenced objects if D1 already committed.
+    pub(crate) async fn publish(
+        &self,
+        prepare: impl AsyncFnOnce(
+            &Self,
+        )
+            -> AppResult<(Vec<D1PreparedStatement>, Vec<D1PreparedStatement>)>,
+        commit: impl AsyncFnOnce(
+            Vec<D1PreparedStatement>,
+            Vec<D1PreparedStatement>,
+        ) -> AppResult<String>,
+    ) -> AppResult<String> {
+        let result = async {
+            let (mut guards, mut writes) = prepare(self).await?;
+            guards.push(storage::stage_guard(self.db, self.key())?);
+            writes.push(storage::remove_stage(self.db, self.key())?);
+            commit(guards, writes).await
+        }
+        .await;
+        if result.is_err() && self.written_bytes.is_some() {
             discard_staged_object(self.env, self.db, self.key()).await;
         }
+        result
     }
 }
 
@@ -96,30 +117,24 @@ async fn discard_staged_object(env: &Env, db: &D1Database, key: &str) {
     match queued {
         Ok(true) => {
             if let Err(error) = process_batch(env, db).await {
-                log::warn!("Staged file cleanup deferred: {error}");
+                log::warn!("Staged file cleanup deferred: {error:?}");
             }
         }
         Ok(false) => {}
         Err(error) => log::warn!(
             "Cannot confirm staged object is unreferenced; retaining bytes: \
-             {error}"
+             {error:?}"
         ),
     }
 }
 
-/// Process at most 128 jobs. Failed backend deletes never acknowledge
-/// uncompleted keys; completed prefixes are acknowledged with generation guards.
+/// Acknowledge at most 128 jobs after R2 confirms the batch deletion.
 pub async fn process_batch(env: &Env, db: &D1Database) -> AppResult<u32> {
     let batch = storage::pending_batch(db).await?;
     let keys = batch.object_keys();
     if keys.is_empty() {
         return Ok(0);
     }
-    let storage = Storage::from_env(env)?;
-    let (completed, delete_error) = storage.delete_many(&keys).await;
-    let acknowledged = batch.acknowledge_prefix(completed).await?;
-    if let Some(error) = delete_error {
-        return Err(error);
-    }
-    Ok(acknowledged)
+    Storage::from_env(env)?.delete_batch(keys).await?;
+    batch.acknowledge().await
 }

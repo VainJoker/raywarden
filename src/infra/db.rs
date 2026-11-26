@@ -57,11 +57,43 @@ copy_params!(bool, i32, u32, f64);
 /// Convert a signed 64-bit integer to an exact IEEE-754 number for D1 binding.
 pub(crate) fn safe_int(value: i64) -> AppResult<f64> {
     if !(-MAX_SAFE_D1_INT..=MAX_SAFE_D1_INT).contains(&value) {
-        return Err(AppError::internal_error(
+        return Err(AppError::internal(
             "Integer cannot be bound to D1 without precision loss",
         ));
     }
     Ok(value as f64)
+}
+
+/// Convert an in-memory collection count to an exact IEEE-754 number for D1 binding.
+pub(crate) fn safe_usize(value: usize) -> AppResult<f64> {
+    let value = i64::try_from(value)
+        .map_err(|_error| AppError::internal("Collection size exceeds supported D1 integer"))?;
+    safe_int(value)
+}
+
+/// Convert a scalar JSON value into a checked D1 parameter without rounding
+/// wide integers through IEEE-754 `f64`.
+pub(crate) fn json_scalar_param(value: &Value, context: &'static str) -> AppResult<JsValue> {
+    match value {
+        Value::Null => Ok(JsValue::NULL),
+        Value::String(text) => Ok(text.as_str().to_d1_param()),
+        Value::Bool(flag) => Ok(f64::from(u8::from(*flag)).into()),
+        Value::Number(num) => {
+            let number = if let Some(int) = num.as_i64() {
+                safe_int(int)?
+            } else if let Some(uint) = num.as_u64() {
+                let int = i64::try_from(uint).map_err(|_error| {
+                    AppError::internal("Integer cannot be bound to D1 without precision loss")
+                })?;
+                safe_int(int)?
+            } else {
+                num.as_f64()
+                    .ok_or_else(|| AppError::internal("Numeric D1 binding out of f64 range"))?
+            };
+            Ok(JsValue::from_f64(number))
+        }
+        Value::Array(_) | Value::Object(_) => Err(AppError::internal(context)),
+    }
 }
 
 macro_rules! d1_params {
@@ -77,22 +109,48 @@ pub(crate) fn changes_count(result: &D1Result) -> WorkerResult<usize> {
 }
 
 /// Resolve the application's D1 binding for the current Worker environment.
-pub(crate) fn binding(env: &Env) -> WorkerResult<D1Database> {
-    env.d1(D1_BINDING)
+pub(crate) fn binding(env: &Env) -> AppResult<D1Database> {
+    env.d1(D1_BINDING).map_err(|error| {
+        AppError::worker_with_context("D1 database binding DB is missing or invalid", error)
+    })
 }
 
 pub(crate) async fn query_first<T: DeserializeOwned>(
-    query: D1PreparedStatement,
+    query: WorkerResult<D1PreparedStatement>,
     column: Option<&str>,
-    context: &str,
+    context: &'static str,
 ) -> AppResult<Option<T>> {
-    run_query(query.first(column), context).await
+    run_query(async { query?.first(column).await }, context).await
+}
+
+pub(crate) async fn query_run(
+    query: WorkerResult<D1PreparedStatement>,
+    context: &'static str,
+) -> AppResult<D1Result> {
+    run_query(async { query?.run().await }, context).await
 }
 
 pub(crate) async fn query_all<T: DeserializeOwned>(
     query: D1PreparedStatement,
 ) -> AppResult<Vec<T>> {
     decode_results(&query.all().await?)
+}
+
+pub(crate) async fn query_results<T: DeserializeOwned>(
+    query: WorkerResult<D1PreparedStatement>,
+    context: &'static str,
+) -> AppResult<Vec<T>> {
+    Ok(run_query(async { query?.all().await }, context)
+        .await?
+        .results()?)
+}
+
+pub(crate) async fn run_batch(
+    db: &D1Database,
+    writes: Vec<D1PreparedStatement>,
+    context: &'static str,
+) -> AppResult<Vec<D1Result>> {
+    run_query(db.batch(writes), context).await
 }
 
 /// Decode rows explicitly: a malformed stored row fails the entire read.
@@ -128,7 +186,7 @@ pub(crate) fn decode_row<T: serde::de::DeserializeOwned>(
     })
 }
 
-pub async fn run_query<F, T>(query: F, context: &str) -> AppResult<T>
+pub async fn run_query<F, T>(query: F, context: &'static str) -> AppResult<T>
 where
     F: Future<Output = WorkerResult<T>>,
 {
@@ -147,10 +205,14 @@ mod tests {
     fn invalid_rows_report_context_without_stored_values() {
         let error = decode_rows::<u32>(vec![json!(7), json!("private row value")])
             .expect_err("invalid row must fail the read");
-        let message = error.to_string();
-        assert!(message.contains("D1 row 2: could not deserialize u32"));
-        assert!(message.contains("row does not match the expected schema"));
-        assert!(!message.contains("private row value"));
+        assert_eq!(
+            error.to_string(),
+            "Internal server error: Stored database record does not match expected schema"
+        );
+        let debug_text = format!("{error:?}");
+        assert!(debug_text.contains("D1 row 2: could not deserialize u32"));
+        assert!(debug_text.contains("row does not match the expected schema"));
+        assert!(!debug_text.contains("private row value"));
     }
 
     #[test]

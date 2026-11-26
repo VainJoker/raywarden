@@ -27,4 +27,11 @@ impl AppState {
     fn domain(&self) -> &str {
         &self.config.domain
     }
+
+    const fn send_owner<'a>(
+        &'a self,
+        claims: &'a crate::service::identity::session::Claims,
+    ) -> crate::service::send::SendOwner<'a> {
+        crate::service::send::SendOwner::new(&self.database, &self.env, claims)
+    }
 }

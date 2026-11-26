@@ -20,13 +20,12 @@ pub struct CleanupBatch<'a> {
 }
 
 pub async fn register_stage(db: &D1Database, key: &str) -> AppResult<()> {
-    db::run_query(
+    db::query_run(
         db.prepare(
             "INSERT INTO storage_upload_stages(object_key, expires_at) VALUES \
              (?1, strftime('%Y-%m-%dT%H:%M:%fZ', 'now', '+1 day'))",
         )
-        .bind(&db::d1_params![key])?
-        .run(),
+        .bind(&db::d1_params![key]),
         "Failed to register staged file",
     )
     .await?;
@@ -49,18 +48,26 @@ pub fn remove_stage(db: &D1Database, key: &str) -> AppResult<D1PreparedStatement
 }
 
 pub async fn expire_stages(db: &D1Database) -> AppResult<()> {
-    db::run_query(
-        db.prepare(
+    db::query_run(
+        Ok(db.prepare(
             "DELETE FROM storage_upload_stages WHERE object_key IN (SELECT \
              object_key FROM storage_upload_stages WHERE \
              julianday(expires_at)<=julianday('now') ORDER BY \
              julianday(expires_at), object_key LIMIT 128)",
-        )
-        .run(),
+        )),
         "Failed to expire staged files",
     )
     .await?;
     Ok(())
+}
+
+fn unreferenced_sql(comparison: &str) -> String {
+    format!(
+        "NOT EXISTS (SELECT 1 FROM attachments WHERE \
+         COALESCE(storage_key, cipher_id || '/' || id) {comparison}) AND NOT EXISTS (\
+         SELECT 1 FROM sends WHERE file_id IS NOT NULL AND \
+         COALESCE(storage_key, 'sends/' || id || '/' || file_id) {comparison})"
+    )
 }
 
 pub async fn enqueue_if_unreferenced(db: &D1Database, key: &str, now: &str) -> AppResult<bool> {
@@ -76,15 +83,12 @@ pub async fn enqueue_if_unreferenced(db: &D1Database, key: &str, now: &str) -> A
     // Publication may have removed the stage before its acknowledgement was
     // lost. A late upload can also finish after its stage has expired.
     let result = db
-        .prepare(
-            "INSERT INTO storage_cleanup_jobs(object_key, created_at) SELECT \
-             ?1, ?2 WHERE NOT EXISTS (SELECT 1 FROM attachments WHERE \
-             COALESCE(storage_key, cipher_id || '/' || id) = ?1) AND NOT \
-             EXISTS (SELECT 1 FROM sends WHERE file_id IS NOT NULL AND \
-             COALESCE(storage_key, 'sends/' || id || '/' || file_id) = ?1) ON \
-             CONFLICT(object_key) DO UPDATE SET \
+        .prepare(format!(
+            "INSERT INTO storage_cleanup_jobs(object_key, created_at) SELECT ?1, ?2 WHERE {} \
+             ON CONFLICT(object_key) DO UPDATE SET \
              created_at=excluded.created_at, generation=excluded.generation",
-        )
+            unreferenced_sql("= ?1")
+        ))
         .bind(&db::d1_params![key, now])?
         .run()
         .await?;
@@ -94,14 +98,11 @@ pub async fn enqueue_if_unreferenced(db: &D1Database, key: &str, now: &str) -> A
 pub async fn pending_batch(db: &D1Database) -> AppResult<CleanupBatch<'_>> {
     // A single-value IN lets SQLite seek the expression indexes with an outer key.
     let jobs = db
-        .prepare(
-            "SELECT object_key, generation FROM storage_cleanup_jobs jobs \
-             WHERE NOT EXISTS (SELECT 1 FROM attachments WHERE \
-             COALESCE(storage_key, cipher_id || '/' || id) IN (jobs.object_key)) \
-             AND NOT EXISTS (SELECT 1 FROM sends WHERE file_id IS NOT NULL \
-             AND COALESCE(storage_key, 'sends/' || id || '/' || file_id) \
-             IN (jobs.object_key)) ORDER BY created_at, object_key LIMIT 128",
-        )
+        .prepare(format!(
+            "SELECT object_key, generation FROM storage_cleanup_jobs jobs WHERE {} \
+             ORDER BY created_at, object_key LIMIT 128",
+            unreferenced_sql("IN (jobs.object_key)")
+        ))
         .all()
         .await?
         .results::<CleanupJobRow>()?;
@@ -116,11 +117,10 @@ impl CleanupBatch<'_> {
             .collect()
     }
 
-    pub async fn acknowledge_prefix(mut self, count: usize) -> AppResult<u32> {
-        self.jobs.truncate(count);
-        if self.jobs.is_empty() {
-            return Ok(0);
-        }
+    pub async fn acknowledge(self) -> AppResult<u32> {
+        let jobs = serde_json::to_string(&self.jobs).map_err(AppError::internal_json(
+            "Failed to serialize storage cleanup jobs",
+        ))?;
         let result = self
             .db
             .prepare(
@@ -128,9 +128,7 @@ impl CleanupBatch<'_> {
                  generation) IN (SELECT json_extract(value, '$.object_key'), \
                  json_extract(value, '$.generation') FROM json_each(?1))",
             )
-            .bind(&[serde_json::to_string(&self.jobs)
-                .map_err(AppError::internal_error)?
-                .into()])?
+            .bind(&db::d1_params![jobs])?
             .run()
             .await?;
         Ok(db::changes_count(&result)? as u32)

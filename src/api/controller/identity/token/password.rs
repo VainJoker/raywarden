@@ -3,7 +3,7 @@ use worker::{D1Database, D1PreparedStatement};
 
 use super::{LoginDevice, TokenExchange, ensure_account_snapshot, form::PasswordGrant};
 use crate::{
-    errors::{AppError, AppResult, AuthError},
+    errors::{AppError, AppResult},
     models::identity::{
         auth_request::AuthRequestRow,
         device::DeviceRow,
@@ -107,15 +107,10 @@ impl TokenExchange<'_> {
         } else {
             None
         };
-        let needs_migration = if auth_request.is_none() {
-            let verification = user::verify_master_password(&user, password_hash).await?;
-            if !verification.is_valid() {
-                return Err(AppError::Auth(AuthError::InvalidPassword));
-            }
-            verification.needs_migration()
-        } else {
-            false
-        };
+        let needs_migration = auth_request.is_none()
+            && user::require_master_password(&user, password_hash)
+                .await?
+                .needs_migration();
 
         let second_factor = self
             .verify_password_second_factor(payload, &user, &device.id)
@@ -292,7 +287,9 @@ impl TokenExchange<'_> {
                     )
                     .await?);
             }
-            let row = remembered.row.ok_or(AppError::Internal)?;
+            let row = remembered.row.ok_or_else(|| {
+                AppError::internal("Verified remembered device record is missing")
+            })?;
             policy.remembered = Some((row.id.clone(), row.data.clone()));
             (None, remembered.prepare_renewal(Some(row))?)
         } else {

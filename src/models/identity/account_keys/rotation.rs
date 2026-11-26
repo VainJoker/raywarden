@@ -2,6 +2,7 @@
 use std::collections::HashSet;
 
 use serde_json::Value;
+use uuid::Uuid;
 use worker::{D1Database, D1PreparedStatement, query, wasm_bindgen::JsValue};
 
 use super::AccountSnapshot;
@@ -15,19 +16,6 @@ use crate::{
     },
 };
 
-const CIPHERS: &[&str] = &[
-    "id",
-    "user_id",
-    "organization_id",
-    "cipher_type",
-    "data",
-    "is_favorite",
-    "folder_id",
-    "deleted_at",
-    "archived_at",
-    "created_at",
-    "updated_at",
-];
 const CIPHER_TEXT_COLUMNS: &[&str] = &[
     "id",
     "user_id",
@@ -40,16 +28,6 @@ const CIPHER_TEXT_COLUMNS: &[&str] = &[
     "updated_at",
 ];
 const FOLDERS: &[&str] = &["id", "name", "created_at", "updated_at"];
-const ATTACHMENTS: &[&str] = &[
-    "id",
-    "cipher_id",
-    "file_name",
-    "file_size_bytes",
-    "encrypted_key",
-    "storage_key",
-    "created_at",
-    "updated_at",
-];
 const ATTACHMENT_TEXT_COLUMNS: &[&str] = &[
     "id",
     "cipher_id",
@@ -57,20 +35,6 @@ const ATTACHMENT_TEXT_COLUMNS: &[&str] = &[
     "encrypted_key",
     "storage_key",
     "created_at",
-    "updated_at",
-];
-const PASSKEYS: &[&str] = &[
-    "id",
-    "slot",
-    "credential_id",
-    "public_key",
-    "sign_count",
-    "credential_use",
-    "prf_status",
-    "encrypted_public_key",
-    "encrypted_user_key",
-    "encrypted_private_key",
-    "account_snapshot",
     "updated_at",
 ];
 const PASSKEY_TEXT_COLUMNS: &[&str] = &[
@@ -85,98 +49,84 @@ const PASSKEY_TEXT_COLUMNS: &[&str] = &[
     "updated_at",
 ];
 
-pub struct CollectionSnapshot {
-    table: &'static str,
-    columns: &'static [&'static str],
-    filter: &'static str,
+pub(crate) enum VaultCollection {
+    Ciphers,
+    Folders,
+    Attachments,
+    Passkeys,
+}
+
+impl VaultCollection {
+    const fn query(self) -> (PageQuery, &'static [&'static str]) {
+        let (table, text_columns, numeric_columns): (_, _, &[_]) = match self {
+            Self::Ciphers => ("ciphers", CIPHER_TEXT_COLUMNS, &[
+                "cipher_type",
+                "is_favorite",
+            ]),
+            Self::Folders => ("folders", FOLDERS, &[]),
+            Self::Attachments => ("attachments", ATTACHMENT_TEXT_COLUMNS, &["file_size_bytes"]),
+            Self::Passkeys => ("webauthn_credentials", PASSKEY_TEXT_COLUMNS, &[
+                "slot",
+                "sign_count",
+                "prf_status",
+            ]),
+        };
+        let filter = match self {
+            Self::Attachments => "cipher_id IN (SELECT id FROM ciphers WHERE user_id=?)",
+            _ => "user_id=?",
+        };
+        (
+            PageQuery {
+                table,
+                filter,
+                text_columns,
+                order: PageOrder::RowId,
+                related_bytes: None,
+            },
+            numeric_columns,
+        )
+    }
+}
+
+pub(crate) struct CollectionSnapshot {
+    query: PageQuery,
+    numeric_columns: &'static [&'static str],
     rows: Vec<Value>,
 }
-impl CollectionSnapshot {
-    pub async fn ciphers(db: &D1Database, owner: &str) -> AppResult<Self> {
-        Self::load(
-            db,
-            "ciphers",
-            CIPHERS,
-            CIPHER_TEXT_COLUMNS,
-            owner,
-            "user_id=?1",
-            "user_id=?",
-        )
-        .await
-    }
-    pub async fn folders(db: &D1Database, owner: &str) -> AppResult<Self> {
-        Self::load(
-            db,
-            "folders",
-            FOLDERS,
-            FOLDERS,
-            owner,
-            "user_id=?1",
-            "user_id=?",
-        )
-        .await
-    }
-    pub async fn attachments(db: &D1Database, owner: &str) -> AppResult<Self> {
-        Self::load(
-            db,
-            "attachments",
-            ATTACHMENTS,
-            ATTACHMENT_TEXT_COLUMNS,
-            owner,
-            "cipher_id IN (SELECT id FROM ciphers WHERE user_id=?1)",
-            "cipher_id IN (SELECT id FROM ciphers WHERE user_id=?)",
-        )
-        .await
-    }
-    pub async fn passkeys(db: &D1Database, owner: &str) -> AppResult<Self> {
-        Self::load(
-            db,
-            "webauthn_credentials",
-            PASSKEYS,
-            PASSKEY_TEXT_COLUMNS,
-            owner,
-            "user_id=?1",
-            "user_id=?",
-        )
-        .await
-    }
 
-    async fn load(
+impl CollectionSnapshot {
+    pub(crate) async fn load(
         db: &D1Database,
-        table: &'static str,
-        columns: &'static [&'static str],
-        text_columns: &'static [&'static str],
         owner: &str,
-        filter: &'static str,
-        page_filter: &'static str,
+        collection: VaultCollection,
     ) -> AppResult<Self> {
-        let query = PageQuery {
-            table,
-            filter: page_filter,
-            text_columns,
-            order: PageOrder::RowId,
-            related_bytes: None,
-        };
+        let (query, numeric_columns) = collection.query();
         let mut rows = query.fetch_all::<Value>(db, &db::d1_params![owner]).await?;
         rows.sort_by(|left, right| left["id"].as_str().cmp(&right["id"].as_str()));
         Ok(Self {
-            table,
-            columns,
-            filter,
+            query,
+            numeric_columns,
             rows,
         })
     }
+
     pub fn guards(&self, db: &D1Database, owner: &str) -> AppResult<Vec<D1PreparedStatement>> {
         let mut guards = vec![crate::models::mutation::guard(
             db,
             &format!(
                 "(SELECT COUNT(*) FROM {} WHERE {})=?2",
-                self.table, self.filter
+                self.query.table, self.query.filter
             ),
-            &db::d1_params![owner, self.rows.len() as f64],
+            &db::d1_params![owner, db::safe_usize(self.rows.len())?],
         )?];
-        let predicates = self
-            .columns
+        let columns: Vec<_> = self
+            .query
+            .text_columns
+            .iter()
+            .chain(self.numeric_columns)
+            .copied()
+            .collect();
+        let predicates = columns
             .iter()
             .enumerate()
             .map(|(i, column)| format!("{column} IS ?{}", i + 2))
@@ -184,13 +134,16 @@ impl CollectionSnapshot {
             .join(" AND ");
         let predicate = format!(
             "EXISTS(SELECT 1 FROM {} WHERE {} AND {predicates})",
-            self.table, self.filter
+            self.query.table, self.query.filter
         );
         for row in &self.rows {
-            let mut values = Vec::with_capacity(self.columns.len() + 1);
+            let mut values = Vec::with_capacity(columns.len() + 1);
             values.push(JsValue::from_str(owner));
-            for column in self.columns {
-                values.push(json_scalar_binding(&row[*column])?);
+            for column in &columns {
+                values.push(db::json_scalar_param(
+                    &row[*column],
+                    "Expected scalar JSON rotation binding",
+                )?);
             }
             guards.push(crate::models::mutation::guard(db, &predicate, &values)?);
         }
@@ -205,15 +158,6 @@ impl CollectionSnapshot {
             .filter_map(|row| row["id"].as_str())
             .collect()
     }
-}
-fn json_scalar_binding(value: &Value) -> AppResult<JsValue> {
-    Ok(match value {
-        Value::Null => JsValue::NULL,
-        Value::String(value) => value.as_str().into(),
-        Value::Number(value) => JsValue::from_f64(value.as_f64().ok_or(AppError::Internal)?),
-        Value::Bool(value) => JsValue::from_f64(f64::from(u8::from(*value))),
-        _ => return Err(AppError::Internal),
-    })
 }
 
 pub fn claim_rotation(
@@ -275,163 +219,161 @@ pub fn claim_rotation(
     ];
     Ok(db.prepare(&sql).bind(&bind)?)
 }
-pub fn cipher_write(
-    db: &D1Database,
-    owner: &str,
-    id: &str,
-    data: &str,
-    now: &str,
-    write_token: &str,
-) -> AppResult<D1PreparedStatement> {
-    Ok(query!(
-        db,
-        "UPDATE ciphers SET data=?1,updated_at=?2 WHERE id=?3 AND user_id=?4 \
-         AND EXISTS(SELECT 1 FROM users WHERE id=?4 AND \
-         account_write_token=?5)",
-        data,
-        now,
-        id,
-        owner,
-        write_token
-    )?)
-}
-#[derive(Clone, Copy)]
-pub struct RotatedAttachmentWrite<'a> {
-    pub owner: &'a str,
-    pub cipher: &'a str,
-    pub attachment_id: &'a str,
-    pub file_name: &'a str,
-    pub key: &'a str,
-    pub now: &'a str,
-    pub write_token: &'a str,
+pub(crate) struct RotationBatch<'a> {
+    pub(crate) db: &'a D1Database,
+    owner: &'a str,
+    pub(crate) now: String,
+    pub(crate) token: String,
+    pub(crate) writes: Vec<D1PreparedStatement>,
 }
 
-pub fn attachment_write(
-    db: &D1Database,
-    write: RotatedAttachmentWrite<'_>,
-) -> AppResult<D1PreparedStatement> {
-    let RotatedAttachmentWrite {
-        owner,
-        cipher,
-        attachment_id,
-        file_name,
-        key,
-        now,
-        write_token,
-    } = write;
-    Ok(query!(
-        db,
-        "UPDATE attachments SET file_name=?1,encrypted_key=?2,updated_at=?3 \
-         WHERE id=?4 AND cipher_id=?5 AND EXISTS(SELECT 1 FROM users WHERE \
-         id=?6 AND account_write_token=?7)",
-        file_name,
-        key,
-        now,
-        attachment_id,
-        cipher,
-        owner,
-        write_token
-    )?)
-}
-pub fn folder_write(
-    db: &D1Database,
-    owner: &str,
-    id: &str,
-    name: &str,
-    now: &str,
-    write_token: &str,
-) -> AppResult<D1PreparedStatement> {
-    Ok(query!(
-        db,
-        "UPDATE folders SET name=?1,updated_at=?2 WHERE id=?3 AND user_id=?4 \
-         AND EXISTS(SELECT 1 FROM users WHERE id=?4 AND \
-         account_write_token=?5)",
-        name,
-        now,
-        id,
-        owner,
-        write_token
-    )?)
-}
-#[derive(Clone, Copy)]
-pub struct RotatedPasskeyWrite<'a> {
-    pub owner: &'a str,
-    pub id: &'a str,
-    pub public: &'a str,
-    pub key: &'a str,
-    pub snapshot: &'a str,
-    pub now: &'a str,
-    pub write_token: &'a str,
+impl<'a> RotationBatch<'a> {
+    pub(crate) fn new(db: &'a D1Database, owner: &'a str) -> Self {
+        Self {
+            db,
+            owner,
+            now: crate::utils::time::now_rfc3339(),
+            token: Uuid::new_v4().to_string(),
+            writes: Vec::new(),
+        }
+    }
+
+    pub(crate) fn write_cipher(&mut self, id: &str, data: &str) -> AppResult<()> {
+        self.writes.push(query!(
+            self.db,
+            "UPDATE ciphers SET data=?1,updated_at=?2 WHERE id=?3 AND user_id=?4 \
+             AND EXISTS(SELECT 1 FROM users WHERE id=?4 AND account_write_token=?5)",
+            data,
+            self.now,
+            id,
+            self.owner,
+            self.token
+        )?);
+        Ok(())
+    }
+
+    pub(crate) fn write_attachment(
+        &mut self,
+        cipher: &str,
+        attachment: &str,
+        file_name: &str,
+        key: &str,
+    ) -> AppResult<()> {
+        self.writes.push(query!(
+            self.db,
+            "UPDATE attachments SET file_name=?1,encrypted_key=?2,updated_at=?3 \
+             WHERE id=?4 AND cipher_id=?5 AND EXISTS(SELECT 1 FROM users WHERE \
+             id=?6 AND account_write_token=?7)",
+            file_name,
+            key,
+            self.now,
+            attachment,
+            cipher,
+            self.owner,
+            self.token
+        )?);
+        Ok(())
+    }
+
+    pub(crate) fn write_folder(&mut self, id: &str, name: &str) -> AppResult<()> {
+        self.writes.push(query!(
+            self.db,
+            "UPDATE folders SET name=?1,updated_at=?2 WHERE id=?3 AND user_id=?4 \
+             AND EXISTS(SELECT 1 FROM users WHERE id=?4 AND account_write_token=?5)",
+            name,
+            self.now,
+            id,
+            self.owner,
+            self.token
+        )?);
+        Ok(())
+    }
+
+    pub(crate) fn write_passkey(
+        &mut self,
+        id: &str,
+        public: &str,
+        key: &str,
+        snapshot: &str,
+    ) -> AppResult<()> {
+        self.writes.push(query!(
+            self.db,
+            "UPDATE webauthn_credentials SET \
+             encrypted_public_key=?1,encrypted_user_key=?2,account_snapshot=?7,\
+             updated_at=?3 WHERE user_id=?4 AND CAST(slot AS TEXT)=?5 AND \
+             EXISTS(SELECT 1 FROM users WHERE id=?4 AND account_write_token=?6)",
+            public,
+            key,
+            self.now,
+            self.owner,
+            id,
+            self.token,
+            snapshot
+        )?);
+        Ok(())
+    }
+
+    pub(crate) async fn commit(mut self) -> AppResult<(String, String)> {
+        use crate::models::mutation::RevisionRow;
+
+        self.writes
+            .extend(invalidation_writes(self.db, self.owner, &self.token)?);
+        let results = self
+            .db
+            .batch(self.writes)
+            .await
+            .map_err(|error| DatabaseError::account_rotation(error, map_database_error))?;
+        let revisions = db::decode_results::<RevisionRow>(
+            results
+                .first()
+                .ok_or_else(|| AppError::internal("Missing account key rotation batch result"))?,
+        )?;
+        let revision = revisions
+            .into_iter()
+            .next()
+            .ok_or_else(DatabaseError::account_rotation_conflict)?;
+        Ok((self.now, revision.updated_at))
+    }
 }
 
-pub fn passkey_write(
+pub(in crate::models::identity) fn invalidation_writes(
     db: &D1Database,
-    write: RotatedPasskeyWrite<'_>,
-) -> AppResult<D1PreparedStatement> {
-    let RotatedPasskeyWrite {
-        owner,
-        id,
-        public,
-        key,
-        snapshot,
-        now,
-        write_token,
-    } = write;
-    Ok(query!(
+    owner: &str,
+    write_token: &str,
+) -> AppResult<[D1PreparedStatement; 2]> {
+    let params = db::d1_params![owner, write_token];
+    Ok([
+        db.prepare(
+            "DELETE FROM two_factors WHERE user_id=?1 AND provider_type=5 AND \
+             EXISTS(SELECT 1 FROM users WHERE id=?1 AND account_write_token=?2)",
+        )
+        .bind(&params)?,
+        db.prepare(
+            "DELETE FROM auth_requests WHERE user_id=?1 AND EXISTS(SELECT 1 FROM \
+             users WHERE id=?1 AND account_write_token=?2)",
+        )
+        .bind(&params)?,
+    ])
+}
+
+pub(in crate::models::identity) fn rewrap_passkey_snapshots(
+    db: &D1Database,
+    user_id: &str,
+    key: &str,
+    snapshot: &str,
+    token: &str,
+) -> worker::Result<D1PreparedStatement> {
+    query!(
         db,
         "UPDATE webauthn_credentials SET \
-         encrypted_public_key=?1,encrypted_user_key=?2,account_snapshot=?7,\
-         updated_at=?3 WHERE user_id=?4 AND CAST(slot AS TEXT)=?5 AND \
-         EXISTS(SELECT 1 FROM users WHERE id=?4 AND account_write_token=?6)",
-        public,
+         account_snapshot=json_set(account_snapshot,'$.key',?1) WHERE \
+         user_id=?2 AND account_snapshot=?3 AND EXISTS(SELECT 1 FROM \
+         users WHERE id=?2 AND account_write_token=?4)",
         key,
-        now,
-        owner,
-        id,
-        write_token,
-        snapshot
-    )?)
-}
-
-fn invalidation_writes(
-    db: &D1Database,
-    owner: &str,
-    write_token: &str,
-) -> AppResult<Vec<D1PreparedStatement>> {
-    let mut writes = Vec::new();
-    for statement in [
-        "DELETE FROM two_factors WHERE user_id=?1 AND provider_type=5 AND \
-         EXISTS(SELECT 1 FROM users WHERE id=?1 AND account_write_token=?2)",
-        "DELETE FROM auth_requests WHERE user_id=?1 AND EXISTS(SELECT 1 FROM \
-         users WHERE id=?1 AND account_write_token=?2)",
-    ] {
-        writes.push(
-            db.prepare(statement)
-                .bind(&[owner.into(), write_token.into()])?,
-        );
-    }
-    Ok(writes)
-}
-
-pub(crate) async fn commit(
-    db: &D1Database,
-    owner: &str,
-    write_token: &str,
-    mut writes: Vec<D1PreparedStatement>,
-) -> AppResult<String> {
-    use crate::models::mutation::RevisionRow;
-
-    writes.extend(invalidation_writes(db, owner, write_token)?);
-    let results = db
-        .batch(writes)
-        .await
-        .map_err(|error| DatabaseError::account_rotation(error, map_database_error))?;
-    let revisions = db::decode_results::<RevisionRow>(results.first().ok_or(AppError::Internal)?)?;
-    revisions
-        .into_iter()
-        .next()
-        .map(|row| row.updated_at)
-        .ok_or_else(DatabaseError::account_rotation_conflict)
+        user_id,
+        snapshot,
+        token
+    )
 }
 
 #[derive(Clone, Copy)]
@@ -510,24 +452,15 @@ pub async fn change_credentials(
             token
         )?
     } else {
-        query!(
-            &db,
-            "UPDATE webauthn_credentials SET \
-             account_snapshot=json_set(account_snapshot,'$.key',?1) WHERE \
-             user_id=?2 AND account_snapshot=?3 AND EXISTS(SELECT 1 FROM \
-             users WHERE id=?2 AND account_write_token=?4)",
-            next.key,
-            user.id,
-            previous,
-            token
-        )?
+        rewrap_passkey_snapshots(db, &user.id, &next.key, &previous, token)?
     });
-    let rows = db::run_query(
-        async { db.batch(writes).await },
-        "Failed to change account credentials",
-    )
-    .await?;
-    if rows[0].results::<Value>()?.is_empty() {
+    let rows = db::run_batch(db, writes, "Failed to change account credentials").await?;
+    if rows
+        .first()
+        .ok_or_else(|| AppError::internal("Missing account credential update batch result"))?
+        .results::<Value>()?
+        .is_empty()
+    {
         return Err(AppError::conflict(
             "Account changed during credential update. Retry.",
         ));

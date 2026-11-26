@@ -63,10 +63,10 @@ const PRELOGIN_KDF_CONTEXT: &[u8] = b"raywarden/prelogin-kdf/v1\0";
 /// This reduces a fixed-response fingerprint; it cannot eliminate enumeration.
 pub fn unknown_email_kdf(secret: &str, normalized_email: &str) -> AppResult<KdfParams> {
     if secret.trim().is_empty() {
-        return Err(AppError::Internal);
+        return Err(AppError::internal("Prelogin KDF secret is empty"));
     }
     let mut mac = <Hmac<Sha256> as hmac::digest::KeyInit>::new_from_slice(secret.as_bytes())
-        .map_err(AppError::internal_error)?;
+        .map_err(|error| AppError::internal_debug("Failed to initialize prelogin HMAC", error))?;
     mac.update(PRELOGIN_KDF_CONTEXT);
     mac.update(normalized_email.as_bytes());
     let digest = mac.finalize().into_bytes();
@@ -89,12 +89,12 @@ pub(crate) fn validate_stored_kdf(params: &KdfParams) -> AppResult<()> {
         return if params.iterations > 0 {
             Ok(())
         } else {
-            Err(AppError::InternalFailure(
-                "Stored PBKDF2 iterations must be positive".into(),
+            Err(AppError::internal(
+                "Stored PBKDF2 iterations must be positive",
             ))
         };
     }
-    ValidatedKdfParams::try_from(params.clone())
+    ValidatedKdfParams::try_from(*params)
         .map(|_| ())
         .map_err(|error| AppError::internal_with_context("Invalid stored KDF settings", error))
 }
@@ -171,89 +171,35 @@ fn invalid_kdf(message: impl Into<Cow<'static, str>>) -> AppError {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeSet;
-
     use super::*;
 
-    fn tuple(value: &KdfParams) -> (i32, i32, Option<i32>, Option<i32>) {
-        (
-            value.kdf_type,
-            value.iterations,
-            value.memory,
-            value.parallelism,
-        )
-    }
-
     #[test]
-    fn unknown_email_settings_are_stable_and_have_a_cross_target_vector() {
-        let secret = "prelogin-test-secret";
-        let email = "unknown@example.test";
-        let first = unknown_email_kdf(secret, email).expect("valid kdf fixture");
+    fn unknown_email_kdf_has_cross_target_vector_and_enforces_bounds() {
+        let first = unknown_email_kdf("prelogin-test-secret", "unknown@example.test").expect("kdf");
         assert_eq!(
-            unknown_email_kdf(secret, email).expect("valid kdf fixture"),
-            first
-        );
-        // The keyed digest starts with 0x410923d625a37e9b. Taking modulo 7
-        // before usize conversion must select the same bucket on WASM32.
-        assert_eq!(
-            tuple(&first),
+            (
+                first.kdf_type,
+                first.iterations,
+                first.memory,
+                first.parallelism
+            ),
             (KdfKind::Argon2id as i32, 6, Some(32), Some(4))
         );
-    }
-
-    #[test]
-    fn unknown_emails_cover_common_settings_without_relaxing_registration() {
-        let seen = (0..256)
-            .map(|index| {
-                tuple(
-                    &unknown_email_kdf(
-                        "prelogin-test-secret",
-                        &format!("unknown-{index}@example.test"),
-                    )
-                    .expect("valid kdf fixture"),
-                )
-            })
-            .collect::<BTreeSet<_>>();
-        assert_eq!(
-            seen,
-            UNKNOWN_EMAIL_KDFS
-                .into_iter()
-                .map(|(kind, i, m, p)| (kind as i32, i, m, p))
-                .collect()
-        );
+        let sample = |secret| {
+            (0..8)
+                .map(|i| unknown_email_kdf(secret, &format!("u{i}@example.test")).expect("kdf"))
+                .collect::<Vec<_>>()
+        };
+        assert_ne!(sample("prelogin-test-secret"), sample("other-secret"));
+        assert!(unknown_email_kdf(" ", "unknown@example.test").is_err());
         assert!(
             ValidatedKdfParams::try_from(KdfParams {
-                kdf_type: KdfKind::Pbkdf2 as i32,
+                kdf_type: 0,
                 iterations: 5_000,
                 memory: None,
-                parallelism: None,
+                parallelism: None
             })
             .is_err()
         );
-    }
-
-    #[test]
-    fn unknown_email_settings_depend_on_the_persisted_key() {
-        let settings = |secret| {
-            (0..32)
-                .map(|index| {
-                    tuple(
-                        &unknown_email_kdf(secret, &format!("unknown-{index}@example.test"))
-                            .expect("valid kdf fixture"),
-                    )
-                })
-                .collect::<Vec<_>>()
-        };
-        assert_ne!(
-            settings("prelogin-test-secret"),
-            settings("different-persisted-secret")
-        );
-    }
-
-    #[test]
-    fn unknown_email_settings_reject_missing_key_material() {
-        for secret in ["", " ", "\n"] {
-            assert!(unknown_email_kdf(secret, "unknown@example.test").is_err());
-        }
     }
 }

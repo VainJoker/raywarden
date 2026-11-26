@@ -6,9 +6,9 @@ use sha2::{Digest, Sha256};
 use worker::{D1Database, D1PreparedStatement, Env};
 
 use super::{
-    ChallengePurpose, CredentialDescriptor, CredentialExtensions, CredentialUse, bind_session,
-    new_challenge, protocol as wire, user_handle, validate_binding, validate_encrypted_keys,
-    verify_client,
+    ChallengePurpose, CredentialDescriptor, CredentialExtensions, CredentialUse, PrfStatus,
+    bind_session, new_challenge, protocol as wire, user_handle, validate_binding,
+    validate_encrypted_keys, verify_client,
 };
 use crate::{
     errors::{AppError, AppResult},
@@ -93,7 +93,9 @@ pub async fn two_factor_assertion_options(
     challenge.account_snapshot = Some(AccountSnapshot::json_from_user(user)?);
     challenge.device_id = Some(device.into());
     let options = save_options(db, challenge, keys, false).await?;
-    serde_json::to_value(options).map_err(AppError::internal_error)
+    serde_json::to_value(options).map_err(AppError::internal_json(
+        "Failed to serialize WebAuthn assertion options",
+    ))
 }
 
 #[derive(Serialize, Deserialize)]
@@ -170,19 +172,23 @@ impl CredentialAssertion {
             client_data: client,
         } = self;
         verify_client(check.env, &client, "webauthn.get", check.challenge)?;
-        let id = assertion
-            .raw_id
-            .as_deref()
-            .or(assertion.id.as_deref())
-            .ok_or_else(|| AppError::invalid_credentials("Missing WebAuthn credential id"))?;
-        let id = wire::decode_base64(id)?;
-        if let (Some(raw), Some(other)) = (&assertion.raw_id, &assertion.id)
-            && wire::decode_base64(raw)? != wire::decode_base64(other)?
-        {
-            return Err(AppError::invalid_credentials(
-                "WebAuthn credential id mismatch",
-            ));
-        }
+        let id = match (&assertion.raw_id, &assertion.id) {
+            (Some(raw), Some(other)) => {
+                let raw = wire::decode_base64(raw)?;
+                if raw != wire::decode_base64(other)? {
+                    return Err(AppError::invalid_credentials(
+                        "WebAuthn credential id mismatch",
+                    ));
+                }
+                raw
+            }
+            (Some(id), None) | (None, Some(id)) => wire::decode_base64(id)?,
+            (None, None) => {
+                return Err(AppError::invalid_credentials(
+                    "Missing WebAuthn credential id",
+                ));
+            }
+        };
         let key = WebauthnCredentialRow::find(check.db, &URL_SAFE_NO_PAD.encode(id))
             .await?
             .filter(|k| k.credential_use == check.usage.as_str())
@@ -216,7 +222,7 @@ impl CredentialAssertion {
             &check.challenge.rp_id,
             check.usage.requires_user_verification(),
         )?;
-        let public_key = wire::parse_webauthn_public_key(&wire::decode_base64(&key.public_key)?)?.0;
+        let public_key = wire::parse_webauthn_public_key(&wire::decode_base64(&key.public_key)?)?;
         let mut signed = auth;
         signed.extend_from_slice(&Sha256::digest(client.bytes()));
         public_key.verify(
@@ -315,18 +321,17 @@ impl PasswordlessLogin {
         session: &NewDeviceSession<'_>,
     ) -> AppResult<Option<(String, String)>> {
         let current = AccountSnapshot::json_from_user(user)?;
-        let key = &self.assertion.key;
-        let prf_keys =
-            if key.prf_status == 0 && key.account_snapshot.as_deref() == Some(current.as_str()) {
-                key.encrypted_user_key
-                    .clone()
-                    .zip(key.encrypted_private_key.clone())
-            } else {
-                None
-            };
-        key.accept_login_assertion(db, &self.challenge, self.assertion.count, user, session)
+        let Self {
+            assertion: VerifiedAssertion { key, count },
+            challenge,
+        } = self;
+        let can_return_prf = key.prf_status == i32::from(PrfStatus::Enabled)
+            && key.account_snapshot.as_deref() == Some(current.as_str());
+        key.accept_login_assertion(db, &challenge, count, user, session)
             .await?;
-        Ok(prf_keys)
+        Ok(can_return_prf
+            .then(|| key.encrypted_user_key.zip(key.encrypted_private_key))
+            .flatten())
     }
 }
 
@@ -451,7 +456,9 @@ pub async fn update_credential(
             "WebAuthn challenge token mismatch",
         ));
     }
-    let expected = WebauthnCredentialRow::find_owned(db, &claims.sub, "login", id).await?;
+    let expected =
+        WebauthnCredentialRow::find_owned(db, &claims.sub, CredentialUse::Login.as_str(), id)
+            .await?;
     let verified = assertion
         .verify(AssertionCheck {
             db,
@@ -478,7 +485,7 @@ pub async fn update_credential(
     key.encrypted_public_key = payload.encrypted_public_key;
     key.encrypted_user_key = payload.encrypted_user_key;
     key.encrypted_private_key = payload.encrypted_private_key;
-    key.prf_status = 0;
+    key.prf_status = i32::from(PrfStatus::Enabled);
     if let Some(name) = payload.name {
         key.name = name;
     }

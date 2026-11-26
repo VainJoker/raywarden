@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use axum::extract::{Path, State};
+use axum::extract::State;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -8,6 +8,7 @@ use crate::{
     api::{
         AppState,
         common::{
+            extract::Path,
             json::Json,
             response::{ApiResponse, EmptyObject},
         },
@@ -16,9 +17,8 @@ use crate::{
     models::identity::{account_keys, user::UserRow},
     service::identity::{
         account_keys::{
-            AccountKeysRequest, AccountRotationContext, PasskeyUnlockItem,
-            RotateAccountKeysRequest, RotateAccountPayload, SignatureKeyPair, ValidatedAccountKeys,
-            WrappedRotationKeys, is_valid_key_id,
+            AccountRotationContext, PasskeyUnlockItem, RotateAccountKeysRequest,
+            RotateAccountPayload, SignatureKeyPair, WrappedRotationKeys,
         },
         kdf::ValidatedKdfParams,
         session::Claims,
@@ -41,16 +41,9 @@ pub(in crate::api) async fn get_key_pair(
     claims: Claims,
     State(state): State<Arc<AppState>>,
 ) -> AppResult<ApiResponse<AccountKeyPairResponse>> {
-    key_pair(&state, &claims.sub).await
-}
-
-async fn key_pair(
-    state: &AppState,
-    user_id: &str,
-) -> AppResult<ApiResponse<AccountKeyPairResponse>> {
     let user = UserRow::fetch_by_id_with(
         state.database(),
-        user_id,
+        &claims.sub,
         "Failed to fetch account keys",
         || AppError::Auth(AuthError::UserNotFound),
     )
@@ -58,7 +51,8 @@ async fn key_pair(
     if user.private_key.is_empty() || user.public_key.is_empty() {
         return Err(AppError::not_found("Account key pair"));
     }
-    let account_keys = crate::service::identity::account_keys::account_keys_response(&user);
+    let account_keys =
+        crate::service::identity::account_keys::account_keys_response(&user, "object");
     Ok(ApiResponse(AccountKeyPairResponse {
         key: user.key,
         private_key: user.private_key,
@@ -66,87 +60,6 @@ async fn key_pair(
         account_keys,
         object: "keys",
     }))
-}
-
-/// Parse optional legacy fields without changing which operation reports an invalid field.
-#[derive(Deserialize)]
-#[serde(untagged)]
-enum CompatibleField<T> {
-    Valid(T),
-    Invalid(serde::de::IgnoredAny),
-}
-
-impl<T> CompatibleField<T> {
-    fn into_valid(self) -> Option<T> {
-        match self {
-            Self::Valid(value) => Some(value),
-            Self::Invalid(_) => None,
-        }
-    }
-}
-
-#[derive(Default, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct UpdateKeyPairFields {
-    account_keys: Option<CompatibleField<AccountKeysRequest>>,
-    encrypted_private_key: Option<CompatibleField<String>>,
-    public_key: Option<CompatibleField<String>>,
-    user_key_id: Option<CompatibleField<String>>,
-}
-
-#[derive(Deserialize)]
-#[serde(transparent)]
-pub(in crate::api) struct UpdateKeyPairRequest(CompatibleField<UpdateKeyPairFields>);
-
-#[worker::send]
-pub(in crate::api) async fn update_key_pair(
-    claims: Claims,
-    State(state): State<Arc<AppState>>,
-    Json(UpdateKeyPairRequest(data)): Json<UpdateKeyPairRequest>,
-) -> AppResult<ApiResponse<AccountKeyPairResponse>> {
-    let fields = data.into_valid().unwrap_or_default();
-    let keys = if let Some(keys) = fields.account_keys {
-        let validated = keys
-            .into_valid()
-            .ok_or_else(|| AppError::bad_request("Invalid account keys"))?
-            .into_validated()?;
-        if !validated.is_v2() {
-            return Err(AppError::bad_request(
-                "AccountKeys are only supported for V2 encryption",
-            ));
-        }
-        validated
-    } else {
-        let required = || AppError::bad_request("Both account keys are required");
-        let private = fields
-            .encrypted_private_key
-            .and_then(CompatibleField::into_valid)
-            .filter(|key| !key.trim().is_empty())
-            .ok_or_else(required)?;
-        let public = fields
-            .public_key
-            .and_then(CompatibleField::into_valid)
-            .filter(|key| !key.trim().is_empty())
-            .ok_or_else(required)?;
-        ValidatedAccountKeys::from_legacy_pair(private, public)
-    };
-    let key_id = fields
-        .user_key_id
-        .map(|id| {
-            id.into_valid()
-                .filter(|id| is_valid_key_id(id))
-                .ok_or_else(|| AppError::bad_request("Key id must be 32 lowercase hex characters"))
-        })
-        .transpose()?;
-    let key_id = if keys.is_v2() {
-        key_id.as_deref()
-    } else {
-        None
-    };
-    let material = keys.into_persistence_material()?;
-    let session = claims.session_snapshot()?;
-    account_keys::set_initial_material(state.database(), &session, &material, key_id).await?;
-    key_pair(&state, &claims.sub).await
 }
 
 #[derive(Deserialize)]
@@ -207,15 +120,11 @@ pub(in crate::api) async fn rotate_account_keys(
         || AuthError::UserNotFound.into(),
     )
     .await?;
-    if !crate::service::identity::user::verify_master_password(
+    crate::service::identity::user::require_master_password(
         &user,
         &payload.old_master_key_authentication_hash,
     )
-    .await?
-    .is_valid()
-    {
-        return Err(AuthError::InvalidPassword.into());
-    }
+    .await?;
     let unlock = &payload.account_unlock_data.master_password_unlock_data;
     payload.validate_rotation_metadata(&user)?;
     let kdf = KdfParams::from(ValidatedKdfParams::try_from(KdfParams {
@@ -252,7 +161,9 @@ pub(in crate::api) async fn rotate_account_keys(
         &user,
     )
     .await?;
-    let new_key_id = payload.new_user_key_id.clone().or_else(|| {
+    let passkeys = payload.account_unlock_data.passkey_unlock_data;
+    let unlock = payload.account_unlock_data.master_password_unlock_data;
+    let new_key_id = payload.new_user_key_id.or_else(|| {
         if keys.is_v2() {
             None
         } else {
@@ -262,7 +173,7 @@ pub(in crate::api) async fn rotate_account_keys(
     let input = crate::service::identity::account_keys::RotationInput {
         keys,
         data: payload.account_data,
-        wrapped_user_key: unlock.master_key_encrypted_user_key.clone(),
+        wrapped_user_key: unlock.master_key_encrypted_user_key,
         old_user_key_id: payload.old_user_key_id.or_else(|| {
             if crate::service::identity::user::is_v2(&user) {
                 None
@@ -272,11 +183,11 @@ pub(in crate::api) async fn rotate_account_keys(
         }),
         new_user_key_id: new_key_id,
         upgrade: None,
-        passkeys: payload.account_unlock_data.passkey_unlock_data,
+        passkeys,
         password: Some(crate::service::identity::account_keys::RotationPassword {
             password,
             kdf,
-            hint: unlock.master_password_hint.clone(),
+            hint: unlock.master_password_hint,
         }),
     };
     input
@@ -290,36 +201,39 @@ pub(in crate::api) async fn rotate_account_keys(
     Ok(ApiResponse(EmptyObject {}))
 }
 
-#[derive(Default, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct RotateUserKeyFields {
-    unlock_method_data: Option<CompatibleField<RotationUnlockMethod>>,
-    wrapped_account_cryptographic_state: Option<CompatibleField<WrappedRotationKeys>>,
-    old_user_key_id: Option<CompatibleField<String>>,
-    new_user_key_id: Option<CompatibleField<String>>,
-    unlock_data: Option<CompatibleField<RotationUnlockData>>,
-    account_data: Option<CompatibleField<RotateAccountPayload>>,
-}
-
 #[derive(Deserialize)]
-#[serde(transparent)]
-pub(in crate::api) struct RotateUserKeysRequest(CompatibleField<RotateUserKeyFields>);
+#[serde(rename_all = "camelCase")]
+pub(in crate::api) struct RotateUserKeysRequest {
+    unlock_method_data: RotationUnlockMethod,
+    wrapped_account_cryptographic_state: WrappedRotationKeys,
+    #[serde(default)]
+    old_user_key_id: Option<String>,
+    #[serde(default)]
+    new_user_key_id: Option<String>,
+    #[serde(default)]
+    unlock_data: RotationUnlockData,
+    account_data: RotateAccountPayload,
+}
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct RotationUnlockMethod {
-    unlock_method: Option<CompatibleField<i32>>,
+    unlock_method: i32,
     key_connector_key_wrapped_user_key: Option<serde::de::IgnoredAny>,
-    master_password_unlock_data: Option<CompatibleField<MasterPasswordUnlockPayload>>,
+    master_password_unlock_data: Option<MasterPasswordUnlockPayload>,
 }
 
 #[derive(Default, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct RotationUnlockData {
-    emergency_access_unlock_data: Option<CompatibleField<Vec<serde::de::IgnoredAny>>>,
-    organization_account_recovery_unlock_data: Option<CompatibleField<Vec<serde::de::IgnoredAny>>>,
-    device_key_unlock_data: Option<CompatibleField<Vec<serde::de::IgnoredAny>>>,
-    passkey_unlock_data: Option<CompatibleField<Vec<PasskeyUnlockItem>>>,
+    #[serde(default)]
+    emergency_access_unlock_data: Vec<serde::de::IgnoredAny>,
+    #[serde(default)]
+    organization_account_recovery_unlock_data: Vec<serde::de::IgnoredAny>,
+    #[serde(default)]
+    device_key_unlock_data: Vec<serde::de::IgnoredAny>,
+    #[serde(default)]
+    passkey_unlock_data: Vec<PasskeyUnlockItem>,
     v2_upgrade_token: Option<Value>,
 }
 
@@ -327,7 +241,7 @@ struct RotationUnlockData {
 pub(in crate::api) async fn rotate_user_keys(
     claims: Claims,
     State(state): State<Arc<AppState>>,
-    Json(RotateUserKeysRequest(payload)): Json<RotateUserKeysRequest>,
+    Json(payload): Json<RotateUserKeysRequest>,
 ) -> AppResult<ApiResponse<EmptyObject>> {
     let user = UserRow::fetch_by_id_with(
         state.database(),
@@ -336,20 +250,19 @@ pub(in crate::api) async fn rotate_user_keys(
         || AuthError::UserNotFound.into(),
     )
     .await?;
-    let payload = payload.into_valid().unwrap_or_default();
-    let method = payload
-        .unlock_method_data
-        .and_then(CompatibleField::into_valid)
-        .filter(|method| method.key_connector_key_wrapped_user_key.is_none())
-        .ok_or_else(|| AppError::bad_request("Only master password unlock is supported"))?;
-    if method.unlock_method.and_then(CompatibleField::into_valid) != Some(1) {
+    if payload.unlock_method_data.unlock_method != 1
+        || payload
+            .unlock_method_data
+            .key_connector_key_wrapped_user_key
+            .is_some()
+    {
         return Err(AppError::bad_request(
             "Only master password unlock is supported",
         ));
     }
-    let unlock = method
+    let unlock = payload
+        .unlock_method_data
         .master_password_unlock_data
-        .and_then(CompatibleField::into_valid)
         .ok_or_else(|| AppError::bad_request("MasterPasswordUnlockData is required"))?;
     if unlock.salt != user.email
         || unlock.kdf.kdf_type != user.kdf_type
@@ -362,54 +275,30 @@ pub(in crate::api) async fn rotate_user_keys(
     }
     let keys = payload
         .wrapped_account_cryptographic_state
-        .and_then(CompatibleField::into_valid)
-        .ok_or_else(|| AppError::bad_request("Invalid V2 account keys"))?
         .into_validated()?;
     if !keys.is_v2() {
         return Err(AppError::bad_request("V2 account keys are required"));
     }
-    let old = payload
-        .old_user_key_id
-        .and_then(CompatibleField::into_valid);
-    let new = payload
-        .new_user_key_id
-        .and_then(CompatibleField::into_valid);
-    if unlock.contained_key_id != new {
+    if unlock.contained_key_id != payload.new_user_key_id {
         return Err(AppError::bad_request(
             "Contained key id must match the new user key id",
         ));
     }
-    let common = payload
-        .unlock_data
-        .and_then(CompatibleField::into_valid)
-        .unwrap_or_default();
-    if [
-        common.emergency_access_unlock_data,
-        common.organization_account_recovery_unlock_data,
-        common.device_key_unlock_data,
-    ]
-    .into_iter()
-    .flatten()
-    .filter_map(CompatibleField::into_valid)
-    .any(|items| !items.is_empty())
+    let common = payload.unlock_data;
+    if !common.emergency_access_unlock_data.is_empty()
+        || !common.organization_account_recovery_unlock_data.is_empty()
+        || !common.device_key_unlock_data.is_empty()
     {
         return Err(AppError::bad_request("Unsupported unlock method"));
     }
-    let data = payload
-        .account_data
-        .and_then(CompatibleField::into_valid)
-        .ok_or_else(|| AppError::bad_request("Invalid account rotation data"))?;
     let input = crate::service::identity::account_keys::RotationInput {
         keys,
-        data,
+        data: payload.account_data,
         wrapped_user_key: unlock.master_key_wrapped_user_key,
-        old_user_key_id: old,
-        new_user_key_id: new,
+        old_user_key_id: payload.old_user_key_id,
+        new_user_key_id: payload.new_user_key_id,
         upgrade: common.v2_upgrade_token,
-        passkeys: common
-            .passkey_unlock_data
-            .and_then(CompatibleField::into_valid)
-            .unwrap_or_default(),
+        passkeys: common.passkey_unlock_data,
         password: None,
     };
     input
@@ -493,7 +382,7 @@ pub(in crate::api) struct AccountPublicKeysResponse {
 pub(in crate::api) async fn get_account_public_keys(
     _claims: Claims,
     State(state): State<Arc<AppState>>,
-    axum::extract::Path(id): axum::extract::Path<String>,
+    Path(id): Path<String>,
 ) -> AppResult<ApiResponse<AccountPublicKeysResponse>> {
     let user =
         UserRow::fetch_by_id_with(state.database(), &id, "Failed to read public keys", || {

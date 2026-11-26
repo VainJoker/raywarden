@@ -3,18 +3,18 @@
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
-use worker::{D1Database, Env};
+use worker::{D1Database, Env, WebSocketIncomingMessage};
 
 use super::{
-    FanoutRequest, FanoutSelector, FanoutVerificationError, HANDSHAKE_RESPONSE, LogoutScope, PING,
-    is_signalr_handshake, verify_fanout_token,
+    FanoutRequest, FanoutSelector, HANDSHAKE_RESPONSE, LogoutScope, PING, is_signalr_handshake,
+    verify_fanout_token,
 };
 use crate::{
     errors::{AppError, JwtError},
     infra::{db, jwt},
     models::identity::{
         auth_request::AuthRequestRow,
-        notification::{ConnectionCheck, session_revision, validate_connections},
+        notification::{ConnectionCheck, validate_connections},
         user::UserRow,
     },
     service::{
@@ -75,6 +75,12 @@ pub(crate) enum HubIdentity {
     },
 }
 
+pub(crate) struct TagPolicy {
+    pub routing_tags: Vec<String>,
+    pub capacity_tag: String,
+    pub max_connections: usize,
+}
+
 impl HubIdentity {
     pub(crate) async fn authenticate(
         env: &Env,
@@ -93,13 +99,10 @@ impl HubIdentity {
             identity.validate(env).await?;
             Ok(identity)
         } else {
-            let token = match access_token {
-                Some(token) => token,
-                None => authorization_header
-                    .and_then(parse_bearer)
-                    .map(str::to_owned)
-                    .ok_or(HubError::BearerRequired)?,
-            };
+            let token = access_token
+                .as_deref()
+                .or_else(|| authorization_header.and_then(parse_bearer))
+                .ok_or(HubError::BearerRequired)?;
             let db = identity_database(env)?;
             let secret = jwt_keys::load(env, &db)
                 .await
@@ -110,7 +113,7 @@ impl HubIdentity {
                 ..Default::default()
             };
             let claims =
-                jwt::decode::<Claims>(&token, secret.as_bytes(), &options).map_err(|error| {
+                jwt::decode::<Claims>(token, secret.as_bytes(), &options).map_err(|error| {
                     match error {
                         JwtError::CryptoError(_) => unavailable("verify access token signature"),
                         _ => HubError::InvalidBearerToken,
@@ -119,7 +122,8 @@ impl HubIdentity {
             let session = claims
                 .session_snapshot()
                 .map_err(|error| session_rejection(&error))?;
-            let account_revision = session_revision(&db, &session)
+            let account_revision = session
+                .revision(&db)
                 .await
                 .map_err(|error| session_rejection(&error))?;
             Ok(Self::User {
@@ -170,20 +174,18 @@ impl HubIdentity {
         }
     }
 
-    /// Return `(routing_tags, capacity_tag, max_connections)` for socket
-    /// admission.
-    pub(crate) fn tag_policy(&self) -> (Vec<String>, String, usize) {
+    pub(crate) fn tag_policy(&self) -> TagPolicy {
         match self {
-            Self::User { claims, .. } => (
-                Vec::new(),
-                super::user_tag(&claims.sub),
-                MAX_USER_CONNECTIONS,
-            ),
-            Self::Anonymous { request_id, ip } => (
-                vec![super::anonymous_tag(request_id)],
-                format!("ip:{}", hex::encode(Sha256::digest(ip.as_bytes()))),
-                MAX_ANONYMOUS_CONNECTIONS_PER_IP,
-            ),
+            Self::User { claims, .. } => TagPolicy {
+                routing_tags: Vec::new(),
+                capacity_tag: super::user_tag(&claims.sub),
+                max_connections: MAX_USER_CONNECTIONS,
+            },
+            Self::Anonymous { request_id, ip } => TagPolicy {
+                routing_tags: vec![super::anonymous_tag(request_id)],
+                capacity_tag: format!("ip:{}", hex::encode(Sha256::digest(ip.as_bytes()))),
+                max_connections: MAX_ANONYMOUS_CONNECTIONS_PER_IP,
+            },
         }
     }
 
@@ -271,18 +273,7 @@ pub(crate) async fn verify_and_decode_fanout(
     body: &str,
     token: &str,
 ) -> HubResult<VerifiedFanout> {
-    if token.is_empty() {
-        return Err(HubError::Forbidden);
-    }
-    verify_fanout_token(env, body, token)
-        .await
-        .map_err(|error| match error {
-            FanoutVerificationError::InvalidProof => HubError::Forbidden,
-            FanoutVerificationError::Unavailable(operation) => {
-                log::warn!("Notification fanout verification failed to {operation}");
-                HubError::Unavailable
-            }
-        })?;
+    verify_fanout_token(env, body, token).await?;
     let request: FanoutRequest =
         serde_json::from_str(body).map_err(|_error| HubError::InvalidNotification)?;
     let payload = STANDARD
@@ -293,12 +284,6 @@ pub(crate) async fn verify_and_decode_fanout(
         payload,
         logout: request.logout,
     })
-}
-
-#[derive(Clone, Copy)]
-pub(crate) enum IncomingFrame<'a> {
-    Text(&'a str),
-    Binary(&'a [u8]),
 }
 
 #[derive(Clone, Copy)]
@@ -336,10 +321,6 @@ impl HubSession {
         self.is_initialized
     }
 
-    pub(crate) fn check(&self, now_seconds: i64) -> Option<ConnectionCheck<'_>> {
-        self.identity.check(now_seconds)
-    }
-
     pub(crate) const fn evaluate_keepalive(&self, now_seconds: i64) -> FilterOutcome {
         if now_seconds - self.last_received_at_seconds > CLIENT_IDLE_TIMEOUT_SECONDS {
             FilterOutcome::Close {
@@ -368,7 +349,7 @@ impl HubSession {
     pub(crate) async fn handle_frame(
         &mut self,
         env: &Env,
-        frame: IncomingFrame<'_>,
+        frame: &WebSocketIncomingMessage,
     ) -> FrameDecision {
         if let Err(error) = self.identity.validate(env).await {
             let (code, reason) = close_for_rejection(error, "Session expired");
@@ -376,11 +357,13 @@ impl HubSession {
         }
         self.last_received_at_seconds = time::now_seconds();
         match frame {
-            IncomingFrame::Text(text) if !self.is_initialized && is_signalr_handshake(text) => {
+            WebSocketIncomingMessage::String(text)
+                if !self.is_initialized && is_signalr_handshake(text) =>
+            {
                 self.is_initialized = true;
                 FrameDecision::Reply(&HANDSHAKE_RESPONSE)
             }
-            IncomingFrame::Binary(bytes) if self.is_initialized && bytes == PING => {
+            WebSocketIncomingMessage::Binary(bytes) if self.is_initialized && bytes == &PING => {
                 FrameDecision::Reply(&PING)
             }
             _ => FrameDecision::Close {
@@ -403,15 +386,14 @@ pub(crate) const fn close_for_rejection(
 
 pub(crate) async fn validate_sessions<'a>(
     env: &Env,
-    sessions: impl ExactSizeIterator<Item = &'a HubSession>,
+    sessions: impl Iterator<Item = &'a HubSession>,
 ) -> Vec<HubResult<()>> {
-    let len = sessions.len();
     let now = time::now();
     let checks = sessions
-        .map(|session| session.check(now.as_second()))
+        .map(|session| session.identity.check(now.as_second()))
         .collect::<Vec<_>>();
     if checks.iter().all(Option::is_none) {
-        return vec![Err(HubError::InvalidBearerToken); len];
+        return vec![Err(HubError::InvalidBearerToken); checks.len()];
     }
 
     let result = async {

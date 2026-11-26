@@ -2,7 +2,7 @@
 mod request;
 mod response;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use request::RotateAttachmentRequest;
 pub use request::{
@@ -17,10 +17,13 @@ use worker::{D1Database, D1PreparedStatement, Env};
 use super::attachment;
 use crate::{
     errors::{AppError, AppResult},
-    models::vault::{
-        attachment::AttachmentRow,
-        cipher::{CipherMutation, CipherRow},
-        folder::FolderRow,
+    models::{
+        page::Page,
+        vault::{
+            attachment::AttachmentRow,
+            cipher::{CipherMutation, CipherRow},
+            folder::FolderRow,
+        },
     },
     service::{
         identity::{session::Claims, user::AccountVerificationRequest},
@@ -35,33 +38,37 @@ async fn collect_attachment_key_updates(
     user_id: &str,
     updates: Option<&HashMap<String, RotateAttachmentRequest>>,
     now: &str,
-) -> AppResult<(Vec<D1PreparedStatement>, Vec<String>)> {
+) -> AppResult<(Vec<D1PreparedStatement>, HashSet<String>)> {
     let Some(updates) = updates.filter(|updates| !updates.is_empty()) else {
-        return Ok((Vec::new(), Vec::new()));
+        return Ok((Vec::new(), HashSet::new()));
     };
-    let ids = serde_json::to_string(&updates.keys().collect::<Vec<_>>())
-        .map_err(AppError::internal_error)?;
+    let ids = serde_json::to_string(&updates.keys().collect::<Vec<_>>()).map_err(
+        AppError::internal_json("Failed to serialize attachment key update IDs"),
+    )?;
     let mut writes = Vec::new();
-    let mut applied = Vec::new();
-    let mut after = None;
-    loop {
-        let page =
-            AttachmentRow::list_key_update_page(db, cipher_id, user_id, &ids, after.as_ref())
-                .await?;
-        for row in page.rows {
-            let update = updates.get(&row.id).ok_or(AppError::Internal)?;
-            writes.extend(AttachmentRow::rotate_key_statements(
-                db,
-                &row,
-                &update.file_name,
-                &update.key,
-                now,
-            )?);
-            applied.push(row.id);
-        }
-        let Some(next) = page.next else { break };
-        after = Some(next);
-    }
+    let mut applied = HashSet::with_capacity(updates.len());
+    Page::visit(
+        async |after| {
+            AttachmentRow::list_key_update_page(db, cipher_id, user_id, &ids, after).await
+        },
+        async |rows| {
+            for row in rows {
+                let update = updates
+                    .get(&row.id)
+                    .ok_or_else(|| AppError::internal("Missing attachment key update entry"))?;
+                writes.extend(AttachmentRow::rotate_key_statements(
+                    db,
+                    &row,
+                    &update.file_name,
+                    &update.key,
+                    now,
+                )?);
+                applied.insert(row.id);
+            }
+            Ok(())
+        },
+    )
+    .await?;
     Ok((writes, applied))
 }
 
@@ -72,147 +79,12 @@ pub(crate) enum CipherSelection {
     Bulk(Vec<String>),
 }
 
-/// Bind a sorted selection and arm snapshot guards before projecting or writing.
-struct SelectionPlan {
-    ids: Vec<String>,
-    ids_json: String,
-    rows: Vec<CipherRow>,
-    bulk: bool,
-    kind: CipherMutation,
-}
-
-impl SelectionPlan {
-    async fn load(
-        selection: CipherSelection,
-        kind: CipherMutation,
-        mutation: &mut VaultWrite<'_>,
-    ) -> AppResult<Self> {
-        let (mut ids, bulk) = match selection {
-            CipherSelection::Single(id) => (vec![id], false),
-            CipherSelection::Bulk(ids) => (ids, true),
-        };
-        ids.sort();
-        ids.dedup();
-        // JSON selections and snapshots avoid a bind for every row. Long
-        // individual ciphertexts still use separate column binds.
-        let ids_json = serde_json::to_string(&ids).map_err(AppError::internal_error)?;
-        if ids_json.len() > 1_900_000 {
-            return Err(AppError::PayloadTooLarge {
-                message: "Cipher selection is too large".into(),
-            });
+impl CipherSelection {
+    fn into_ids_and_bulk_flag(self) -> (Vec<String>, bool) {
+        match self {
+            Self::Single(id) => (vec![id], false),
+            Self::Bulk(ids) => (ids, true),
         }
-        let db = mutation.database();
-        if let CipherMutation::Move {
-            folder_id: Some(folder),
-        } = &kind
-        {
-            FolderRow::ensure_for_user(db, folder, mutation.user_id()).await?;
-        }
-        let rows = CipherRow::fetch_selected(db, mutation.user_id(), &ids_json).await?;
-        if rows.len() != ids.len() {
-            return Err(AppError::bad_request(
-                "Not all selected ciphers exist in the personal vault",
-            ));
-        }
-        mutation.add_guards(crate::models::vault::cipher::selected_snapshot_guards(
-            db,
-            mutation.user_id(),
-            &rows,
-        )?);
-        if let CipherMutation::Move { folder_id } = &kind {
-            mutation.guard_folder(folder_id.as_deref())?;
-        }
-        Ok(Self {
-            ids,
-            ids_json,
-            rows,
-            bulk,
-            kind,
-        })
-    }
-
-    async fn execute_mutation(
-        self,
-        mutation: VaultWrite<'_>,
-        env: &Env,
-        domain: &str,
-    ) -> AppResult<Vec<CipherResponse>> {
-        let Self {
-            ids,
-            ids_json,
-            rows,
-            bulk,
-            kind,
-        } = self;
-        let db = mutation.database();
-        let now = crate::utils::time::now_rfc3339();
-        let hard_delete = kind == CipherMutation::HardDelete;
-        let response = if matches!(
-            kind,
-            CipherMutation::Restore | CipherMutation::Archive | CipherMutation::Unarchive
-        ) {
-            let mut response: Vec<_> = rows
-                .into_iter()
-                .map(CipherResponse::try_from)
-                .collect::<AppResult<_>>()?;
-            for cipher in &mut response {
-                cipher.updated_at.clone_from(&now);
-                match &kind {
-                    CipherMutation::Restore => cipher.deleted_at = None,
-                    CipherMutation::Archive => {
-                        cipher.archived_at = Some(now.clone());
-                    }
-                    CipherMutation::Unarchive => cipher.archived_at = None,
-                    _ => {}
-                }
-            }
-            attachment::hydrate_ciphers_attachments(
-                db,
-                domain,
-                attachment::include_metadata(env),
-                &mut response,
-            )
-            .await?;
-            response
-        } else {
-            Vec::new()
-        };
-        let write = crate::models::vault::cipher::selected_mutation(
-            db,
-            mutation.user_id(),
-            &ids_json,
-            &kind,
-            &now,
-        )?;
-        let committed = mutation.commit(vec![write]).await?;
-        if bulk {
-            committed.publish_user(UpdateType::SyncCiphers).await;
-        }
-        if !bulk && let Some(id) = ids.first() {
-            let update = if hard_delete {
-                UpdateType::SyncLoginDelete
-            } else {
-                UpdateType::SyncCipherUpdate
-            };
-            committed.publish_cipher(update, id).await;
-        }
-        if !ids.is_empty() {
-            let event = if matches!(
-                kind,
-                CipherMutation::SoftDelete | CipherMutation::HardDelete
-            ) {
-                Event::CipherDelete
-            } else {
-                Event::CipherUpdate
-            };
-            committed.emit_admin(event).await;
-        }
-        if hard_delete
-            && let Err(error) = crate::service::storage_cleanup::process_batch(env, db).await
-        {
-            log::warn!("File cleanup deferred: {error}");
-        }
-        Ok(response)
     }
 }
 
@@ -225,10 +97,112 @@ pub(crate) async fn mutate_selected(
     kind: CipherMutation,
 ) -> AppResult<Vec<CipherResponse>> {
     let mut mutation = VaultWrite::new(db, env, claims);
-    SelectionPlan::load(selection, kind, &mut mutation)
-        .await?
-        .execute_mutation(mutation, env, domain)
-        .await
+    let (mut ids, is_bulk) = selection.into_ids_and_bulk_flag();
+    ids.sort();
+    ids.dedup();
+    // JSON selections and snapshots avoid a bind for every row. Long
+    // individual ciphertexts still use separate column binds.
+    let ids_json = serde_json::to_string(&ids).map_err(AppError::internal_json(
+        "Failed to serialize selected cipher IDs",
+    ))?;
+    if ids_json.len() > 1_900_000 {
+        return Err(AppError::PayloadTooLarge {
+            message: "Cipher selection is too large".into(),
+        });
+    }
+    if let CipherMutation::Move {
+        folder_id: Some(folder),
+    } = &kind
+    {
+        FolderRow::ensure_for_user(db, folder, mutation.user_id()).await?;
+    }
+    let rows = CipherRow::fetch_selected(db, mutation.user_id(), &ids_json).await?;
+    if rows.len() != ids.len() {
+        return Err(AppError::bad_request(
+            "Not all selected ciphers exist in the personal vault",
+        ));
+    }
+    mutation.add_guards(crate::models::vault::cipher::selected_snapshot_guards(
+        db,
+        mutation.user_id(),
+        &rows,
+    )?);
+    if let CipherMutation::Move { folder_id } = &kind {
+        mutation.guard_folder(folder_id.as_deref())?;
+    }
+    let now = crate::utils::time::now_rfc3339();
+    let hard_delete = kind == CipherMutation::HardDelete;
+    let response = mutation_response(db, env, domain, rows, &kind, &now).await?;
+    let write = crate::models::vault::cipher::selected_mutation(
+        db,
+        mutation.user_id(),
+        &ids_json,
+        &kind,
+        &now,
+    )?;
+    let committed = mutation.commit(vec![write]).await?;
+    match (is_bulk, ids.first()) {
+        (true, _) => committed.publish_user(UpdateType::SyncCiphers).await,
+        (false, Some(id)) => {
+            let update = if hard_delete {
+                UpdateType::SyncLoginDelete
+            } else {
+                UpdateType::SyncCipherUpdate
+            };
+            committed.publish_cipher(update, id).await;
+        }
+        (false, None) => {}
+    }
+    if !ids.is_empty() {
+        let event = if matches!(
+            kind,
+            CipherMutation::SoftDelete | CipherMutation::HardDelete
+        ) {
+            Event::CipherDelete
+        } else {
+            Event::CipherUpdate
+        };
+        committed.emit_admin(event).await;
+    }
+    if hard_delete && let Err(error) = crate::service::storage_cleanup::process_batch(env, db).await
+    {
+        log::warn!("File cleanup deferred: {error:?}");
+    }
+    Ok(response)
+}
+
+async fn mutation_response(
+    db: &D1Database,
+    env: &Env,
+    domain: &str,
+    rows: Vec<CipherRow>,
+    kind: &CipherMutation,
+    now: &str,
+) -> AppResult<Vec<CipherResponse>> {
+    if !kind.returns_rows() {
+        return Ok(Vec::new());
+    }
+    let mut response = rows
+        .into_iter()
+        .map(CipherResponse::try_from)
+        .collect::<AppResult<Vec<_>>>()?;
+    for cipher in &mut response {
+        now.clone_into(&mut cipher.updated_at);
+        match kind {
+            CipherMutation::Restore => cipher.deleted_at = None,
+            CipherMutation::Archive => cipher.archived_at = Some(now.to_owned()),
+            CipherMutation::Unarchive => cipher.archived_at = None,
+            _ => {}
+        }
+    }
+    attachment::hydrate_ciphers_attachments(
+        db,
+        domain,
+        attachment::include_metadata(env),
+        &mut response,
+    )
+    .await?;
+    Ok(response)
 }
 
 /// Read and project each bounded page before loading the next one.
@@ -241,44 +215,29 @@ pub(crate) async fn visit_cipher_responses(
     domain: &str,
     mut visit: impl FnMut(CipherResponse) -> AppResult<()>,
 ) -> AppResult<()> {
-    let mut after = None;
-    loop {
-        let page = CipherRow::list_page(
-            db,
-            user_id,
-            include_attachments,
-            include_ssh_keys,
-            newest_first,
-            after.as_ref(),
-        )
-        .await?;
-        let mut ciphers = page
-            .rows
-            .into_iter()
-            .map(CipherResponse::try_from)
-            .collect::<AppResult<Vec<_>>>()?;
-        attachment::hydrate_ciphers_attachments(db, domain, include_attachments, &mut ciphers)
-            .await?;
-        for cipher in ciphers {
-            visit(cipher)?;
-        }
-        let Some(next) = page.next else { return Ok(()) };
-        after = Some(next);
-    }
-}
-
-async fn guard_cipher_write(
-    request: &CipherRequest,
-    mutation: &mut VaultWrite<'_>,
-) -> AppResult<()> {
-    let db = mutation.database();
-    let account = mutation.guard_account_key().await?;
-    request.validate_for_personal_vault(mutation.user_id())?;
-    request.validate_encryption_context(mutation.user_id(), account.user_key_id.as_deref())?;
-    if let Some(folder) = &request.folder_id {
-        FolderRow::ensure_for_user(db, folder, mutation.user_id()).await?;
-    }
-    mutation.guard_folder(request.folder_id.as_deref())
+    Page::visit(
+        async |after| {
+            CipherRow::list_page(
+                db,
+                user_id,
+                include_attachments,
+                include_ssh_keys,
+                newest_first,
+                after,
+            )
+            .await
+        },
+        async |rows| {
+            let mut ciphers = rows
+                .into_iter()
+                .map(CipherResponse::try_from)
+                .collect::<AppResult<Vec<_>>>()?;
+            attachment::hydrate_ciphers_attachments(db, domain, include_attachments, &mut ciphers)
+                .await?;
+            ciphers.into_iter().try_for_each(&mut visit)
+        },
+    )
+    .await
 }
 
 pub(crate) async fn save_cipher(
@@ -290,22 +249,29 @@ pub(crate) async fn save_cipher(
     payload: CipherRequest,
 ) -> AppResult<CipherResponse> {
     let mut mutation = VaultWrite::new(db, env, claims);
-    guard_cipher_write(&payload, &mut mutation).await?;
+    let account = mutation.guard_account_key().await?;
+    payload.validate_for_personal_vault(mutation.user_id(), account.user_key_id.as_deref())?;
+    if let Some(folder) = &payload.folder_id {
+        FolderRow::ensure_for_user(db, folder, mutation.user_id()).await?;
+    }
+    mutation.guard_folder(payload.folder_id.as_deref())?;
     let existing = if let Some(id) = &id {
         Some(CipherRow::fetch_for_user(db, id, mutation.user_id()).await?)
     } else {
         None
     };
-    if let Some(existing) = &existing {
-        if client_revision_is_stale(
+    if let Some(existing) = &existing
+        && client_revision_is_stale(
             &existing.updated_at,
             payload.last_known_revision_at.as_deref(),
-        ) {
-            return Err(AppError::bad_request(
-                "The client copy of this cipher is out of date. Resync the \
-                 client and try again.",
-            ));
-        }
+        )
+    {
+        return Err(AppError::bad_request(
+            "The client copy of this cipher is out of date. Resync the \
+             client and try again.",
+        ));
+    }
+    if let Some(existing) = &existing {
         mutation.guard_cipher(existing)?;
     }
     let now = crate::utils::time::now_rfc3339();
@@ -326,7 +292,7 @@ pub(crate) async fn save_cipher(
         writes.extend(attachment_writes);
         applied
     } else {
-        Vec::new()
+        HashSet::new()
     };
     attachment::hydrate_cipher_attachments(
         db,
@@ -372,8 +338,12 @@ fn prepare_cipher_row(
         normalize_optional_rfc3339(Some(value))
             .or_else(|| existing.and_then(|row| row.archived_at.clone()))
     });
-    let data = serde_json::to_value(request.into_payload()).map_err(AppError::internal_error)?;
-    let encoded = serde_json::to_string(&data).map_err(AppError::internal_error)?;
+    let data = serde_json::to_value(request.into_payload()).map_err(AppError::internal_json(
+        "Failed to serialize cipher payload",
+    ))?;
+    let encoded = serde_json::to_string(&data).map_err(AppError::internal_json(
+        "Failed to serialize cipher payload",
+    ))?;
     if encoded.len() > 2_000_000 {
         return Err(AppError::PayloadTooLarge {
             message: "Cipher data exceeds the D1 size limit".into(),
@@ -400,11 +370,11 @@ pub(crate) async fn update_cipher_partial(
     env: &Env,
     domain: &str,
     claims: &Claims,
-    id: String,
+    id: &str,
     payload: UpdateCipherPartialRequest,
 ) -> AppResult<CipherResponse> {
     let mut mutation = VaultWrite::new(db, env, claims);
-    let old = CipherRow::fetch_for_user(db, &id, mutation.user_id()).await?;
+    let old = CipherRow::fetch_for_user(db, id, mutation.user_id()).await?;
     if let Some(folder) = &payload.folder_id {
         FolderRow::ensure_for_user(db, folder, mutation.user_id()).await?;
     }
@@ -414,7 +384,7 @@ pub(crate) async fn update_cipher_partial(
     let write = CipherRow::partial_statement(
         db,
         mutation.user_id(),
-        &id,
+        id,
         payload.folder_id.as_deref(),
         payload.is_favorite,
         &now,
@@ -462,7 +432,7 @@ pub(crate) async fn purge_vault(
     committed.publish_user(UpdateType::SyncVault).await;
     committed.emit_admin(Event::CipherDelete).await;
     if let Err(error) = crate::service::storage_cleanup::process_batch(env, db).await {
-        log::warn!("File cleanup deferred: {error}");
+        log::warn!("File cleanup deferred: {error:?}");
     }
     Ok(())
 }

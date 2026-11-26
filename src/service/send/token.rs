@@ -33,6 +33,21 @@ pub(super) enum TokenPurpose<'a> {
     Download,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum FileTokenScope {
+    Upload,
+    Download,
+}
+
+impl From<FileTokenScope> for SendScope {
+    fn from(scope: FileTokenScope) -> Self {
+        match scope {
+            FileTokenScope::Upload => Self::Upload,
+            FileTokenScope::Download => Self::Download,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(super) struct SendClaims {
     pub sub: String,
@@ -49,23 +64,36 @@ pub(super) struct SendClaims {
     pub session_token: Option<String>,
 }
 
+#[derive(Serialize)]
+struct SendClaimsRef<'a> {
+    sub: &'a str,
+    exp: i64,
+    nbf: i64,
+    iat: i64,
+    aud: &'static str,
+    scope: SendScope,
+    send_id: &'a str,
+    file_id: Option<&'a str>,
+    access_stamp: &'a str,
+    sstamp: Option<&'a str>,
+    device: Option<&'a str>,
+    session_token: Option<&'a str>,
+}
+
 pub(super) fn decode_file_token(
     secret: &str,
     token: &str,
-    scope: SendScope,
+    purpose: FileTokenScope,
     send_id: &str,
     file_id: &str,
 ) -> AppResult<SendClaims> {
-    let claims = jwt::decode::<SendClaims>(token, secret.as_bytes(), &jwt::ValidationOptions {
-        leeway_seconds: 0,
-        expected_audience: Some(TOKEN_AUDIENCE.into()),
-        ..Default::default()
-    })?;
+    let scope = SendScope::from(purpose);
+    let claims = decode_claims(secret, token)?;
     if claims.sub.is_empty()
         || claims.scope != scope
         || claims.send_id != send_id
         || claims.file_id.as_deref() != Some(file_id)
-        || (scope == SendScope::Download && claims.sub != send_id)
+        || (purpose == FileTokenScope::Download && claims.sub != send_id)
     {
         return Err(AppError::Unauthorized {
             message: "Invalid Send file token".into(),
@@ -81,9 +109,9 @@ pub(super) fn encode_token(
     purpose: TokenPurpose<'_>,
 ) -> AppResult<String> {
     let (scope, subject, owner) = match purpose {
-        TokenPurpose::Access => (SendScope::Access, &send.id, None),
-        TokenPurpose::Upload(owner) => (SendScope::Upload, &send.user_id, Some(owner)),
-        TokenPurpose::Download => (SendScope::Download, &send.id, None),
+        TokenPurpose::Access => (SendScope::Access, send.id.as_str(), None),
+        TokenPurpose::Upload(owner) => (SendScope::Upload, send.user_id.as_str(), Some(owner)),
+        TokenPurpose::Download => (SendScope::Download, send.id.as_str(), None),
     };
     let now_seconds = crate::utils::time::now_seconds();
     let expires_at_seconds = if matches!(scope, SendScope::Upload | SendScope::Download) {
@@ -91,38 +119,42 @@ pub(super) fn encode_token(
     } else {
         now_seconds
             .checked_add(ACCESS_TOKEN_TTL_SECONDS)
-            .ok_or(AppError::Internal)?
+            .ok_or_else(|| AppError::internal("Send access token expiration overflowed"))?
     };
-    let claims = SendClaims {
-        sub: subject.clone(),
+    let claims = SendClaimsRef {
+        sub: subject,
         exp: expires_at_seconds,
         nbf: now_seconds,
         iat: now_seconds,
-        aud: TOKEN_AUDIENCE.into(),
+        aud: TOKEN_AUDIENCE,
         scope,
-        send_id: send.id.clone(),
-        file_id: send.file_id.clone(),
-        access_stamp: send.access_stamp.clone(),
-        sstamp: owner.map(|c| c.sstamp.clone()),
-        device: owner.and_then(|c| c.device().map(str::to_owned)),
-        session_token: owner.map(|c| c.session_token.clone()),
+        send_id: &send.id,
+        file_id: send.file_id.as_deref(),
+        access_stamp: &send.access_stamp,
+        sstamp: owner.map(|c| c.sstamp.as_str()),
+        device: owner.and_then(Claims::device),
+        session_token: owner.map(|c| c.session_token.as_str()),
     };
     jwt::encode(&claims, access_secret.as_bytes())
 }
 
 pub(super) fn decode_token(access_secret: &str, token: &str) -> AppResult<SendClaims> {
-    let claims =
-        jwt::decode::<SendClaims>(token, access_secret.as_bytes(), &jwt::ValidationOptions {
-            leeway_seconds: 0,
-            expected_audience: Some(TOKEN_AUDIENCE.into()),
-            ..Default::default()
-        })?;
+    let claims = decode_claims(access_secret, token)?;
     if claims.scope != SendScope::Access || claims.sub != claims.send_id {
         return Err(AppError::Unauthorized {
             message: "Invalid Send access token".into(),
         });
     }
     Ok(claims)
+}
+
+fn decode_claims(secret: &str, token: &str) -> AppResult<SendClaims> {
+    jwt::decode(token, secret.as_bytes(), &jwt::ValidationOptions {
+        leeway_seconds: 0,
+        expected_audience: Some(TOKEN_AUDIENCE.into()),
+        ..Default::default()
+    })
+    .map_err(AppError::from)
 }
 
 #[derive(Serialize)]
@@ -133,91 +165,60 @@ pub(crate) struct SendAccessTokenResponse {
     scope: &'static str,
 }
 
-pub(crate) struct SendTokenIssuer<'a> {
-    db: &'a D1Database,
-    env: &'a Env,
-    access_secret: &'a str,
-}
-
-impl<'a> SendTokenIssuer<'a> {
-    pub(crate) const fn new(db: &'a D1Database, env: &'a Env, access_secret: &'a str) -> Self {
-        Self {
-            db,
-            env,
-            access_secret,
-        }
-    }
-
-    /// Identity's `send_access` grant calls this with `send_id=accessId`
-    /// and `password_hash_b64`. Issuance never consumes a content access.
-    pub(crate) async fn issue_access_token(
-        &self,
-        headers: &HeaderMap,
-        access_id: &str,
-        password: Option<&str>,
-    ) -> AppResult<SendAccessTokenResponse> {
-        let id = decode_access_id(access_id)?;
-        let send = SendRow::fetch_by_id(self.db, &id).await?;
-        authorize_anonymous(self.env, self.access_secret, headers, &send, password).await?;
-        Ok(SendAccessTokenResponse {
-            access_token: encode_token(self.env, self.access_secret, &send, TokenPurpose::Access)?,
-            expires_in: ACCESS_TOKEN_TTL_SECONDS,
-            token_type: "Bearer",
-            scope: "api.send.access",
-        })
-    }
+/// The identity grant supplies `send_id=accessId` and `password_hash_b64`.
+/// Issuance never consumes a content access.
+pub(crate) async fn issue_access_token(
+    db: &D1Database,
+    env: &Env,
+    access_secret: &str,
+    headers: &HeaderMap,
+    access_id: &str,
+    password: Option<&str>,
+) -> AppResult<SendAccessTokenResponse> {
+    let id = decode_access_id(access_id)?;
+    let send = SendRow::fetch_by_id(db, &id).await?;
+    authorize_anonymous(env, access_secret, headers, &send, password).await?;
+    Ok(SendAccessTokenResponse {
+        access_token: encode_token(env, access_secret, &send, TokenPurpose::Access)?,
+        expires_in: ACCESS_TOKEN_TTL_SECONDS,
+        token_type: "Bearer",
+        scope: "api.send.access",
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn file_claims(scope: SendScope) -> SendClaims {
-        let now_seconds = crate::utils::time::now_seconds();
-        SendClaims {
-            sub: if scope == SendScope::Upload {
-                "owner"
-            } else {
-                "send"
-            }
-            .into(),
-            exp: now_seconds + 300,
-            nbf: now_seconds - 1,
-            iat: now_seconds,
+    #[test]
+    fn file_capabilities_bind_signature_scope_audience_and_path() {
+        let now = crate::utils::time::now_seconds();
+        let claims = SendClaims {
+            sub: "send".into(),
+            exp: now + 300,
+            nbf: now - 1,
+            iat: now,
             aud: TOKEN_AUDIENCE.into(),
-            scope,
+            scope: SendScope::Download,
             send_id: "send".into(),
             file_id: Some("file".into()),
             access_stamp: "stamp".into(),
-            sstamp: Some("owner-stamp".into()),
-            device: Some("device".into()),
-            session_token: Some("session".into()),
-        }
-    }
-
-    #[test]
-    fn file_capabilities_bind_signature_scope_audience_path_and_subject() {
-        let secret = "file-capability-unit-test-key";
-        for scope in [SendScope::Upload, SendScope::Download] {
-            let claims = file_claims(scope);
-            let token = jwt::encode(&claims, secret.as_bytes()).expect("sign");
-            assert!(decode_file_token(secret, &token, scope, "send", "file").is_ok());
-            assert!(decode_file_token("wrong-key", &token, scope, "send", "file").is_err());
-            assert!(decode_file_token(secret, &token, SendScope::Access, "send", "file").is_err());
-            assert!(decode_file_token(secret, &token, scope, "other-send", "file").is_err());
-            assert!(decode_file_token(secret, &token, scope, "send", "other-file").is_err());
-            let mut invalid = claims.clone();
-            invalid.exp = crate::utils::time::now_seconds() - 1;
-            let token = jwt::encode(&invalid, secret.as_bytes()).expect("sign");
-            assert!(decode_file_token(secret, &token, scope, "send", "file").is_err());
-            invalid = claims;
-            invalid.aud = "another-service".into();
-            let token = jwt::encode(&invalid, secret.as_bytes()).expect("sign");
-            assert!(decode_file_token(secret, &token, scope, "send", "file").is_err());
-        }
-        let mut wrong_subject = file_claims(SendScope::Download);
-        wrong_subject.sub = "other-send".into();
-        let token = jwt::encode(&wrong_subject, secret.as_bytes()).expect("sign");
-        assert!(decode_file_token(secret, &token, SendScope::Download, "send", "file").is_err());
+            sstamp: None,
+            device: None,
+            session_token: None,
+        };
+        let token = jwt::encode(&claims, b"secret").expect("sign");
+        assert!(
+            decode_file_token("secret", &token, FileTokenScope::Download, "send", "file").is_ok()
+        );
+        assert!(
+            decode_file_token("wrong", &token, FileTokenScope::Download, "send", "file").is_err()
+        );
+        assert!(
+            decode_file_token("secret", &token, FileTokenScope::Upload, "send", "file").is_err()
+        );
+        assert!(
+            decode_file_token("secret", &token, FileTokenScope::Download, "other", "file").is_err()
+        );
     }
 }

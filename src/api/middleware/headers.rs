@@ -3,58 +3,50 @@
 use std::{collections::BTreeMap, sync::OnceLock};
 
 use axum::http::{HeaderName, HeaderValue, StatusCode, header};
-use serde::Deserialize;
+use serde::{Deserialize, Deserializer, de::Error as _};
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct SecurityHeaderPolicy {
-    common: BTreeMap<String, String>,
-    document: BTreeMap<String, String>,
-    image: BTreeMap<String, String>,
-    api: BTreeMap<String, String>,
-    dynamic_cache: String,
-}
-
-type Headers = Vec<(HeaderName, HeaderValue)>;
-
 struct SecurityHeaders {
-    common: Headers,
-    document: Headers,
-    image: Headers,
-    api: Headers,
+    common: HeaderGroup,
+    document: HeaderGroup,
+    image: HeaderGroup,
+    api: HeaderGroup,
+    #[serde(deserialize_with = "parse_cache_header")]
     dynamic_cache: (HeaderName, HeaderValue),
 }
 
-fn parse_headers(headers: BTreeMap<String, String>) -> Headers {
-    headers
+#[derive(Deserialize)]
+#[serde(transparent)]
+struct HeaderGroup(#[serde(deserialize_with = "parse_headers")] Vec<(HeaderName, HeaderValue)>);
+
+fn parse_headers<'de, D: Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Vec<(HeaderName, HeaderValue)>, D::Error> {
+    BTreeMap::<String, String>::deserialize(deserializer)?
         .into_iter()
         .map(|(name, value)| {
-            (
-                HeaderName::from_bytes(name.as_bytes())
-                    .expect("compiled header name must be valid"),
-                HeaderValue::from_str(&value).expect("compiled header value must be valid"),
-            )
+            let name = HeaderName::from_bytes(name.as_bytes()).map_err(D::Error::custom)?;
+            let value = HeaderValue::from_str(&value).map_err(D::Error::custom)?;
+            Ok((name, value))
         })
         .collect()
+}
+
+fn parse_cache_header<'de, D: Deserializer<'de>>(
+    deserializer: D,
+) -> Result<(HeaderName, HeaderValue), D::Error> {
+    let value = String::deserialize(deserializer)?;
+    HeaderValue::from_str(&value)
+        .map(|value| (header::CACHE_CONTROL, value))
+        .map_err(D::Error::custom)
 }
 
 fn policy() -> &'static SecurityHeaders {
     static POLICY: OnceLock<SecurityHeaders> = OnceLock::new();
     POLICY.get_or_init(|| {
-        let policy: SecurityHeaderPolicy =
-            serde_json::from_str(include_str!("../../../static/security-headers.json"))
-                .expect("compiled security headers must be valid");
-        SecurityHeaders {
-            common: parse_headers(policy.common),
-            document: parse_headers(policy.document),
-            image: parse_headers(policy.image),
-            api: parse_headers(policy.api),
-            dynamic_cache: (
-                header::CACHE_CONTROL,
-                HeaderValue::from_str(&policy.dynamic_cache)
-                    .expect("compiled header value must be valid"),
-            ),
-        }
+        serde_json::from_str(include_str!("../../../static/security-headers.json"))
+            .expect("compiled security headers must be valid")
     })
 }
 
@@ -78,8 +70,9 @@ fn defaults(
     };
     policy
         .common
+        .0
         .iter()
-        .chain(specific.into_iter().flatten())
+        .chain(specific.into_iter().flat_map(|group| &group.0))
         .chain(std::iter::once(&policy.dynamic_cache))
 }
 
@@ -95,7 +88,7 @@ pub(crate) fn apply_http(path: &str, response: &mut axum::response::Response) {
         .and_then(|value| value.to_str().ok())
         .unwrap_or("");
     for (name, value) in defaults(connector, content_type) {
-        headers.entry(name).or_insert(value.clone());
+        headers.entry(name).or_insert_with(|| value.clone());
     }
     if connector {
         headers.remove(header::CONTENT_SECURITY_POLICY);

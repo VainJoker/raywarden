@@ -4,7 +4,7 @@ use worker::{D1Database, D1PreparedStatement, query};
 
 use crate::{
     errors::{AppError, AppResult, DatabaseError, DbSentinel},
-    infra::db,
+    infra::db::{self, IntoD1Param},
     models::{
         mutation::{NEXT_USER_REVISION_SQL, RevisionRow},
         page::{Page, PageCursor, PageOrder, PageQuery},
@@ -41,12 +41,9 @@ pub(crate) struct SendRow {
 
 impl SendRow {
     pub(crate) async fn fetch_by_id(db: &D1Database, id: &str) -> AppResult<Self> {
-        db::run_query(
-            async {
-                query!(db, "SELECT * FROM sends WHERE id = ?1", id)?
-                    .first(None)
-                    .await
-            },
+        db::query_first(
+            query!(db, "SELECT * FROM sends WHERE id = ?1", id),
+            None,
             "Failed to fetch Send",
         )
         .await?
@@ -54,18 +51,14 @@ impl SendRow {
     }
 
     pub(crate) async fn fetch_for_user(db: &D1Database, id: &str, user: &str) -> AppResult<Self> {
-        db::run_query(
-            async {
-                query!(
-                    db,
-                    "SELECT * FROM sends WHERE id = ?1 AND user_id = ?2 AND \
-                     upload_state = 0",
-                    id,
-                    user
-                )?
-                .first(None)
-                .await
-            },
+        db::query_first(
+            query!(
+                db,
+                "SELECT * FROM sends WHERE id = ?1 AND user_id = ?2 AND upload_state = 0",
+                id,
+                user
+            ),
+            None,
             "Failed to fetch user Send",
         )
         .await?
@@ -77,9 +70,15 @@ impl SendRow {
         user: &str,
         after: Option<&PageCursor>,
     ) -> AppResult<Page<Self>> {
+        Self::page_query("user_id=? AND upload_state=0", PageOrder::CreatedFirst)
+            .fetch(db, &db::d1_params![user], after)
+            .await
+    }
+
+    const fn page_query(filter: &'static str, order: PageOrder) -> PageQuery {
         PageQuery {
             table: "sends",
-            filter: "user_id=? AND upload_state=0",
+            filter,
             text_columns: &[
                 "id",
                 "user_id",
@@ -97,11 +96,9 @@ impl SendRow {
                 "file_id",
                 "storage_key",
             ],
-            order: PageOrder::CreatedFirst,
+            order,
             related_bytes: None,
         }
-        .fetch(db, &db::d1_params![user], after)
-        .await
     }
 
     pub(crate) fn insert_statement(&self, db: &D1Database) -> AppResult<D1PreparedStatement> {
@@ -140,90 +137,79 @@ impl SendRow {
         )?)
     }
 
-    const fn snapshot_columns() -> &'static [&'static str; 23] {
-        &[
-            "id",
-            "user_id",
-            "name",
-            "notes",
-            "send_type",
-            "data",
-            "encrypted_key",
-            "password_hash",
-            "password_salt",
-            "password_iterations",
-            "max_access_count",
-            "access_count",
-            "created_at",
-            "updated_at",
-            "expires_at",
-            "deletes_at",
-            "is_disabled",
-            "is_email_hidden",
-            "access_stamp",
-            "file_id",
-            "file_size_bytes",
-            "upload_state",
-            "storage_key",
-        ]
-    }
-
-    pub(crate) fn snapshot_predicate(&self) -> AppResult<(String, [wasm_bindgen::JsValue; 23])> {
-        let predicate = Self::snapshot_columns()
+    pub(crate) fn snapshot_guard(&self, db: &D1Database) -> AppResult<D1PreparedStatement> {
+        // Bind fields individually. Quoting large ciphertexts a second time
+        // can exceed D1's per-parameter limit.
+        let fields = [
+            ("id", self.id.to_d1_param()),
+            ("user_id", self.user_id.to_d1_param()),
+            ("name", self.name.to_d1_param()),
+            ("notes", self.notes.to_d1_param()),
+            ("send_type", self.send_type.to_d1_param()),
+            ("data", self.data.to_d1_param()),
+            ("encrypted_key", self.encrypted_key.to_d1_param()),
+            ("password_hash", self.password_hash.to_d1_param()),
+            ("password_salt", self.password_salt.to_d1_param()),
+            (
+                "password_iterations",
+                self.password_iterations.to_d1_param(),
+            ),
+            (
+                "max_access_count",
+                self.max_access_count
+                    .map(db::safe_int)
+                    .transpose()?
+                    .to_d1_param(),
+            ),
+            (
+                "access_count",
+                db::safe_int(self.access_count)?.to_d1_param(),
+            ),
+            ("created_at", self.created_at.to_d1_param()),
+            ("updated_at", self.updated_at.to_d1_param()),
+            ("expires_at", self.expires_at.to_d1_param()),
+            ("deletes_at", self.deletes_at.to_d1_param()),
+            ("is_disabled", self.is_disabled.to_d1_param()),
+            ("is_email_hidden", self.is_email_hidden.to_d1_param()),
+            ("access_stamp", self.access_stamp.to_d1_param()),
+            ("file_id", self.file_id.to_d1_param()),
+            (
+                "file_size_bytes",
+                db::safe_int(self.file_size_bytes)?.to_d1_param(),
+            ),
+            ("upload_state", self.upload_state.to_d1_param()),
+            ("storage_key", self.storage_key.to_d1_param()),
+        ];
+        let predicate = fields
             .iter()
             .enumerate()
-            .map(|(index, column)| format!("s.{column} IS ?{}", index + 1))
+            .map(|(index, (column, _))| format!("s.{column} IS ?{}", index + 1))
             .collect::<Vec<_>>()
             .join(" AND ");
-        // Each field is its own D1 value. Serializing the complete collection
-        // (or quoting a large data field a second time) exceeds D1's 2 MB cap.
-        let bindings = db::d1_params![
-            self.id,
-            self.user_id,
-            self.name,
-            self.notes,
-            self.send_type,
-            self.data,
-            self.encrypted_key,
-            self.password_hash,
-            self.password_salt,
-            self.password_iterations,
-            self.max_access_count.map(db::safe_int).transpose()?,
-            db::safe_int(self.access_count)?,
-            self.created_at,
-            self.updated_at,
-            self.expires_at,
-            self.deletes_at,
-            self.is_disabled,
-            self.is_email_hidden,
-            self.access_stamp,
-            self.file_id,
-            db::safe_int(self.file_size_bytes)?,
-            self.upload_state,
-            self.storage_key,
-        ];
-        Ok((
-            format!("EXISTS(SELECT 1 FROM sends s WHERE {predicate})"),
-            bindings,
-        ))
+        crate::models::mutation::guard(
+            db,
+            &format!("EXISTS(SELECT 1 FROM sends s WHERE {predicate})"),
+            &fields.map(|(_, value)| value),
+        )
     }
 
-    pub(crate) fn upload_predicate(&self) -> (&'static str, [wasm_bindgen::JsValue; 8]) {
+    pub(crate) fn upload_guard(&self, db: &D1Database) -> AppResult<D1PreparedStatement> {
         // Public access may change count and revision while bytes are in
         // flight. Only bind the encrypted file and pointer fields this upload
         // relies on.
-        (
+        crate::models::mutation::guard(
+            db,
             "EXISTS(SELECT 1 FROM sends WHERE id=?1 AND user_id=?2 AND \
              send_type=1 AND data IS ?3 AND encrypted_key IS ?4 AND file_id \
              IS ?5 AND file_size_bytes IS ?6 AND storage_key IS ?7 AND \
              upload_state IS ?8)",
-            db::d1_params![
+            &db::d1_params![
                 self.id,
                 self.user_id,
                 self.data,
                 self.encrypted_key,
                 self.file_id,
-                self.file_size_bytes as f64,
+                db::safe_int(self.file_size_bytes)?,
                 self.storage_key,
                 self.upload_state,
             ],
@@ -331,7 +317,7 @@ impl SendRow {
             "Failed to update Send owner revision",
         )
         .await?
-        .ok_or(AppError::Internal)
+        .ok_or_else(|| AppError::internal("Send owner account is missing"))
     }
 
     pub(crate) async fn consume_access(
@@ -367,18 +353,20 @@ impl SendRow {
             .await
             .map_err(DatabaseError::send_access)?;
         let [increment, _, revision] = results.as_slice() else {
-            return Err(AppError::Internal);
+            return Err(AppError::internal(
+                "Send access batch returned an unexpected result count",
+            ));
         };
         let count = increment
             .results::<AccessCountRow>()?
             .into_iter()
             .next()
-            .ok_or(AppError::Internal)?;
+            .ok_or_else(|| AppError::internal("Missing Send access count row"))?;
         let revision = revision
             .results::<RevisionRow>()?
             .into_iter()
             .next()
-            .ok_or(AppError::Internal)?;
+            .ok_or_else(|| AppError::internal("Missing Send owner revision row"))?;
         self.access_count = count.access_count;
         self.updated_at = now;
         Ok(revision.updated_at)
@@ -398,21 +386,16 @@ impl SendRow {
         now: &str,
         cutoff: &str,
     ) -> AppResult<Vec<Self>> {
-        db::run_query(
-            async {
-                query!(
-                    db,
-                    "SELECT * FROM sends WHERE \
-                     julianday(deletes_at)<=julianday(?1) OR (upload_state<>0 \
-                     AND julianday(created_at)<=julianday(?2)) ORDER BY rowid \
-                     LIMIT 16",
-                    now,
-                    cutoff
-                )?
-                .all()
-                .await?
-                .results()
-            },
+        db::query_results(
+            query!(
+                db,
+                "SELECT * FROM sends WHERE \
+                 julianday(deletes_at)<=julianday(?1) OR (upload_state<>0 \
+                 AND julianday(created_at)<=julianday(?2)) ORDER BY rowid \
+                 LIMIT 16",
+                now,
+                cutoff
+            ),
             "Failed to find expired Sends",
         )
         .await
@@ -432,7 +415,7 @@ impl SendRow {
             &db::d1_params![self.id, now, cutoff],
         )?;
         db.batch(vec![
-            snapshot_guard(db, self)?,
+            self.snapshot_guard(db)?,
             expired,
             self.delete_statement(db)?,
             Self::revision_statement(db, &self.user_id, now)?,
@@ -442,54 +425,19 @@ impl SendRow {
     }
 
     pub(crate) async fn all_for_user(db: &D1Database, user: &str) -> AppResult<Vec<Self>> {
-        PageQuery {
-            table: "sends",
-            filter: "user_id=?",
-            text_columns: &[
-                "id",
-                "user_id",
-                "name",
-                "notes",
-                "data",
-                "encrypted_key",
-                "password_hash",
-                "password_salt",
-                "created_at",
-                "updated_at",
-                "expires_at",
-                "deletes_at",
-                "access_stamp",
-                "file_id",
-                "storage_key",
-            ],
-            order: PageOrder::RowId,
-            related_bytes: None,
-        }
-        .fetch_all(db, &db::d1_params![user])
-        .await
+        Self::page_query("user_id=?", PageOrder::RowId)
+            .fetch_all(db, &db::d1_params![user])
+            .await
     }
 
     pub(crate) async fn creator_email(&self, db: &D1Database) -> AppResult<Option<String>> {
-        db::run_query(
-            async {
-                query!(db, "SELECT email FROM users WHERE id=?1", self.user_id)?
-                    .first(Some("email"))
-                    .await
-            },
+        db::query_first(
+            query!(db, "SELECT email FROM users WHERE id=?1", self.user_id),
+            Some("email"),
             "Failed to fetch Send creator",
         )
         .await
     }
-}
-
-pub(crate) fn snapshot_guard(db: &D1Database, send: &SendRow) -> AppResult<D1PreparedStatement> {
-    let (predicate, bindings) = send.snapshot_predicate()?;
-    crate::models::mutation::guard(db, &predicate, &bindings)
-}
-
-pub(crate) fn upload_guard(db: &D1Database, send: &SendRow) -> AppResult<D1PreparedStatement> {
-    let (predicate, bindings) = send.upload_predicate();
-    crate::models::mutation::guard(db, predicate, &bindings)
 }
 
 pub(crate) fn collection_guard(
@@ -500,7 +448,7 @@ pub(crate) fn collection_guard(
     crate::models::mutation::guard(
         db,
         "(SELECT COUNT(*) FROM sends WHERE user_id=?1)=?2",
-        &db::d1_params![owner, count as f64],
+        &db::d1_params![owner, db::safe_usize(count)?],
     )
 }
 
@@ -514,6 +462,10 @@ pub(crate) fn quota_guard(
         db,
         "COALESCE((SELECT SUM(file_size_bytes) FROM sends WHERE \
          user_id=?2),0)+?3<=?1",
-        &db::d1_params![quota as f64, send.user_id, send.file_size_bytes as f64],
+        &db::d1_params![
+            db::safe_int(quota)?,
+            send.user_id,
+            db::safe_int(send.file_size_bytes)?,
+        ],
     )
 }
